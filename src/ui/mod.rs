@@ -1,5 +1,6 @@
 pub mod dual_pane_view;
 pub mod file_pane;
+pub mod native_file_list;
 pub mod new_tab_view;
 pub mod settings_modal;
 pub mod transfer_drawer;
