@@ -1,7 +1,7 @@
 use super::{
-    map_row_index_to_entry, resolve_drop_destination_dir, should_commit_inline_rename,
-    NativeContextMenuAction, NativeEventSink, NativePaneEvent, NativePaneSnapshot,
-    NativeRowViewModel,
+    map_row_index_to_entry, resolve_drop_destination_dir, resolve_inline_rename_entry,
+    should_commit_inline_rename, NativeContextMenuAction, NativeEventSink, NativePaneEvent,
+    NativePaneSnapshot, NativeRowViewModel,
 };
 use crate::i18n::i18n;
 use crate::models::FileEntry;
@@ -13,16 +13,16 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ, ScreenToClient,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
-use windows::Win32::System::Com::{CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Ole::{IDropSource, DROPEFFECT_COPY};
+use windows::Win32::System::Ole::{IDropSource, OleInitialize, OleUninitialize, DROPEFFECT_COPY};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, SetWindowTheme, HDITEMW, HDF_LEFT, HDF_RIGHT, HDF_SORTDOWN, HDF_SORTUP,
     HDF_STRING, HDI_FORMAT, HDM_GETITEMW, HDM_SETITEMW, HEADER_CONTROL_FORMAT_FLAGS,
@@ -32,11 +32,11 @@ use windows::Win32::UI::Controls::{
     LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETBKCOLOR, LVM_SETCOLUMNW, LVM_SETCOLUMNWIDTH,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
     LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVNI_FOCUSED, LVNI_SELECTED, LVN_BEGINDRAG,
-    LVN_COLUMNCLICK, LVN_ENDLABELEDITW, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN,
-    LVN_ODSTATECHANGED, LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, LVSIL_SMALL, LVS_EDITLABELS,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP, LVS_OWNERDATA, LVS_REPORT,
-    LVS_SHOWSELALWAYS, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN, NM_DBLCLK,
-    NM_RCLICK, WC_LISTVIEWW,
+    LVN_BEGINLABELEDITW, LVN_COLUMNCLICK, LVN_ENDLABELEDITW, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
+    LVN_KEYDOWN, LVN_ODSTATECHANGED, LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, LVSIL_SMALL,
+    LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP,
+    LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, NMHDR, NMITEMACTIVATE,
+    NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN, NM_DBLCLK, NM_RCLICK, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_F2,
@@ -50,6 +50,8 @@ use windows::Win32::UI::Shell::{
     CMINVOKECOMMANDINFO, CMF_NORMAL, HDROP, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
     SHGFI_USEFILEATTRIBUTES,
 };
+#[cfg(test)]
+use windows::Win32::UI::WindowsAndMessaging::WS_POPUP;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetCursorPos,
     GetWindowLongW, IsChild, LoadCursorW, SendMessageW, SetCursor, SetWindowLongW, SetWindowPos,
@@ -202,6 +204,7 @@ struct PaneControlState {
     rows: Arc<Vec<NativeRowViewModel>>,
     entries: Arc<Vec<FileEntry>>,
     selected_paths: Vec<String>,
+    editing_original_path: Option<String>,
 }
 
 impl PaneControlState {
@@ -221,15 +224,16 @@ impl PaneControlState {
             rows: Arc::new(Vec::new()),
             entries: Arc::new(Vec::new()),
             selected_paths: Vec::new(),
+            editing_original_path: None,
         }
     }
 
-    fn hide(&mut self) {
+    fn take_hide_hwnd(&mut self) -> Option<HWND> {
         if self.visible && self.hwnd != 0 {
             self.visible = false;
-            unsafe {
-                let _ = ShowWindow(HWND(self.hwnd as *mut c_void), SW_HIDE);
-            }
+            Some(HWND(self.hwnd as *mut c_void))
+        } else {
+            None
         }
     }
 }
@@ -240,6 +244,7 @@ struct ActiveRemoteDrag {
 
 struct HostInner {
     parent_hwnd: isize,
+    subclass_ctx_ptr: usize,
     ui_font: isize,
     icon_cache: ShellIconCache,
     left: PaneControlState,
@@ -251,6 +256,7 @@ struct HostInner {
 pub struct PlatformHost {
     state: Arc<Mutex<HostInner>>,
     suppress_selection_events: Arc<AtomicBool>,
+    ole_initialized: bool,
 }
 
 impl Default for PlatformHost {
@@ -259,19 +265,31 @@ impl Default for PlatformHost {
     }
 }
 
+impl Drop for PlatformHost {
+    fn drop(&mut self) {
+        if self.ole_initialized {
+            unsafe {
+                OleUninitialize();
+            }
+        }
+    }
+}
+
 impl PlatformHost {
     pub fn new() -> Self {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let ole_initialized = unsafe {
+            let ole_ok = OleInitialize(None).is_ok();
             let icc = INITCOMMONCONTROLSEX {
                 dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
                 dwICC: ICC_LISTVIEW_CLASSES,
             };
             let _ = InitCommonControlsEx(&icc);
-        }
+            ole_ok
+        };
 
         let inner = HostInner {
             parent_hwnd: 0,
+            subclass_ctx_ptr: 0,
             ui_font: create_message_font(),
             icon_cache: ShellIconCache::new(),
             left: PaneControlState::new(),
@@ -283,6 +301,7 @@ impl PlatformHost {
         Self {
             state: Arc::new(Mutex::new(inner)),
             suppress_selection_events: Arc::new(AtomicBool::new(false)),
+            ole_initialized,
         }
     }
 
@@ -297,7 +316,14 @@ impl PlatformHost {
         if parent_hwnd_val == 0 {
             return;
         }
+        self.sync_pane_for_parent_hwnd(parent_hwnd_val, snapshot);
+    }
 
+    pub(crate) fn sync_pane_for_parent_hwnd(
+        &self,
+        parent_hwnd_val: isize,
+        snapshot: &NativePaneSnapshot,
+    ) {
         self.ensure_controls_created(parent_hwnd_val);
 
         let mut guard = self.state.lock().unwrap();
@@ -322,11 +348,11 @@ impl PlatformHost {
             return;
         }
 
-        if pane.is_dark.is_none() && sys_img_list != 0 {
-            unsafe {
-                send_msg(hwnd, LVM_SETIMAGELIST, LVSIL_SMALL as usize, sys_img_list);
-            }
-        }
+        let need_imagelist = if pane.is_dark.is_none() && sys_img_list != 0 {
+            Some(sys_img_list)
+        } else {
+            None
+        };
 
         let bounds_changed = pane.bounds_px != snapshot.bounds_px;
         let vis_changed = pane.visible != snapshot.visible;
@@ -334,6 +360,7 @@ impl PlatformHost {
         pane.visible = snapshot.visible;
 
         if !snapshot.visible {
+            drop(guard);
             if vis_changed {
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
@@ -342,7 +369,55 @@ impl PlatformHost {
             return;
         }
 
+        let need_theme = if pane.is_dark != Some(snapshot.is_dark) {
+            pane.is_dark = Some(snapshot.is_dark);
+            Some(snapshot.is_dark)
+        } else {
+            None
+        };
+
+        let t = i18n();
+        let desired_labels = (
+            t.col_name().to_string(),
+            t.col_modified().to_string(),
+            t.col_size().to_string(),
+        );
+        let sort_changed =
+            pane.sort_col != snapshot.sort_col || pane.sort_ascending != snapshot.sort_ascending;
+        let need_headers = if pane.header_labels != desired_labels || sort_changed {
+            pane.header_labels = desired_labels.clone();
+            pane.sort_col = snapshot.sort_col;
+            pane.sort_ascending = snapshot.sort_ascending;
+            Some((desired_labels, snapshot.sort_col, snapshot.sort_ascending))
+        } else {
+            None
+        };
+
+        let data_changed = pane.tab_idx != snapshot.tab_idx
+            || pane.entries_revision != snapshot.entries_revision
+            || pane.rows.len() != snapshot.rows.len();
+        pane.tab_idx = snapshot.tab_idx;
+        pane.entries_revision = snapshot.entries_revision;
+        pane.current_path = snapshot.current_path.clone();
+        pane.has_parent = snapshot.has_parent;
+        pane.rows = Arc::clone(&snapshot.rows);
+        pane.entries = Arc::clone(&snapshot.entries);
+
+        let item_count = data_changed.then_some(pane.rows.len());
+        let need_sel_sync = if data_changed || pane.selected_paths != snapshot.selected_paths {
+            pane.selected_paths = snapshot.selected_paths.clone();
+            Some(Arc::clone(&pane.rows))
+        } else {
+            None
+        };
         let (x, y, w, h) = snapshot.bounds_px;
+        drop(guard);
+
+        if let Some(img_list) = need_imagelist {
+            unsafe {
+                send_msg(hwnd, LVM_SETIMAGELIST, LVSIL_SMALL as usize, img_list);
+            }
+        }
         if bounds_changed {
             unsafe {
                 let _ = SetWindowPos(
@@ -362,44 +437,13 @@ impl PlatformHost {
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             }
         }
-
-        if pane.is_dark != Some(snapshot.is_dark) {
-            pane.is_dark = Some(snapshot.is_dark);
-            apply_listview_theme(hwnd, snapshot.is_dark);
+        if let Some(is_dark) = need_theme {
+            apply_listview_theme(hwnd, is_dark);
         }
-
-        let t = i18n();
-        let desired_labels = (
-            t.col_name().to_string(),
-            t.col_modified().to_string(),
-            t.col_size().to_string(),
-        );
-        let sort_changed =
-            pane.sort_col != snapshot.sort_col || pane.sort_ascending != snapshot.sort_ascending;
-        if pane.header_labels != desired_labels || sort_changed {
-            pane.header_labels = desired_labels.clone();
-            pane.sort_col = snapshot.sort_col;
-            pane.sort_ascending = snapshot.sort_ascending;
-            update_column_headers_and_sort(
-                hwnd,
-                &desired_labels,
-                snapshot.sort_col,
-                snapshot.sort_ascending,
-            );
+        if let Some((labels, sort_col, sort_asc)) = need_headers {
+            update_column_headers_and_sort(hwnd, &labels, sort_col, sort_asc);
         }
-
-        let data_changed = pane.tab_idx != snapshot.tab_idx
-            || pane.entries_revision != snapshot.entries_revision
-            || pane.rows.len() != snapshot.rows.len();
-        pane.tab_idx = snapshot.tab_idx;
-        pane.entries_revision = snapshot.entries_revision;
-        pane.current_path = snapshot.current_path.clone();
-        pane.has_parent = snapshot.has_parent;
-        pane.rows = Arc::clone(&snapshot.rows);
-        pane.entries = Arc::clone(&snapshot.entries);
-
-        if data_changed {
-            let count = pane.rows.len();
+        if let Some(count) = item_count {
             unsafe {
                 send_msg(
                     hwnd,
@@ -412,24 +456,26 @@ impl PlatformHost {
                 }
             }
         }
-
-        if data_changed || pane.selected_paths != snapshot.selected_paths {
-            pane.selected_paths = snapshot.selected_paths.clone();
-            let rows_clone = Arc::clone(&pane.rows);
+        if let Some(rows_clone) = need_sel_sync {
             let sel_set: HashSet<&str> =
                 snapshot.selected_paths.iter().map(|s| s.as_str()).collect();
-            drop(guard);
-
             self.suppress_selection_events.store(true, Ordering::SeqCst);
             sync_listview_selection(hwnd, &rows_clone, &sel_set);
-            self.suppress_selection_events.store(false, Ordering::SeqCst);
+            self.suppress_selection_events
+                .store(false, Ordering::SeqCst);
         }
     }
 
     pub fn hide_all(&self) {
-        let mut guard = self.state.lock().unwrap();
-        guard.left.hide();
-        guard.right.hide();
+        let (left_hwnd, right_hwnd) = {
+            let mut guard = self.state.lock().unwrap();
+            (guard.left.take_hide_hwnd(), guard.right.take_hide_hwnd())
+        };
+        unsafe {
+            for hwnd in [left_hwnd, right_hwnd].into_iter().flatten() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
     }
 
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
@@ -448,9 +494,30 @@ impl PlatformHost {
     }
 
     fn ensure_controls_created(&self, parent_hwnd_val: isize) {
-        let mut guard = self.state.lock().unwrap();
-        if guard.parent_hwnd == parent_hwnd_val && guard.left.hwnd != 0 && guard.right.hwnd != 0 {
-            return;
+        let (old_left, old_right, old_parent, old_ctx, font_val) = {
+            let mut guard = self.state.lock().unwrap();
+            if guard.parent_hwnd == parent_hwnd_val
+                && guard.left.hwnd != 0
+                && guard.right.hwnd != 0
+            {
+                return;
+            }
+            let tup = (
+                guard.left.hwnd,
+                guard.right.hwnd,
+                guard.parent_hwnd,
+                guard.subclass_ctx_ptr,
+                guard.ui_font,
+            );
+            guard.left.hwnd = 0;
+            guard.right.hwnd = 0;
+            guard.parent_hwnd = 0;
+            guard.subclass_ctx_ptr = 0;
+            tup
+        };
+
+        unsafe {
+            teardown_win32_controls(old_left, old_right, old_parent, old_ctx);
         }
 
         let parent_hwnd = HWND(parent_hwnd_val as *mut c_void);
@@ -462,7 +529,7 @@ impl PlatformHost {
         }
 
         let ctx_ptr = Box::into_raw(Box::new(SubclassContext {
-            state: Arc::clone(&self.state),
+            state: Arc::downgrade(&self.state),
             suppress_selection: Arc::clone(&self.suppress_selection_events),
         }));
 
@@ -475,41 +542,63 @@ impl PlatformHost {
             );
         }
 
-        let font = HFONT(guard.ui_font as *mut c_void);
+        let font = HFONT(font_val as *mut c_void);
         let left_hwnd = create_single_listview(parent_hwnd, LEFT_LISTVIEW_ID, font, ctx_ptr);
         let right_hwnd = create_single_listview(parent_hwnd, RIGHT_LISTVIEW_ID, font, ctx_ptr);
 
+        let mut guard = self.state.lock().unwrap();
         guard.parent_hwnd = parent_hwnd_val;
+        guard.subclass_ctx_ptr = ctx_ptr as usize;
         guard.left.hwnd = left_hwnd.0 as isize;
         guard.right.hwnd = right_hwnd.0 as isize;
+    }
+}
+
+unsafe fn teardown_win32_controls(
+    left_hwnd_val: isize,
+    right_hwnd_val: isize,
+    parent_hwnd_val: isize,
+    subclass_ctx_ptr: usize,
+) {
+    for child_val in [left_hwnd_val, right_hwnd_val] {
+        if child_val != 0 {
+            let child = HWND(child_val as *mut c_void);
+            let _ = RemoveWindowSubclass(child, Some(child_subclass_proc), CHILD_SUBCLASS_ID);
+            let _ = DestroyWindow(child);
+        }
+    }
+    if parent_hwnd_val != 0 {
+        let parent = HWND(parent_hwnd_val as *mut c_void);
+        let _ = RemoveWindowSubclass(parent, Some(parent_subclass_proc), PARENT_SUBCLASS_ID);
+    }
+    if subclass_ctx_ptr != 0 {
+        let _ = Box::from_raw(subclass_ctx_ptr as *mut SubclassContext);
     }
 }
 
 impl Drop for HostInner {
     fn drop(&mut self) {
         unsafe {
-            for child_val in [self.left.hwnd, self.right.hwnd] {
-                if child_val != 0 {
-                    let child = HWND(child_val as *mut c_void);
-                    let _ =
-                        RemoveWindowSubclass(child, Some(child_subclass_proc), CHILD_SUBCLASS_ID);
-                    let _ = DestroyWindow(child);
-                }
-            }
-            if self.parent_hwnd != 0 {
-                let parent = HWND(self.parent_hwnd as *mut c_void);
-                let _ =
-                    RemoveWindowSubclass(parent, Some(parent_subclass_proc), PARENT_SUBCLASS_ID);
-            }
+            teardown_win32_controls(
+                self.left.hwnd,
+                self.right.hwnd,
+                self.parent_hwnd,
+                self.subclass_ctx_ptr,
+            );
+            self.left.hwnd = 0;
+            self.right.hwnd = 0;
+            self.parent_hwnd = 0;
+            self.subclass_ctx_ptr = 0;
             if self.ui_font != 0 {
                 let _ = DeleteObject(HGDIOBJ(self.ui_font as *mut c_void));
+                self.ui_font = 0;
             }
         }
     }
 }
 
 struct SubclassContext {
-    state: Arc<Mutex<HostInner>>,
+    state: Weak<Mutex<HostInner>>,
     suppress_selection: Arc<AtomicBool>,
 }
 
@@ -546,6 +635,7 @@ fn create_single_listview(
             | WS_TABSTOP.0
             | LVS_REPORT
             | LVS_OWNERDATA
+            | LVS_SHAREIMAGELISTS
             | LVS_SHOWSELALWAYS
             | LVS_EDITLABELS,
     );
@@ -772,25 +862,27 @@ unsafe extern "system" fn parent_subclass_proc(
 ) -> LRESULT {
     if umsg == WM_NOTIFY && lparam.0 != 0 && dwrefdata != 0 {
         let ctx = &*(dwrefdata as *const SubclassContext);
-        let hdr = &*(lparam.0 as *const NMHDR);
-        let from_val = hdr.hwndFrom.0 as isize;
+        if let Some(state) = ctx.state.upgrade() {
+            let hdr = &*(lparam.0 as *const NMHDR);
+            let from_val = hdr.hwndFrom.0 as isize;
 
-        let pane_side = {
-            let guard = ctx.state.lock().unwrap();
-            if from_val != 0 && from_val == guard.left.hwnd {
-                Some(true)
-            } else if from_val != 0 && from_val == guard.right.hwnd {
-                Some(false)
-            } else {
-                None
-            }
-        };
+            let pane_side = {
+                let guard = state.lock().unwrap();
+                if from_val != 0 && from_val == guard.left.hwnd {
+                    Some(true)
+                } else if from_val != 0 && from_val == guard.right.hwnd {
+                    Some(false)
+                } else {
+                    None
+                }
+            };
 
-        if let Some(is_local) = pane_side {
-            if let Some(res) =
-                handle_listview_notify(ctx, hdr.hwndFrom, is_local, hdr.code, lparam)
-            {
-                return res;
+            if let Some(is_local) = pane_side {
+                if let Some(res) =
+                    handle_listview_notify(ctx, &state, hdr.hwndFrom, is_local, hdr.code, lparam)
+                {
+                    return res;
+                }
             }
         }
     }
@@ -800,6 +892,7 @@ unsafe extern "system" fn parent_subclass_proc(
 
 unsafe fn handle_listview_notify(
     ctx: &SubclassContext,
+    state: &Arc<Mutex<HostInner>>,
     lv_hwnd: HWND,
     is_local: bool,
     code: u32,
@@ -811,7 +904,7 @@ unsafe fn handle_listview_notify(
             let row_idx = di.item.iItem as usize;
             let sub_item = di.item.iSubItem;
 
-            let mut guard = ctx.state.lock().unwrap();
+            let mut guard = state.lock().unwrap();
             let row_opt = if is_local {
                 guard.left.rows.get(row_idx).cloned()
             } else {
@@ -863,13 +956,16 @@ unsafe fn handle_listview_notify(
                     return Some(LRESULT(0));
                 }
             }
-            let mut guard = ctx.state.lock().unwrap();
-            let rows = if is_local {
-                Arc::clone(&guard.left.rows)
-            } else {
-                Arc::clone(&guard.right.rows)
+            let rows = {
+                let guard = state.lock().unwrap();
+                if is_local {
+                    Arc::clone(&guard.left.rows)
+                } else {
+                    Arc::clone(&guard.right.rows)
+                }
             };
             let selected = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
+            let mut guard = state.lock().unwrap();
             let pane = if is_local {
                 &mut guard.left
             } else {
@@ -888,7 +984,7 @@ unsafe fn handle_listview_notify(
         NM_DBLCLK => {
             let nmia = &*(lparam.0 as *const NMITEMACTIVATE);
             if nmia.iItem >= 0 {
-                let mut guard = ctx.state.lock().unwrap();
+                let mut guard = state.lock().unwrap();
                 let (has_parent, entries) = if is_local {
                     (guard.left.has_parent, Arc::clone(&guard.left.entries))
                 } else {
@@ -915,7 +1011,7 @@ unsafe fn handle_listview_notify(
                 _ => None,
             };
             if let Some(column) = col {
-                let mut guard = ctx.state.lock().unwrap();
+                let mut guard = state.lock().unwrap();
                 guard
                     .events
                     .push(NativePaneEvent::SortChanged { is_local, column });
@@ -923,19 +1019,54 @@ unsafe fn handle_listview_notify(
             Some(LRESULT(0))
         }
 
+        LVN_BEGINLABELEDITW => {
+            let di = &*(lparam.0 as *const NMLVDISPINFOW);
+            if di.item.iItem < 0 {
+                return Some(LRESULT(1));
+            }
+            let mut guard = state.lock().unwrap();
+            let pane = if is_local {
+                &mut guard.left
+            } else {
+                &mut guard.right
+            };
+            match map_row_index_to_entry(di.item.iItem as usize, pane.has_parent, &pane.entries) {
+                Some(Ok(entry)) if !matches!(entry.kind, crate::models::FileKind::Bucket) => {
+                    pane.editing_original_path = Some(entry.path.clone());
+                    Some(LRESULT(0))
+                }
+                _ => {
+                    pane.editing_original_path = None;
+                    Some(LRESULT(1))
+                }
+            }
+        }
+
         LVN_ENDLABELEDITW => {
             let di = &*(lparam.0 as *const NMLVDISPINFOW);
-            if di.item.iItem >= 0 && !di.item.pszText.is_null() {
+            let mut guard = state.lock().unwrap();
+            let (tracked_path, has_parent, entries) = if is_local {
+                (
+                    guard.left.editing_original_path.take(),
+                    guard.left.has_parent,
+                    Arc::clone(&guard.left.entries),
+                )
+            } else {
+                (
+                    guard.right.editing_original_path.take(),
+                    guard.right.has_parent,
+                    Arc::clone(&guard.right.entries),
+                )
+            };
+            if !di.item.pszText.is_null() {
                 let edited = di.item.pszText.to_string().unwrap_or_default();
-                let mut guard = ctx.state.lock().unwrap();
-                let (has_parent, entries) = if is_local {
-                    (guard.left.has_parent, Arc::clone(&guard.left.entries))
-                } else {
-                    (guard.right.has_parent, Arc::clone(&guard.right.entries))
-                };
-                if let Some(Ok(entry)) =
-                    map_row_index_to_entry(di.item.iItem as usize, has_parent, &entries)
-                {
+                let fallback_row = (di.item.iItem >= 0).then_some(di.item.iItem as usize);
+                if let Some(entry) = resolve_inline_rename_entry(
+                    tracked_path.as_deref(),
+                    fallback_row,
+                    has_parent,
+                    &entries,
+                ) {
                     if let Some(new_name) = should_commit_inline_rename(&entry.name, &edited) {
                         guard.events.push(NativePaneEvent::InlineRenameCommitted {
                             is_local,
@@ -977,10 +1108,10 @@ unsafe fn handle_listview_notify(
                     send_msg(lv_hwnd, LVM_EDITLABELW, focused as usize, 0);
                 }
             } else if vk == VK_BACK.0 {
-                let mut guard = ctx.state.lock().unwrap();
+                let mut guard = state.lock().unwrap();
                 guard.events.push(NativePaneEvent::NavigateUp { is_local });
             } else if vk == VK_DELETE.0 {
-                let mut guard = ctx.state.lock().unwrap();
+                let mut guard = state.lock().unwrap();
                 guard.events.push(NativePaneEvent::ContextMenuCommand {
                     is_local,
                     action: NativeContextMenuAction::DeleteSelected,
@@ -989,7 +1120,7 @@ unsafe fn handle_listview_notify(
                 let focused =
                     send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize).0;
                 if focused >= 0 {
-                    let mut guard = ctx.state.lock().unwrap();
+                    let mut guard = state.lock().unwrap();
                     let (has_parent, entries) = if is_local {
                         (guard.left.has_parent, Arc::clone(&guard.left.entries))
                     } else {
@@ -1037,51 +1168,53 @@ unsafe extern "system" fn child_subclass_proc(
 ) -> LRESULT {
     if dwrefdata != 0 {
         let ctx = &*(dwrefdata as *const SubclassContext);
-        let is_local = {
-            let guard = ctx.state.lock().unwrap();
-            hwnd.0 as isize == guard.left.hwnd
-        };
+        if let Some(state) = ctx.state.upgrade() {
+            let is_local = {
+                let guard = state.lock().unwrap();
+                hwnd.0 as isize == guard.left.hwnd
+            };
 
-        match umsg {
-            WM_DROPFILES => {
-                let hdrop = HDROP(wparam.0 as *mut c_void);
-                handle_wm_dropfiles(ctx, hwnd, is_local, hdrop);
-                return LRESULT(0);
-            }
-            WM_CONTEXTMENU => {
-                let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                if x == -1 && y == -1 {
-                    let mut pt = POINT::default();
-                    let _ = GetCursorPos(&mut pt);
-                    show_pane_context_menu(ctx, hwnd, is_local, pt);
+            match umsg {
+                WM_DROPFILES => {
+                    let hdrop = HDROP(wparam.0 as *mut c_void);
+                    handle_wm_dropfiles(&state, hwnd, is_local, hdrop);
                     return LRESULT(0);
                 }
-            }
-            WM_MOUSEMOVE => {
-                let has_drag = ctx.state.lock().unwrap().active_remote_drag.is_some();
-                if has_drag {
-                    if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
-                        SetCursor(Some(cursor));
+                WM_CONTEXTMENU => {
+                    let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                    if x == -1 && y == -1 {
+                        let mut pt = POINT::default();
+                        let _ = GetCursorPos(&mut pt);
+                        show_pane_context_menu(ctx, hwnd, is_local, pt);
+                        return LRESULT(0);
                     }
-                    return LRESULT(0);
                 }
-            }
-            WM_LBUTTONUP => {
-                let drag_opt = ctx.state.lock().unwrap().active_remote_drag.take();
-                if let Some(drag) = drag_opt {
-                    let _ = ReleaseCapture();
-                    if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
-                        SetCursor(Some(cursor));
+                WM_MOUSEMOVE => {
+                    let has_drag = state.lock().unwrap().active_remote_drag.is_some();
+                    if has_drag {
+                        if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+                            SetCursor(Some(cursor));
+                        }
+                        return LRESULT(0);
                     }
-                    finish_remote_to_local_drag(ctx, drag.source_paths);
-                    return LRESULT(0);
                 }
+                WM_LBUTTONUP => {
+                    let drag_opt = state.lock().unwrap().active_remote_drag.take();
+                    if let Some(drag) = drag_opt {
+                        let _ = ReleaseCapture();
+                        if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
+                            SetCursor(Some(cursor));
+                        }
+                        finish_remote_to_local_drag(&state, drag.source_paths);
+                        return LRESULT(0);
+                    }
+                }
+                WM_CAPTURECHANGED => {
+                    state.lock().unwrap().active_remote_drag = None;
+                }
+                _ => {}
             }
-            WM_CAPTURECHANGED => {
-                ctx.state.lock().unwrap().active_remote_drag = None;
-            }
-            _ => {}
         }
     }
 
@@ -1089,7 +1222,7 @@ unsafe extern "system" fn child_subclass_proc(
 }
 
 unsafe fn handle_wm_dropfiles(
-    ctx: &SubclassContext,
+    state: &Arc<Mutex<HostInner>>,
     lv_hwnd: HWND,
     target_is_local: bool,
     hdrop: HDROP,
@@ -1122,7 +1255,7 @@ unsafe fn handle_wm_dropfiles(
     };
     let hit_row = send_msg(lv_hwnd, LVM_HITTEST, 0, &mut hti as *mut _ as isize).0;
 
-    let mut guard = ctx.state.lock().unwrap();
+    let mut guard = state.lock().unwrap();
     let pane = if target_is_local {
         &guard.left
     } else {
@@ -1146,19 +1279,26 @@ unsafe fn handle_wm_dropfiles(
 }
 
 unsafe fn start_pane_drag(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, dragged_row: i32) {
-    let (current_path, selected_paths) = {
-        let guard = ctx.state.lock().unwrap();
-        let pane = if is_local { &guard.left } else { &guard.right };
-        let mut sel = collect_selected_paths_from_hwnd(lv_hwnd, &pane.rows);
-        if sel.is_empty() && dragged_row >= 0 {
-            if let Some(Ok(e)) =
-                map_row_index_to_entry(dragged_row as usize, pane.has_parent, &pane.entries)
-            {
-                sel.push(e.path.clone());
-            }
-        }
-        (pane.current_path.clone(), sel)
+    let Some(state) = ctx.state.upgrade() else {
+        return;
     };
+    let (current_path, rows, has_parent, entries) = {
+        let guard = state.lock().unwrap();
+        let pane = if is_local { &guard.left } else { &guard.right };
+        (
+            pane.current_path.clone(),
+            Arc::clone(&pane.rows),
+            pane.has_parent,
+            Arc::clone(&pane.entries),
+        )
+    };
+
+    let mut selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
+    if selected_paths.is_empty() && dragged_row >= 0 {
+        if let Some(Ok(e)) = map_row_index_to_entry(dragged_row as usize, has_parent, &entries) {
+            selected_paths.push(e.path.clone());
+        }
+    }
 
     if selected_paths.is_empty() {
         return;
@@ -1167,10 +1307,36 @@ unsafe fn start_pane_drag(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, 
     if is_local && current_path != "/" {
         let _ = run_local_shell_drag(&current_path, &selected_paths, lv_hwnd);
     } else if !is_local {
-        ctx.state.lock().unwrap().active_remote_drag = Some(ActiveRemoteDrag {
+        state.lock().unwrap().active_remote_drag = Some(ActiveRemoteDrag {
             source_paths: selected_paths,
         });
         SetCapture(lv_hwnd);
+    }
+}
+
+struct PidlListGuard(Vec<*mut ITEMIDLIST>);
+
+impl PidlListGuard {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, pidl: *mut ITEMIDLIST) {
+        if !pidl.is_null() {
+            self.0.push(pidl);
+        }
+    }
+}
+
+impl Drop for PidlListGuard {
+    fn drop(&mut self) {
+        unsafe {
+            for pidl in self.0.drain(..) {
+                if !pidl.is_null() {
+                    ILFree(Some(pidl as *const ITEMIDLIST));
+                }
+            }
+        }
     }
 }
 
@@ -1179,6 +1345,7 @@ unsafe fn run_local_shell_drag(
     file_paths: &[String],
     hwnd: HWND,
 ) -> anyhow::Result<()> {
+    let mut guard = PidlListGuard::new();
     let parent_wide: Vec<u16> = parent_dir.encode_utf16().chain(std::iter::once(0)).collect();
     let mut parent_pidl: *mut ITEMIDLIST = null_mut();
     SHParseDisplayName(
@@ -1188,8 +1355,8 @@ unsafe fn run_local_shell_drag(
         0,
         None,
     )?;
+    guard.push(parent_pidl);
 
-    let mut full_pidls: Vec<*mut ITEMIDLIST> = Vec::new();
     let mut child_pidls: Vec<*const ITEMIDLIST> = Vec::new();
     for path in file_paths {
         let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1197,7 +1364,7 @@ unsafe fn run_local_shell_drag(
         if SHParseDisplayName(PCWSTR(wpath.as_ptr()), None, &mut pidl, 0, None).is_ok()
             && !pidl.is_null()
         {
-            full_pidls.push(pidl);
+            guard.push(pidl);
             child_pidls.push(ILFindLastID(pidl) as *const ITEMIDLIST);
         }
     }
@@ -1212,14 +1379,13 @@ unsafe fn run_local_shell_drag(
         }
     }
 
-    for pidl in full_pidls {
-        ILFree(Some(pidl as *const ITEMIDLIST));
-    }
-    ILFree(Some(parent_pidl as *const ITEMIDLIST));
     Ok(())
 }
 
-unsafe fn finish_remote_to_local_drag(ctx: &SubclassContext, source_paths: Vec<String>) {
+unsafe fn finish_remote_to_local_drag(
+    state: &Arc<Mutex<HostInner>>,
+    source_paths: Vec<String>,
+) {
     let mut screen_pt = POINT::default();
     if GetCursorPos(&mut screen_pt).is_err() {
         return;
@@ -1229,14 +1395,19 @@ unsafe fn finish_remote_to_local_drag(ctx: &SubclassContext, source_paths: Vec<S
         return;
     }
 
-    let mut guard = ctx.state.lock().unwrap();
-    let left_hwnd = HWND(guard.left.hwnd as *mut c_void);
+    let (left_hwnd, left_path) = {
+        let guard = state.lock().unwrap();
+        (
+            HWND(guard.left.hwnd as *mut c_void),
+            guard.left.current_path.clone(),
+        )
+    };
     if left_hwnd.0.is_null() {
         return;
     }
 
     let is_over_left = target_hwnd == left_hwnd || IsChild(left_hwnd, target_hwnd).as_bool();
-    if !is_over_left || guard.left.current_path == "/" {
+    if !is_over_left || left_path == "/" {
         return;
     }
 
@@ -1248,6 +1419,7 @@ unsafe fn finish_remote_to_local_drag(ctx: &SubclassContext, source_paths: Vec<S
     };
     let hit_row = send_msg(left_hwnd, LVM_HITTEST, 0, &mut hti as *mut _ as isize).0;
 
+    let mut guard = state.lock().unwrap();
     let hovered_entry = if hit_row >= 0 {
         match map_row_index_to_entry(hit_row as usize, guard.left.has_parent, &guard.left.entries) {
             Some(Ok(e)) => Some(e),
@@ -1271,17 +1443,23 @@ unsafe fn show_pane_context_menu(
     is_local: bool,
     screen_pt: POINT,
 ) {
-    let (current_path, selected_paths, single_is_bucket) = {
-        let guard = ctx.state.lock().unwrap();
-        let pane = if is_local { &guard.left } else { &guard.right };
-        let sel = collect_selected_paths_from_hwnd(lv_hwnd, &pane.rows);
-        let is_bucket = sel.len() == 1
-            && pane
-                .entries
-                .iter()
-                .any(|e| e.path == sel[0] && matches!(e.kind, crate::models::FileKind::Bucket));
-        (pane.current_path.clone(), sel, is_bucket)
+    let Some(state) = ctx.state.upgrade() else {
+        return;
     };
+    let (current_path, rows, entries) = {
+        let guard = state.lock().unwrap();
+        let pane = if is_local { &guard.left } else { &guard.right };
+        (
+            pane.current_path.clone(),
+            Arc::clone(&pane.rows),
+            Arc::clone(&pane.entries),
+        )
+    };
+    let selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
+    let single_is_bucket = selected_paths.len() == 1
+        && entries
+            .iter()
+            .any(|e| e.path == selected_paths[0] && matches!(e.kind, crate::models::FileKind::Bucket));
 
     if is_local && can_use_shell_context_menu(&current_path, &selected_paths) {
         if show_local_shell_context_menu(ctx, lv_hwnd, &current_path, &selected_paths, screen_pt)
@@ -1302,28 +1480,30 @@ unsafe fn show_pane_context_menu(
     );
 }
 
-unsafe fn show_local_shell_context_menu(
-    ctx: &SubclassContext,
-    lv_hwnd: HWND,
+unsafe fn resolve_shell_menu_pidls(
     parent_dir: &str,
     selected_paths: &[String],
-    screen_pt: POINT,
-) -> anyhow::Result<()> {
-    let mut full_pidls: Vec<*mut ITEMIDLIST> = Vec::new();
+) -> anyhow::Result<(IShellFolder, Vec<*const ITEMIDLIST>, PidlListGuard)> {
+    if selected_paths.is_empty() {
+        return Err(anyhow::anyhow!("empty selected_paths"));
+    }
+
+    let mut pidl_guard = PidlListGuard::new();
     let mut child_pidls: Vec<*const ITEMIDLIST> = Vec::new();
 
-    let parent_folder: IShellFolder = if selected_paths.len() == 1 {
+    if selected_paths.len() == 1 {
         let wpath: Vec<u16> = selected_paths[0]
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
         let mut pidl: *mut ITEMIDLIST = null_mut();
         SHParseDisplayName(PCWSTR(wpath.as_ptr()), None, &mut pidl, 0, None)?;
+        pidl_guard.push(pidl);
+
         let mut child_last: *mut ITEMIDLIST = null_mut();
         let folder: IShellFolder = SHBindToParent(pidl, Some(&mut child_last))?;
-        full_pidls.push(pidl);
         child_pidls.push(child_last as *const ITEMIDLIST);
-        folder
+        Ok((folder, child_pidls, pidl_guard))
     } else {
         let wparent: Vec<u16> = parent_dir
             .encode_utf16()
@@ -1331,68 +1511,78 @@ unsafe fn show_local_shell_context_menu(
             .collect();
         let mut parent_pidl: *mut ITEMIDLIST = null_mut();
         SHParseDisplayName(PCWSTR(wparent.as_ptr()), None, &mut parent_pidl, 0, None)?;
-        let folder_res: windows::core::Result<IShellFolder> =
-            SHBindToObject(None, parent_pidl, None);
-        ILFree(Some(parent_pidl as *const ITEMIDLIST));
-        let folder = folder_res?;
+        pidl_guard.push(parent_pidl);
 
+        let folder: IShellFolder = SHBindToObject(None, parent_pidl, None)?;
         for path in selected_paths {
             let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
             let mut pidl: *mut ITEMIDLIST = null_mut();
-            if SHParseDisplayName(PCWSTR(wpath.as_ptr()), None, &mut pidl, 0, None).is_ok()
-                && !pidl.is_null()
-            {
-                full_pidls.push(pidl);
-                child_pidls.push(ILFindLastID(pidl) as *const ITEMIDLIST);
+            SHParseDisplayName(PCWSTR(wpath.as_ptr()), None, &mut pidl, 0, None)?;
+            if pidl.is_null() {
+                return Err(anyhow::anyhow!("null pidl for {path}"));
             }
+            pidl_guard.push(pidl);
+            child_pidls.push(ILFindLastID(pidl) as *const ITEMIDLIST);
         }
-        folder
-    };
+        Ok((folder, child_pidls, pidl_guard))
+    }
+}
 
-    let result = (|| -> anyhow::Result<()> {
-        if child_pidls.is_empty() {
-            return Err(anyhow::anyhow!("empty child pidls"));
-        }
-        let context_menu: IContextMenu =
-            parent_folder.GetUIObjectOf(lv_hwnd, &child_pidls, None)?;
-        let hmenu = CreatePopupMenu()?;
+unsafe fn show_local_shell_context_menu(
+    ctx: &SubclassContext,
+    lv_hwnd: HWND,
+    parent_dir: &str,
+    selected_paths: &[String],
+    screen_pt: POINT,
+) -> anyhow::Result<()> {
+    let (parent_folder, child_pidls, _pidl_guard) =
+        resolve_shell_menu_pidls(parent_dir, selected_paths)?;
+    if child_pidls.is_empty() {
+        return Err(anyhow::anyhow!("empty child pidls"));
+    }
 
-        let t = i18n();
-        append_menu_str(hmenu, CMD_TRANSFER, t.ctx_upload_to_remote(), true);
-        append_menu_str(hmenu, CMD_NEW_FOLDER, t.ctx_new_folder(), true);
-        append_menu_str(hmenu, CMD_REFRESH, t.ctx_refresh(), true);
-        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
+    let context_menu: IContextMenu = parent_folder.GetUIObjectOf(lv_hwnd, &child_pidls, None)?;
+    let hmenu = CreatePopupMenu()?;
 
-        let insert_pos = 4u32;
-        let _ = context_menu.QueryContextMenu(
-            hmenu,
-            insert_pos,
-            CMD_SHELL_FIRST,
-            CMD_SHELL_LAST,
-            CMF_NORMAL,
-        );
+    let t = i18n();
+    append_menu_str(hmenu, CMD_TRANSFER, t.ctx_upload_to_remote(), true);
+    append_menu_str(hmenu, CMD_NEW_FOLDER, t.ctx_new_folder(), true);
+    append_menu_str(hmenu, CMD_REFRESH, t.ctx_refresh(), true);
+    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
 
-        let cmd = TrackPopupMenuEx(
-            hmenu,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN).0,
-            screen_pt.x,
-            screen_pt.y,
-            lv_hwnd,
-            None,
-        )
-        .0 as u32;
+    let insert_pos = 4u32;
+    let _ = context_menu.QueryContextMenu(
+        hmenu,
+        insert_pos,
+        CMD_SHELL_FIRST,
+        CMD_SHELL_LAST,
+        CMF_NORMAL,
+    );
 
-        if cmd >= CMD_SHELL_FIRST && cmd <= CMD_SHELL_LAST {
-            let offset = (cmd - CMD_SHELL_FIRST) as usize;
-            let ici = CMINVOKECOMMANDINFO {
-                cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32,
-                hwnd: lv_hwnd,
-                lpVerb: windows::core::PCSTR(offset as *const u8),
-                nShow: SW_SHOWNOACTIVATE.0,
-                ..Default::default()
-            };
-            let _ = context_menu.InvokeCommand(&ici);
-            ctx.state
+    let cmd = TrackPopupMenuEx(
+        hmenu,
+        (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN).0,
+        screen_pt.x,
+        screen_pt.y,
+        lv_hwnd,
+        None,
+    )
+    .0 as u32;
+
+    let _ = DestroyMenu(hmenu);
+
+    if cmd >= CMD_SHELL_FIRST && cmd <= CMD_SHELL_LAST {
+        let offset = (cmd - CMD_SHELL_FIRST) as usize;
+        let ici = CMINVOKECOMMANDINFO {
+            cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32,
+            hwnd: lv_hwnd,
+            lpVerb: windows::core::PCSTR(offset as *const u8),
+            nShow: SW_SHOWNOACTIVATE.0,
+            ..Default::default()
+        };
+        let _ = context_menu.InvokeCommand(&ici);
+        if let Some(state) = ctx.state.upgrade() {
+            state
                 .lock()
                 .unwrap()
                 .events
@@ -1400,18 +1590,12 @@ unsafe fn show_local_shell_context_menu(
                     is_local: true,
                     action: NativeContextMenuAction::Refresh,
                 });
-        } else if cmd != 0 {
-            dispatch_custom_menu_cmd(ctx, lv_hwnd, true, cmd);
         }
-
-        let _ = DestroyMenu(hmenu);
-        Ok(())
-    })();
-
-    for pidl in full_pidls {
-        ILFree(Some(pidl as *const ITEMIDLIST));
+    } else if cmd != 0 {
+        dispatch_custom_menu_cmd(ctx, lv_hwnd, true, cmd);
     }
-    result
+
+    Ok(())
 }
 
 unsafe fn show_standard_native_hmenu(
@@ -1499,8 +1683,8 @@ unsafe fn dispatch_custom_menu_cmd(
         _ => None,
     };
 
-    if let Some(act) = action {
-        ctx.state
+    if let (Some(act), Some(state)) = (action, ctx.state.upgrade()) {
+        state
             .lock()
             .unwrap()
             .events
@@ -1535,5 +1719,88 @@ mod tests {
         assert!(dir_icon >= 0);
         assert!(txt_icon >= 0);
         assert!(exe_icon >= 0);
+    }
+
+    #[test]
+    fn test_ole_clipboard_initialized_for_drag_drop_on_fresh_thread() {
+        let ok = std::thread::spawn(|| {
+            let _host = PlatformHost::new();
+            unsafe { windows::Win32::System::Ole::OleGetClipboard().is_ok() }
+        })
+        .join()
+        .unwrap();
+        assert!(ok, "PlatformHost::new must initialize OLE on the UI thread");
+    }
+
+    #[test]
+    fn test_platform_host_teardown_releases_weak_state_and_syncs_unlocked() {
+        unsafe {
+            let hinstance = GetModuleHandleW(None).unwrap_or_default();
+            let dummy_parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("rustduck_test_parent"),
+                WS_POPUP,
+                0,
+                0,
+                400,
+                300,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+            .expect("dummy parent HWND");
+
+            let weak = {
+                let host = PlatformHost::new();
+                let weak = Arc::downgrade(&host.state);
+                let snap = NativePaneSnapshot {
+                    tab_idx: 0,
+                    is_local: true,
+                    current_path: r"C:\".to_string(),
+                    bounds_px: (0, 0, 360, 240),
+                    scale_factor: 1.0,
+                    visible: true,
+                    is_dark: true,
+                    sort_col: SortColumn::Name,
+                    sort_ascending: true,
+                    has_parent: false,
+                    entries_revision: 1,
+                    rows: Arc::new(Vec::new()),
+                    entries: Arc::new(Vec::new()),
+                    selected_paths: Vec::new(),
+                };
+                host.sync_pane_for_parent_hwnd(dummy_parent.0 as isize, &snap);
+                assert!(weak.upgrade().is_some());
+                weak
+            };
+
+            assert!(
+                weak.upgrade().is_none(),
+                "Dropping PlatformHost must release HostInner without SubclassContext Arc cycles"
+            );
+            let _ = DestroyWindow(dummy_parent);
+        }
+    }
+
+    #[test]
+    fn test_pidl_guard_frees_allocated_pidls_when_bind_or_parse_fails_early() {
+        let tmp = std::env::temp_dir();
+        let valid_path = tmp.to_string_lossy().to_string();
+        let invalid_path = r"Z:\__rustduck_nonexistent_drive_and_file_99999__".to_string();
+
+        let _host = PlatformHost::new();
+        let res = unsafe {
+            resolve_shell_menu_pidls(
+                &valid_path,
+                &[valid_path.clone(), invalid_path],
+            )
+        };
+        assert!(res.is_err());
+
+        let single_ok =
+            unsafe { resolve_shell_menu_pidls(&valid_path, std::slice::from_ref(&valid_path)) };
+        assert!(single_ok.is_ok());
     }
 }

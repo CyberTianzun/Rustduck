@@ -186,6 +186,24 @@ pub fn should_commit_inline_rename(original_name: &str, edited_text: &str) -> Op
     }
 }
 
+pub fn resolve_inline_rename_entry<'a>(
+    tracked_path: Option<&str>,
+    fallback_row: Option<usize>,
+    has_parent: bool,
+    entries: &'a [FileEntry],
+) -> Option<&'a FileEntry> {
+    if let Some(target_path) = tracked_path {
+        if !target_path.is_empty() {
+            return entries.iter().find(|e| e.path == target_path);
+        }
+    }
+    let row_idx = fallback_row?;
+    match map_row_index_to_entry(row_idx, has_parent, entries) {
+        Some(Ok(entry)) => Some(entry),
+        _ => None,
+    }
+}
+
 pub fn compute_pane_visibility(
     is_connected: bool,
     settings_open: bool,
@@ -366,6 +384,84 @@ mod tests {
         assert_eq!(
             host.drain_events(),
             vec![NativePaneEvent::NavigateUp { is_local: true }]
+        );
+    }
+
+    #[test]
+    fn test_resolve_inline_rename_entry_prefers_tracked_path_over_shifted_row() {
+        let shifted_entries = vec![
+            FileEntry {
+                name: "00_new_folder".into(),
+                path: "/var/00_new_folder".into(),
+                kind: FileKind::Directory,
+                size: 0,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "docs".into(),
+                path: "/var/docs".into(),
+                kind: FileKind::Directory,
+                size: 0,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "report.pdf".into(),
+                path: "/var/report.pdf".into(),
+                kind: FileKind::File,
+                size: 2048,
+                modified_unix: None,
+                permissions: None,
+            },
+        ];
+
+        // Row 1 used to be "/var/docs", now "/var/00_new_folder" is at row 1 and "/var/docs" is at row 2.
+        let resolved =
+            resolve_inline_rename_entry(Some("/var/docs"), Some(1), true, &shifted_entries);
+        assert_eq!(resolved.map(|e| e.path.as_str()), Some("/var/docs"));
+
+        // If the tracked path was deleted mid-edit, abort rather than renaming whatever is now at row 1.
+        let deleted =
+            resolve_inline_rename_entry(Some("/var/deleted.txt"), Some(1), true, &shifted_entries);
+        assert_eq!(deleted, None);
+
+        // Without a tracked path hint, fall back to live row index mapping.
+        let by_row = resolve_inline_rename_entry(None, Some(3), true, &shifted_entries);
+        assert_eq!(by_row.map(|e| e.path.as_str()), Some("/var/report.pdf"));
+    }
+
+    #[test]
+    fn test_macos_source_balances_retains_and_uses_weak_delegate_state() {
+        let macos_src = include_str!("macos.rs");
+        let delegate_block = macos_src
+            .split("struct DelegateContext {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("DelegateContext struct must exist in macos.rs");
+        assert!(
+            delegate_block.contains("state: Weak<Mutex<HostInner>>"),
+            "DelegateContext must hold Weak<Mutex<HostInner>> to avoid Arc reference cycle"
+        );
+        assert!(
+            !delegate_block.contains("Arc<Mutex<HostInner>>"),
+            "DelegateContext must not hold strong Arc<Mutex<HostInner>>"
+        );
+        assert!(
+            macos_src.contains("msg_send![tf, autorelease]"),
+            "NSTextField subview must be autoreleased after addSubview"
+        );
+        assert!(
+            macos_src.contains("msg_send![iv, autorelease]"),
+            "NSImageView subview must be autoreleased after addSubview"
+        );
+        assert!(
+            macos_src.contains("msg_send![item, autorelease]"),
+            "NSMenuItem must be autoreleased after addItem"
+        );
+        assert!(
+            macos_src.contains("rowForView:"),
+            "macOS inline rename must resolve live row via [tableView rowForView:] instead of stale [tf tag]"
         );
     }
 }

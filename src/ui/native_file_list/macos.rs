@@ -1,7 +1,7 @@
 use super::{
     compute_appkit_frame, map_row_index_to_entry, resolve_drop_destination_dir,
-    should_commit_inline_rename, NativeContextMenuAction, NativeEventSink, NativePaneEvent,
-    NativePaneSnapshot, NativeRowViewModel,
+    resolve_inline_rename_entry, should_commit_inline_rename, NativeContextMenuAction,
+    NativeEventSink, NativePaneEvent, NativePaneSnapshot, NativeRowViewModel,
 };
 use crate::i18n::i18n;
 use crate::models::FileEntry;
@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::ffi::{c_void, CStr};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, Weak};
 
 const DELEGATE_IVAR: &CStr = c"rustduckDelegateCtx";
 const RUSTDUCK_REMOTE_PB_TYPE: &str = "app.rustduck.remote-paths";
@@ -31,6 +31,7 @@ struct MacPaneState {
     delegate_obj: usize,
     visible: bool,
     bounds_px: (i32, i32, i32, i32),
+    scale_factor: f32,
     is_dark: Option<bool>,
     tab_idx: usize,
     entries_revision: u64,
@@ -42,6 +43,7 @@ struct MacPaneState {
     rows: Arc<Vec<NativeRowViewModel>>,
     entries: Arc<Vec<FileEntry>>,
     selected_paths: Vec<String>,
+    editing_original_path: Option<String>,
 }
 
 impl MacPaneState {
@@ -52,6 +54,7 @@ impl MacPaneState {
             delegate_obj: 0,
             visible: false,
             bounds_px: (0, 0, 0, 0),
+            scale_factor: 1.0,
             is_dark: None,
             tab_idx: usize::MAX,
             entries_revision: u64::MAX,
@@ -63,16 +66,16 @@ impl MacPaneState {
             rows: Arc::new(Vec::new()),
             entries: Arc::new(Vec::new()),
             selected_paths: Vec::new(),
+            editing_original_path: None,
         }
     }
 
-    fn hide(&mut self) {
+    fn take_hide_scroll_view(&mut self) -> Option<usize> {
         if self.visible && self.scroll_view != 0 {
             self.visible = false;
-            unsafe {
-                let sv = self.scroll_view as *mut AnyObject;
-                let _: () = msg_send![sv, setHidden: Bool::YES];
-            }
+            Some(self.scroll_view)
+        } else {
+            None
         }
     }
 }
@@ -86,7 +89,7 @@ struct HostInner {
 
 struct DelegateContext {
     is_local: bool,
-    state: Arc<Mutex<HostInner>>,
+    state: Weak<Mutex<HostInner>>,
     suppress_selection: Arc<AtomicBool>,
 }
 
@@ -144,11 +147,14 @@ impl PlatformHost {
         let root_view = root_view_ptr as *mut AnyObject;
 
         let vis_changed = pane.visible != snapshot.visible;
-        let bounds_changed = pane.bounds_px != snapshot.bounds_px;
+        let bounds_changed = pane.bounds_px != snapshot.bounds_px
+            || (pane.scale_factor - snapshot.scale_factor).abs() > f32::EPSILON;
         pane.visible = snapshot.visible;
         pane.bounds_px = snapshot.bounds_px;
+        pane.scale_factor = snapshot.scale_factor;
 
         if !snapshot.visible {
+            drop(guard);
             if vis_changed {
                 unsafe {
                     let _: () = msg_send![sv, setHidden: Bool::YES];
@@ -157,33 +163,12 @@ impl PlatformHost {
             return;
         }
 
-        if bounds_changed {
-            unsafe {
-                let root_bounds: NSRect = msg_send![root_view, bounds];
-                let is_flipped: Bool = msg_send![root_view, isFlipped];
-                let (x, y, w, h) = compute_appkit_frame(
-                    snapshot.bounds_px,
-                    snapshot.scale_factor,
-                    root_bounds.size.height,
-                    is_flipped.as_bool(),
-                );
-                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-                let _: () = msg_send![sv, setFrame: frame];
-                resize_mac_columns(tv, w);
-            }
-        }
-        if vis_changed {
-            unsafe {
-                let _: () = msg_send![sv, setHidden: Bool::NO];
-            }
-        }
-
-        if pane.is_dark != Some(snapshot.is_dark) {
+        let need_appearance = if pane.is_dark != Some(snapshot.is_dark) {
             pane.is_dark = Some(snapshot.is_dark);
-            unsafe {
-                apply_mac_appearance(sv, snapshot.is_dark);
-            }
-        }
+            Some(snapshot.is_dark)
+        } else {
+            None
+        };
 
         let t = i18n();
         let desired_labels = (
@@ -193,19 +178,14 @@ impl PlatformHost {
         );
         let sort_changed =
             pane.sort_col != snapshot.sort_col || pane.sort_ascending != snapshot.sort_ascending;
-        if pane.header_labels != desired_labels || sort_changed {
+        let need_headers = if pane.header_labels != desired_labels || sort_changed {
             pane.header_labels = desired_labels.clone();
             pane.sort_col = snapshot.sort_col;
             pane.sort_ascending = snapshot.sort_ascending;
-            unsafe {
-                update_mac_column_headers(
-                    tv,
-                    &desired_labels,
-                    snapshot.sort_col,
-                    snapshot.sort_ascending,
-                );
-            }
-        }
+            Some((desired_labels, snapshot.sort_col, snapshot.sort_ascending))
+        } else {
+            None
+        };
 
         let data_changed = pane.tab_idx != snapshot.tab_idx
             || pane.entries_revision != snapshot.entries_revision
@@ -223,9 +203,33 @@ impl PlatformHost {
         }
         let rows_clone = Arc::clone(&pane.rows);
         let selected_clone = pane.selected_paths.clone();
+        let bounds_px = snapshot.bounds_px;
+        let scale_factor = snapshot.scale_factor;
         drop(guard);
 
         unsafe {
+            if bounds_changed {
+                let root_bounds: NSRect = msg_send![root_view, bounds];
+                let is_flipped: Bool = msg_send![root_view, isFlipped];
+                let (x, y, w, h) = compute_appkit_frame(
+                    bounds_px,
+                    scale_factor,
+                    root_bounds.size.height,
+                    is_flipped.as_bool(),
+                );
+                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+                let _: () = msg_send![sv, setFrame: frame];
+                resize_mac_columns(tv, w);
+            }
+            if vis_changed {
+                let _: () = msg_send![sv, setHidden: Bool::NO];
+            }
+            if let Some(is_dark) = need_appearance {
+                apply_mac_appearance(sv, is_dark);
+            }
+            if let Some((labels, sort_col, sort_asc)) = need_headers {
+                update_mac_column_headers(tv, &labels, sort_col, sort_asc);
+            }
             if data_changed {
                 self.suppress_selection.store(true, Ordering::SeqCst);
                 let _: () = msg_send![tv, reloadData];
@@ -240,9 +244,19 @@ impl PlatformHost {
     }
 
     pub fn hide_all(&self) {
-        let mut guard = self.state.lock().unwrap();
-        guard.left.hide();
-        guard.right.hide();
+        let (left_sv, right_sv) = {
+            let mut guard = self.state.lock().unwrap();
+            (
+                guard.left.take_hide_scroll_view(),
+                guard.right.take_hide_scroll_view(),
+            )
+        };
+        unsafe {
+            for sv_ptr in [left_sv, right_sv].into_iter().flatten() {
+                let sv = sv_ptr as *mut AnyObject;
+                let _: () = msg_send![sv, setHidden: Bool::YES];
+            }
+        }
     }
 
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
@@ -261,28 +275,32 @@ impl PlatformHost {
     }
 
     fn ensure_views_created(&self, root_view_ptr: usize) {
-        let mut guard = self.state.lock().unwrap();
-        if guard.root_ns_view == root_view_ptr
-            && guard.left.scroll_view != 0
-            && guard.right.scroll_view != 0
         {
-            return;
+            let guard = self.state.lock().unwrap();
+            if guard.root_ns_view == root_view_ptr
+                && guard.left.scroll_view != 0
+                && guard.right.scroll_view != 0
+            {
+                return;
+            }
         }
 
         let root_view = root_view_ptr as *mut AnyObject;
+        let weak_state = Arc::downgrade(&self.state);
         unsafe {
             let (l_sv, l_tv, l_del) = create_single_mac_table(
                 root_view,
                 true,
-                Arc::clone(&self.state),
+                weak_state.clone(),
                 Arc::clone(&self.suppress_selection),
             );
             let (r_sv, r_tv, r_del) = create_single_mac_table(
                 root_view,
                 false,
-                Arc::clone(&self.state),
+                weak_state,
                 Arc::clone(&self.suppress_selection),
             );
+            let mut guard = self.state.lock().unwrap();
             guard.root_ns_view = root_view_ptr;
             guard.left.scroll_view = l_sv as usize;
             guard.left.table_view = l_tv as usize;
@@ -298,6 +316,13 @@ impl Drop for HostInner {
     fn drop(&mut self) {
         unsafe {
             for pane in [&mut self.left, &mut self.right] {
+                if pane.table_view != 0 {
+                    let tv = pane.table_view as *mut AnyObject;
+                    let _: () = msg_send![tv, setDelegate: null::<AnyObject>()];
+                    let _: () = msg_send![tv, setDataSource: null::<AnyObject>()];
+                    let _: () = msg_send![tv, setTarget: null::<AnyObject>()];
+                    pane.table_view = 0;
+                }
                 if pane.scroll_view != 0 {
                     let sv = pane.scroll_view as *mut AnyObject;
                     let _: () = msg_send![sv, removeFromSuperview];
@@ -340,6 +365,10 @@ fn ensure_objc_classes() {
         del_decl.add_method(
             sel!(onDoubleClick:),
             on_double_click as extern "C" fn(_, Sel, *mut AnyObject),
+        );
+        del_decl.add_method(
+            sel!(controlTextDidBeginEditing:),
+            text_did_begin_editing as extern "C" fn(_, Sel, *mut AnyObject),
         );
         del_decl.add_method(
             sel!(controlTextDidEndEditing:),
@@ -386,7 +415,6 @@ fn ensure_objc_classes() {
 
         let mut tv_decl =
             ClassBuilder::new(c"RustduckFinderTableView", class!(NSTableView)).expect("tv class");
-        tv_decl.add_ivar::<*mut c_void>(DELEGATE_IVAR);
         tv_decl.add_method(
             sel!(keyDown:),
             table_key_down as extern "C" fn(_, Sel, *mut AnyObject),
@@ -398,7 +426,7 @@ fn ensure_objc_classes() {
 unsafe fn create_single_mac_table(
     root_view: *mut AnyObject,
     is_local: bool,
-    state: Arc<Mutex<HostInner>>,
+    state: Weak<Mutex<HostInner>>,
     suppress_selection: Arc<AtomicBool>,
 ) -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
     let ctx_ptr = Box::into_raw(Box::new(DelegateContext {
@@ -420,7 +448,6 @@ unsafe fn create_single_mac_table(
 
     let tv: *mut AnyObject = msg_send![TABLE_VIEW_CLASS, alloc];
     let tv: *mut AnyObject = msg_send![tv, initWithFrame: init_rect];
-    (*tv).set_ivar::<*mut c_void>(DELEGATE_IVAR, ctx_ptr);
 
     let _: () = msg_send![tv, setUsesAlternatingRowBackgroundColors: Bool::YES];
     let _: () = msg_send![tv, setAllowsMultipleSelection: Bool::YES];
@@ -441,6 +468,7 @@ unsafe fn create_single_mac_table(
     let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
     let _: () = msg_send![menu, setDelegate: del];
     let _: () = msg_send![tv, setMenu: menu];
+    let _: *mut AnyObject = msg_send![menu, autorelease];
 
     // Drag & Drop registration (Finder file URLs + cross-pane remote paths)
     let file_url_type = NSString::from_str("public.file-url");
@@ -453,6 +481,7 @@ unsafe fn create_single_mac_table(
     let _: () = msg_send![tv, registerForDraggedTypes: types];
 
     let _: () = msg_send![sv, setDocumentView: tv];
+    let _: *mut AnyObject = msg_send![tv, autorelease];
     let _: () = msg_send![root_view, addSubview: sv];
 
     (sv, tv, del)
@@ -467,6 +496,7 @@ unsafe fn add_mac_column(tv: *mut AnyObject, id: &str, title: &str, width: f64) 
     let _: () = msg_send![col, setWidth: width];
     let _: () = msg_send![col, setMinWidth: 64.0f64];
     let _: () = msg_send![tv, addTableColumn: col];
+    let _: *mut AnyObject = msg_send![col, autorelease];
 }
 
 unsafe fn resize_mac_columns(tv: *mut AnyObject, total_width: f64) {
@@ -578,7 +608,10 @@ extern "C" fn number_of_rows(this: *mut AnyObject, _cmd: Sel, _tv: *mut AnyObjec
         let Some(ctx) = get_delegate_ctx(this) else {
             return 0;
         };
-        let guard = ctx.state.lock().unwrap();
+        let Some(state) = ctx.state.upgrade() else {
+            return 0;
+        };
+        let guard = state.lock().unwrap();
         let pane = if ctx.is_local {
             &guard.left
         } else {
@@ -599,11 +632,14 @@ extern "C" fn view_for_table_column(
         let Some(ctx) = get_delegate_ctx(this) else {
             return null_mut();
         };
+        let Some(state) = ctx.state.upgrade() else {
+            return null_mut();
+        };
         if row < 0 || col.is_null() {
             return null_mut();
         }
         let row_opt = {
-            let guard = ctx.state.lock().unwrap();
+            let guard = state.lock().unwrap();
             let pane = if ctx.is_local {
                 &guard.left
             } else {
@@ -635,7 +671,6 @@ extern "C" fn view_for_table_column(
         let _: () = msg_send![tf, setBordered: Bool::NO];
         let _: () = msg_send![tf, setEditable: Bool::new(col_id == "name" && !row_vm.is_parent_row && !row_vm.is_bucket)];
         let _: () = msg_send![tf, setDelegate: this];
-        let _: () = msg_send![tf, setTag: row];
 
         let text = match col_id {
             "name" => row_vm.name.as_str(),
@@ -665,11 +700,13 @@ extern "C" fn view_for_table_column(
                 let iv: *mut AnyObject = msg_send![iv, initWithFrame: iv_frame];
                 let _: () = msg_send![iv, setImage: icon];
                 let _: () = msg_send![cell, addSubview: iv];
+                let _: *mut AnyObject = msg_send![iv, autorelease];
                 let _: () = msg_send![cell, setImageView: iv];
             }
         }
 
         let _: () = msg_send![cell, addSubview: tf];
+        let _: *mut AnyObject = msg_send![tf, autorelease];
         let _: () = msg_send![cell, setTextField: tf];
         let _: *mut AnyObject = msg_send![cell, autorelease];
         cell
@@ -703,16 +740,22 @@ extern "C" fn selection_did_change(this: *mut AnyObject, _cmd: Sel, _notif: *mut
         if ctx.suppress_selection.load(Ordering::SeqCst) {
             return;
         }
-        let mut guard = ctx.state.lock().unwrap();
-        let (tv, rows) = if ctx.is_local {
-            (guard.left.table_view as *mut AnyObject, Arc::clone(&guard.left.rows))
-        } else {
-            (guard.right.table_view as *mut AnyObject, Arc::clone(&guard.right.rows))
+        let Some(state) = ctx.state.upgrade() else {
+            return;
+        };
+        let (tv, rows) = {
+            let guard = state.lock().unwrap();
+            if ctx.is_local {
+                (guard.left.table_view as *mut AnyObject, Arc::clone(&guard.left.rows))
+            } else {
+                (guard.right.table_view as *mut AnyObject, Arc::clone(&guard.right.rows))
+            }
         };
         if tv.is_null() {
             return;
         }
         let sel = collect_mac_selected_paths(tv, &rows);
+        let mut guard = state.lock().unwrap();
         let pane = if ctx.is_local {
             &mut guard.left
         } else {
@@ -738,6 +781,9 @@ extern "C" fn did_click_table_column(
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
+        let Some(state) = ctx.state.upgrade() else {
+            return;
+        };
         if col.is_null() {
             return;
         }
@@ -755,7 +801,7 @@ extern "C" fn did_click_table_column(
             _ => None,
         };
         if let Some(column) = sort_col {
-            ctx.state
+            state
                 .lock()
                 .unwrap()
                 .events
@@ -772,6 +818,9 @@ extern "C" fn on_double_click(this: *mut AnyObject, _cmd: Sel, sender: *mut AnyO
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
+        let Some(state) = ctx.state.upgrade() else {
+            return;
+        };
         if sender.is_null() {
             return;
         }
@@ -779,7 +828,7 @@ extern "C" fn on_double_click(this: *mut AnyObject, _cmd: Sel, sender: *mut AnyO
         if clicked_row < 0 {
             return;
         }
-        let mut guard = ctx.state.lock().unwrap();
+        let mut guard = state.lock().unwrap();
         let (has_parent, entries) = if ctx.is_local {
             (guard.left.has_parent, Arc::clone(&guard.left.entries))
         } else {
@@ -798,9 +847,12 @@ extern "C" fn on_double_click(this: *mut AnyObject, _cmd: Sel, sender: *mut AnyO
     }
 }
 
-extern "C" fn text_did_end_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut AnyObject) {
+extern "C" fn text_did_begin_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut AnyObject) {
     unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
+            return;
+        };
+        let Some(state) = ctx.state.upgrade() else {
             return;
         };
         if notif.is_null() {
@@ -810,10 +862,65 @@ extern "C" fn text_did_end_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut 
         if tf.is_null() {
             return;
         }
-        let row: NSInteger = msg_send![tf, tag];
+        let tv = {
+            let guard = state.lock().unwrap();
+            if ctx.is_local {
+                guard.left.table_view as *mut AnyObject
+            } else {
+                guard.right.table_view as *mut AnyObject
+            }
+        };
+        if tv.is_null() {
+            return;
+        }
+        let row: NSInteger = msg_send![tv, rowForView: tf];
         if row < 0 {
             return;
         }
+        let mut guard = state.lock().unwrap();
+        let pane = if ctx.is_local {
+            &mut guard.left
+        } else {
+            &mut guard.right
+        };
+        pane.editing_original_path =
+            match map_row_index_to_entry(row as usize, pane.has_parent, &pane.entries) {
+                Some(Ok(entry)) => Some(entry.path.clone()),
+                _ => None,
+            };
+    }
+}
+
+extern "C" fn text_did_end_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut AnyObject) {
+    unsafe {
+        let Some(ctx) = get_delegate_ctx(this) else {
+            return;
+        };
+        let Some(state) = ctx.state.upgrade() else {
+            return;
+        };
+        if notif.is_null() {
+            return;
+        }
+        let tf: *mut AnyObject = msg_send![notif, object];
+        if tf.is_null() {
+            return;
+        }
+        let tv = {
+            let guard = state.lock().unwrap();
+            if ctx.is_local {
+                guard.left.table_view as *mut AnyObject
+            } else {
+                guard.right.table_view as *mut AnyObject
+            }
+        };
+        let live_row = if tv.is_null() {
+            None
+        } else {
+            let r: NSInteger = msg_send![tv, rowForView: tf];
+            (r >= 0).then_some(r as usize)
+        };
+
         let ns_str: *mut AnyObject = msg_send![tf, stringValue];
         let utf8: *const i8 = msg_send![ns_str, UTF8String];
         let edited = if utf8.is_null() {
@@ -822,13 +929,23 @@ extern "C" fn text_did_end_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut 
             CStr::from_ptr(utf8).to_string_lossy().to_string()
         };
 
-        let mut guard = ctx.state.lock().unwrap();
-        let (has_parent, entries) = if ctx.is_local {
-            (guard.left.has_parent, Arc::clone(&guard.left.entries))
+        let mut guard = state.lock().unwrap();
+        let (tracked_path, has_parent, entries) = if ctx.is_local {
+            (
+                guard.left.editing_original_path.take(),
+                guard.left.has_parent,
+                Arc::clone(&guard.left.entries),
+            )
         } else {
-            (guard.right.has_parent, Arc::clone(&guard.right.entries))
+            (
+                guard.right.editing_original_path.take(),
+                guard.right.has_parent,
+                Arc::clone(&guard.right.entries),
+            )
         };
-        if let Some(Ok(entry)) = map_row_index_to_entry(row as usize, has_parent, &entries) {
+        if let Some(entry) =
+            resolve_inline_rename_entry(tracked_path.as_deref(), live_row, has_parent, &entries)
+        {
             if let Some(new_name) = should_commit_inline_rename(&entry.name, &edited) {
                 guard.events.push(NativePaneEvent::InlineRenameCommitted {
                     is_local: ctx.is_local,
@@ -845,12 +962,15 @@ extern "C" fn menu_needs_update(this: *mut AnyObject, _cmd: Sel, menu: *mut AnyO
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
+        let Some(state) = ctx.state.upgrade() else {
+            return;
+        };
         if menu.is_null() {
             return;
         }
         let _: () = msg_send![menu, removeAllItems];
         let has_sel = {
-            let guard = ctx.state.lock().unwrap();
+            let guard = state.lock().unwrap();
             let pane = if ctx.is_local {
                 &guard.left
             } else {
@@ -903,11 +1023,15 @@ unsafe fn add_nsmenu_item(
     let _: () = msg_send![item, setTag: tag];
     let _: () = msg_send![item, setEnabled: Bool::new(enabled)];
     let _: () = msg_send![menu, addItem: item];
+    let _: *mut AnyObject = msg_send![item, autorelease];
 }
 
 extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
     unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
+            return;
+        };
+        let Some(state) = ctx.state.upgrade() else {
             return;
         };
         if sender.is_null() {
@@ -916,7 +1040,7 @@ extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut
         let tag: NSInteger = msg_send![sender, tag];
 
         if tag == 8 && ctx.is_local {
-            let paths = ctx.state.lock().unwrap().left.selected_paths.clone();
+            let paths = state.lock().unwrap().left.selected_paths.clone();
             let urls: Vec<_> = paths
                 .iter()
                 .map(|p| {
@@ -948,7 +1072,7 @@ extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut
             _ => None,
         };
         if let Some(act) = action {
-            ctx.state
+            state
                 .lock()
                 .unwrap()
                 .events
@@ -962,7 +1086,12 @@ extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut
 
 extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     unsafe {
-        let Some(ctx) = get_delegate_ctx(this) else {
+        let del: *mut AnyObject = msg_send![this, delegate];
+        let Some(ctx) = get_delegate_ctx(del) else {
+            let _: () = msg_send![super(this, class!(NSTableView)), keyDown: event];
+            return;
+        };
+        let Some(state) = ctx.state.upgrade() else {
             let _: () = msg_send![super(this, class!(NSTableView)), keyDown: event];
             return;
         };
@@ -973,7 +1102,7 @@ extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObj
 
             // Finder shortcuts: Cmd+Up (126) -> parent, Cmd+Down (125) -> open, Cmd+Backspace (51) -> delete, Return (36) -> inline rename
             if cmd_held && key_code == 126 {
-                ctx.state
+                state
                     .lock()
                     .unwrap()
                     .events
@@ -983,7 +1112,7 @@ extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObj
                 return;
             }
             if cmd_held && key_code == 51 {
-                ctx.state
+                state
                     .lock()
                     .unwrap()
                     .events
@@ -996,7 +1125,7 @@ extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObj
             if cmd_held && key_code == 125 {
                 let sel_row: NSInteger = msg_send![this, selectedRow];
                 if sel_row >= 0 {
-                    let mut guard = ctx.state.lock().unwrap();
+                    let mut guard = state.lock().unwrap();
                     let (has_parent, entries) = if ctx.is_local {
                         (guard.left.has_parent, Arc::clone(&guard.left.entries))
                     } else {
@@ -1019,14 +1148,32 @@ extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObj
                 // Finder Return -> edit selected row's Name cell inline
                 let sel_row: NSInteger = msg_send![this, selectedRow];
                 if sel_row >= 0 {
-                    let _: () = msg_send![
-                        this,
-                        editColumn: 0isize,
-                        row: sel_row,
-                        withEvent: null::<AnyObject>(),
-                        select: Bool::YES
-                    ];
-                    return;
+                    let can_edit = {
+                        let mut guard = state.lock().unwrap();
+                        let pane = if ctx.is_local {
+                            &mut guard.left
+                        } else {
+                            &mut guard.right
+                        };
+                        match map_row_index_to_entry(sel_row as usize, pane.has_parent, &pane.entries)
+                        {
+                            Some(Ok(entry)) if !matches!(entry.kind, crate::models::FileKind::Bucket) => {
+                                pane.editing_original_path = Some(entry.path.clone());
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if can_edit {
+                        let _: () = msg_send![
+                            this,
+                            editColumn: 0isize,
+                            row: sel_row,
+                            withEvent: null::<AnyObject>(),
+                            select: Bool::YES
+                        ];
+                        return;
+                    }
                 }
             }
         }
@@ -1045,11 +1192,14 @@ extern "C" fn write_rows_to_pasteboard(
         let Some(ctx) = get_delegate_ctx(this) else {
             return Bool::NO;
         };
+        let Some(state) = ctx.state.upgrade() else {
+            return Bool::NO;
+        };
         if row_indexes.is_null() || pboard.is_null() {
             return Bool::NO;
         }
         let rows = {
-            let guard = ctx.state.lock().unwrap();
+            let guard = state.lock().unwrap();
             if ctx.is_local {
                 Arc::clone(&guard.left.rows)
             } else {
@@ -1118,6 +1268,9 @@ extern "C" fn accept_drop(
         let Some(ctx) = get_delegate_ctx(this) else {
             return Bool::NO;
         };
+        let Some(state) = ctx.state.upgrade() else {
+            return Bool::NO;
+        };
         if info.is_null() {
             return Bool::NO;
         }
@@ -1167,7 +1320,7 @@ extern "C" fn accept_drop(
             return Bool::NO;
         }
 
-        let mut guard = ctx.state.lock().unwrap();
+        let mut guard = state.lock().unwrap();
         let pane = if ctx.is_local {
             &guard.left
         } else {
