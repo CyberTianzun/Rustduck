@@ -1,4 +1,6 @@
 pub mod fallback;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -7,9 +9,11 @@ use crate::ui::file_pane::{format_modified_time, join_local_or_remote, SortColum
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(target_os = "macos")]
+use macos::PlatformHost;
 #[cfg(target_os = "windows")]
 use windows::PlatformHost;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 use fallback::PlatformHost;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +79,7 @@ pub struct NativePaneSnapshot {
     pub is_local: bool,
     pub current_path: String,
     pub bounds_px: (i32, i32, i32, i32),
+    pub scale_factor: f32,
     pub visible: bool,
     pub is_dark: bool,
     pub sort_col: SortColumn,
@@ -189,6 +194,25 @@ pub fn compute_pane_visibility(
     is_connected && !settings_open && width > 0 && height > 0
 }
 
+pub fn compute_appkit_frame(
+    bounds_px: (i32, i32, i32, i32),
+    scale_factor: f32,
+    parent_height_pts: f64,
+    is_flipped: bool,
+) -> (f64, f64, f64, f64) {
+    let scale = (scale_factor.max(0.5)) as f64;
+    let x = (bounds_px.0 as f64) / scale;
+    let top_y = (bounds_px.1 as f64) / scale;
+    let w = ((bounds_px.2.max(1)) as f64) / scale;
+    let h = ((bounds_px.3.max(1)) as f64) / scale;
+    let y = if is_flipped {
+        top_y
+    } else {
+        (parent_height_pts - (top_y + h)).max(0.0)
+    };
+    (x, y, w, h)
+}
+
 #[derive(Default)]
 pub struct NativeFileListHost {
     inner: PlatformHost,
@@ -287,5 +311,14 @@ mod tests {
         assert!(!compute_pane_visibility(true, true, 400, 300));
         assert!(!compute_pane_visibility(false, false, 400, 300));
         assert!(!compute_pane_visibility(true, false, 0, 300));
+    }
+
+    #[test]
+    fn test_compute_appkit_frame_converts_retina_pixels_and_flips_y() {
+        let frame = compute_appkit_frame((20, 200, 800, 600), 2.0, 500.0, false);
+        assert_eq!(frame, (10.0, 100.0, 400.0, 300.0));
+
+        let flipped = compute_appkit_frame((20, 160, 800, 600), 2.0, 500.0, true);
+        assert_eq!(flipped, (10.0, 80.0, 400.0, 300.0));
     }
 }
