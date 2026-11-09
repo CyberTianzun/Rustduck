@@ -877,6 +877,90 @@ impl I18n {
         }
     }
 
+    pub fn pane_footer_multi_selection(&self, count: usize, primary_name: Option<&str>) -> String {
+        if count <= 1 {
+            return self.pane_footer_selection(primary_name);
+        }
+        match (self.is_zh(), primary_name) {
+            (true, Some(name)) => format!("已选 {count} 项 ({name} 等)"),
+            (true, None) => format!("已选 {count} 项"),
+            (false, Some(name)) => format!("{count} selected ({name}, ...)"),
+            (false, None) => format!("{count} selected"),
+        }
+    }
+
+    pub fn ctx_upload_to_remote(&self) -> &'static str {
+        if self.is_zh() {
+            "上传到远程"
+        } else {
+            "Upload to Remote"
+        }
+    }
+
+    pub fn ctx_download_to_local(&self) -> &'static str {
+        if self.is_zh() {
+            "下载到本地"
+        } else {
+            "Download to Local"
+        }
+    }
+
+    pub fn ctx_open_or_enter(&self) -> &'static str {
+        if self.is_zh() {
+            "打开"
+        } else {
+            "Open"
+        }
+    }
+
+    pub fn ctx_rename(&self) -> &'static str {
+        if self.is_zh() {
+            "重命名 (F2)"
+        } else {
+            "Rename (F2)"
+        }
+    }
+
+    pub fn ctx_new_folder(&self) -> &'static str {
+        if self.is_zh() {
+            "新建文件夹"
+        } else {
+            "New Folder"
+        }
+    }
+
+    pub fn ctx_delete(&self) -> &'static str {
+        if self.is_zh() {
+            "删除"
+        } else {
+            "Delete"
+        }
+    }
+
+    pub fn ctx_copy_path(&self) -> &'static str {
+        if self.is_zh() {
+            "复制路径"
+        } else {
+            "Copy Path"
+        }
+    }
+
+    pub fn ctx_refresh(&self) -> &'static str {
+        if self.is_zh() {
+            "刷新"
+        } else {
+            "Refresh"
+        }
+    }
+
+    pub fn ctx_reveal_in_shell(&self) -> &'static str {
+        if self.is_zh() {
+            "在文件管理器中显示"
+        } else {
+            "Reveal in File Manager"
+        }
+    }
+
     // --- Transfer Drawer ---
     pub fn drawer_title(&self) -> &'static str {
         if self.is_zh() {
@@ -1141,5 +1225,28 @@ mod tests {
         assert_eq!(en.theme_option_title(ThemePreference::System), "System");
         assert!(!zh.about_update_placeholder().is_empty());
         assert!(!en.about_update_placeholder().is_empty());
+    }
+
+    #[test]
+    fn test_native_context_menu_and_multi_selection_i18n() {
+        let zh = I18n::new(AppLanguage::ZhCn);
+        let en = I18n::new(AppLanguage::EnUs);
+
+        assert_eq!(zh.ctx_upload_to_remote(), "上传到远程");
+        assert_eq!(en.ctx_upload_to_remote(), "Upload to Remote");
+        assert_eq!(zh.ctx_download_to_local(), "下载到本地");
+        assert_eq!(en.ctx_download_to_local(), "Download to Local");
+        assert_eq!(zh.ctx_rename(), "重命名 (F2)");
+        assert_eq!(en.ctx_rename(), "Rename (F2)");
+        assert_eq!(zh.ctx_copy_path(), "复制路径");
+        assert_eq!(en.ctx_copy_path(), "Copy Path");
+        assert_eq!(
+            zh.pane_footer_multi_selection(3, Some("a.txt")),
+            "已选 3 项 (a.txt 等)"
+        );
+        assert_eq!(
+            en.pane_footer_multi_selection(3, Some("a.txt")),
+            "3 selected (a.txt, ...)"
+        );
     }
 }

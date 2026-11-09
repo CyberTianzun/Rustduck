@@ -4,7 +4,17 @@ use rustduck::ui::{
     RustduckAssets,
 };
 
+pub fn configure_native_child_hosting_env() {
+    #[cfg(target_os = "windows")]
+    {
+        // Disable DirectComposition topmost visual so embedded Win32 child HWNDs
+        // (SysListView32) render cleanly inside the GPUI SwapChain window.
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+    }
+}
+
 fn main() {
+    configure_native_child_hosting_env();
     let app = gpui_kit::application().with_assets(RustduckAssets);
 
     app.run(move |cx: &mut App| {

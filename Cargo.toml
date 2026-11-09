@@ -18,6 +18,7 @@ hmac = "0.12"
 keyring = "3"
 percent-encoding = "2"
 quick-xml = "0.37"
+raw-window-handle = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 russh = "0.50"
 russh-sftp = "2.1"
@@ -28,6 +29,28 @@ smb = "0.12.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
 tokio-util = { version = "0.7", features = ["io"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
 
 [dev-dependencies]
 tempfile = "3"
