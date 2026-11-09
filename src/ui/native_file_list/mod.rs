@@ -1,10 +1,15 @@
 pub mod fallback;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 use crate::models::{format_bytes, FileEntry, FileKind};
 use crate::ui::file_pane::{format_modified_time, join_local_or_remote, SortColumn};
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(target_os = "windows")]
+use windows::PlatformHost;
+#[cfg(not(target_os = "windows"))]
 use fallback::PlatformHost;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
