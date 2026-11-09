@@ -11,8 +11,12 @@ use crate::storage::local::LocalFileSystem;
 use crate::storage::{create_backend, StorageBackend};
 use crate::ui::dual_pane_view::render_dual_pane_view;
 use crate::ui::file_pane::{
-    join_local_or_remote, parent_local_or_remote, resolve_rename_target_path, PaneInlineAction,
-    SortColumn,
+    filter_and_sort_entries, join_local_or_remote, parent_local_or_remote,
+    resolve_rename_target_path, summarize_pane_entries, PaneInlineAction, SortColumn,
+};
+use crate::ui::native_file_list::{
+    build_native_row_models, NativeContextMenuAction, NativeFileListHost, NativePaneEvent,
+    NativeRowViewModel,
 };
 use crate::ui::new_tab_view::render_new_tab_view;
 use crate::ui::settings_modal::{render_settings_modal, SettingsTab};
@@ -21,9 +25,10 @@ use crate::ui::{
     accent_amber, accent_blue, accent_green, apply_theme_preference, bg_canvas, bg_elevated,
     border_subtle, protocol_icon_and_color, text_muted, text_primary,
 };
+use futures::StreamExt as _;
 use gpui::{
-    div, img, prelude::*, px, AnyElement, Context, Entity, IntoElement, MouseButton, Render,
-    Window,
+    div, img, prelude::*, px, AnyElement, App, ClipboardItem, Context, Entity, IntoElement,
+    MouseButton, Render, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::InputState;
@@ -127,6 +132,199 @@ impl ConnectionFormInputs {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PaneVisibleCache {
+    pub visible: Arc<Vec<FileEntry>>,
+    pub rows: Arc<Vec<NativeRowViewModel>>,
+    pub summary: (usize, usize, u64),
+    pub revision: u64,
+    initialized: bool,
+    last_query: String,
+    last_show_hidden: bool,
+    last_sort_col: SortColumn,
+    last_sort_ascending: bool,
+    last_has_parent: bool,
+    last_parent_label: String,
+}
+
+impl Default for PaneVisibleCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PaneVisibleCache {
+    pub fn new() -> Self {
+        Self {
+            visible: Arc::new(Vec::new()),
+            rows: Arc::new(Vec::new()),
+            summary: (0, 0, 0),
+            revision: 0,
+            initialized: false,
+            last_query: String::new(),
+            last_show_hidden: false,
+            last_sort_col: SortColumn::Name,
+            last_sort_ascending: true,
+            last_has_parent: false,
+            last_parent_label: String::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn force_rebuild(
+        &mut self,
+        raw_entries: &[FileEntry],
+        query: &str,
+        show_hidden: bool,
+        sort_col: SortColumn,
+        sort_ascending: bool,
+        has_parent: bool,
+        parent_label: &str,
+    ) {
+        let sorted =
+            filter_and_sort_entries(raw_entries, query, show_hidden, sort_col, sort_ascending);
+        let summary = summarize_pane_entries(&sorted);
+        let rows = build_native_row_models(&sorted, has_parent, parent_label);
+
+        self.visible = Arc::new(sorted);
+        self.rows = Arc::new(rows);
+        self.summary = summary;
+        self.revision = self.revision.wrapping_add(1);
+        self.initialized = true;
+        self.last_query = query.to_string();
+        self.last_show_hidden = show_hidden;
+        self.last_sort_col = sort_col;
+        self.last_sort_ascending = sort_ascending;
+        self.last_has_parent = has_parent;
+        self.last_parent_label = parent_label.to_string();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_if_needed(
+        &mut self,
+        raw_entries: &[FileEntry],
+        query: &str,
+        show_hidden: bool,
+        sort_col: SortColumn,
+        sort_ascending: bool,
+        has_parent: bool,
+        parent_label: &str,
+    ) -> bool {
+        if self.initialized
+            && self.last_query == query
+            && self.last_show_hidden == show_hidden
+            && self.last_sort_col == sort_col
+            && self.last_sort_ascending == sort_ascending
+            && self.last_has_parent == has_parent
+            && self.last_parent_label == parent_label
+        {
+            return false;
+        }
+        self.force_rebuild(
+            raw_entries,
+            query,
+            show_hidden,
+            sort_col,
+            sort_ascending,
+            has_parent,
+            parent_label,
+        );
+        true
+    }
+}
+
+pub fn sync_pane_selection(
+    selected_paths: &mut Vec<String>,
+    primary_path: &mut Option<String>,
+    new_paths: Vec<String>,
+) {
+    let mut deduped = Vec::with_capacity(new_paths.len());
+    let mut seen = HashSet::with_capacity(new_paths.len());
+    for p in new_paths {
+        if !p.is_empty() && seen.insert(p.clone()) {
+            deduped.push(p);
+        }
+    }
+    *primary_path = deduped.first().cloned();
+    *selected_paths = deduped;
+}
+
+pub fn prune_selection_against_entries(
+    selected_paths: &mut Vec<String>,
+    primary_path: &mut Option<String>,
+    entries: &[FileEntry],
+) {
+    let valid: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    selected_paths.retain(|p| valid.contains(p.as_str()));
+    *primary_path = selected_paths.first().cloned();
+}
+
+pub fn resolve_local_drop_sources(
+    local_entries: &[FileEntry],
+    source_paths: &[String],
+) -> Vec<FileEntry> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_path in source_paths {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        if let Some(existing) = local_entries.iter().find(|e| e.path == trimmed) {
+            if !matches!(existing.kind, FileKind::Bucket) {
+                out.push(existing.clone());
+            }
+            continue;
+        }
+        let path_obj = std::path::Path::new(trimmed);
+        let Ok(meta) = std::fs::metadata(path_obj) else {
+            continue;
+        };
+        let Some(name_os) = path_obj.file_name() else {
+            continue;
+        };
+        let name = name_os.to_string_lossy().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let kind = if meta.is_dir() {
+            FileKind::Directory
+        } else {
+            FileKind::File
+        };
+        let size = if meta.is_dir() { 0 } else { meta.len() };
+        out.push(FileEntry {
+            name,
+            path: trimmed.to_string(),
+            kind,
+            size,
+            modified_unix: None,
+            permissions: None,
+        });
+    }
+    out
+}
+
+pub fn resolve_remote_drop_sources(
+    remote_entries: &[FileEntry],
+    source_paths: &[String],
+) -> Vec<FileEntry> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_path in source_paths {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        if let Some(existing) = remote_entries.iter().find(|e| e.path == trimmed) {
+            if !matches!(existing.kind, FileKind::Bucket) {
+                out.push(existing.clone());
+            }
+        }
+    }
+    out
+}
+
 pub struct TabSession {
     pub id: Uuid,
     pub title: String,
@@ -142,6 +340,18 @@ pub struct TabSession {
     pub remote_entries: Vec<FileEntry>,
     pub selected_local_path: Option<String>,
     pub selected_remote_path: Option<String>,
+    pub selected_local_paths: Vec<String>,
+    pub selected_remote_paths: Vec<String>,
+    pub cached_local_visible: Arc<Vec<FileEntry>>,
+    pub cached_remote_visible: Arc<Vec<FileEntry>>,
+    pub cached_local_rows: Arc<Vec<NativeRowViewModel>>,
+    pub cached_remote_rows: Arc<Vec<NativeRowViewModel>>,
+    pub cached_local_summary: (usize, usize, u64),
+    pub cached_remote_summary: (usize, usize, u64),
+    pub local_entries_revision: u64,
+    pub remote_entries_revision: u64,
+    local_cache: PaneVisibleCache,
+    remote_cache: PaneVisibleCache,
     pub local_path_editing: bool,
     pub remote_path_editing: bool,
     pub local_inline_action: Option<PaneInlineAction>,
@@ -165,7 +375,27 @@ impl TabSession {
         let initial_local = LocalFileSystem::initial_local_dir();
 
         let local_for_input = initial_local.clone();
-        Self {
+        let local_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t.placeholder_filter_local()));
+        let remote_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t.placeholder_filter_remote()));
+
+        cx.observe(&local_filter_input, |ws, _input, cx| {
+            for tab in &mut ws.tabs {
+                tab.sync_visible_caches_if_needed(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        cx.observe(&remote_filter_input, |ws, _input, cx| {
+            for tab in &mut ws.tabs {
+                tab.sync_visible_caches_if_needed(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+
+        let mut session = Self {
             id: Uuid::new_v4(),
             title: t.default_tab_title().to_string(),
             is_connected: false,
@@ -180,6 +410,18 @@ impl TabSession {
             remote_entries: Vec::new(),
             selected_local_path: None,
             selected_remote_path: None,
+            selected_local_paths: Vec::new(),
+            selected_remote_paths: Vec::new(),
+            cached_local_visible: Arc::new(Vec::new()),
+            cached_remote_visible: Arc::new(Vec::new()),
+            cached_local_rows: Arc::new(Vec::new()),
+            cached_remote_rows: Arc::new(Vec::new()),
+            cached_local_summary: (0, 0, 0),
+            cached_remote_summary: (0, 0, 0),
+            local_entries_revision: 0,
+            remote_entries_revision: 0,
+            local_cache: PaneVisibleCache::new(),
+            remote_cache: PaneVisibleCache::new(),
             local_path_editing: false,
             remote_path_editing: false,
             local_inline_action: None,
@@ -187,10 +429,8 @@ impl TabSession {
             local_path_input: cx
                 .new(|cx| InputState::new(window, cx).default_value(local_for_input)),
             remote_path_input: cx.new(|cx| InputState::new(window, cx).default_value("/")),
-            local_filter_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_filter_local())),
-            remote_filter_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_filter_remote())),
+            local_filter_input,
+            remote_filter_input,
             local_action_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_inline_name())),
             remote_action_input: cx
@@ -200,6 +440,83 @@ impl TabSession {
             show_hidden: false,
             sort_column: SortColumn::Name,
             sort_ascending: true,
+        };
+        session.rebuild_visible_cache(true, cx);
+        session.rebuild_visible_cache(false, cx);
+        session
+    }
+
+    pub fn rebuild_visible_cache(&mut self, is_local: bool, cx: &App) {
+        let parent_label = i18n().parent_dir_row_text();
+        if is_local {
+            let query = self.local_filter_input.read(cx).value().to_string();
+            let has_parent = parent_local_or_remote(&self.local_path, true).is_some();
+            self.local_cache.force_rebuild(
+                &self.local_entries,
+                &query,
+                self.show_hidden,
+                self.sort_column,
+                self.sort_ascending,
+                has_parent,
+                parent_label,
+            );
+            self.cached_local_visible = Arc::clone(&self.local_cache.visible);
+            self.cached_local_rows = Arc::clone(&self.local_cache.rows);
+            self.cached_local_summary = self.local_cache.summary;
+            self.local_entries_revision = self.local_cache.revision;
+        } else {
+            let query = self.remote_filter_input.read(cx).value().to_string();
+            let has_parent = parent_local_or_remote(&self.remote_path, false).is_some();
+            self.remote_cache.force_rebuild(
+                &self.remote_entries,
+                &query,
+                self.show_hidden,
+                self.sort_column,
+                self.sort_ascending,
+                has_parent,
+                parent_label,
+            );
+            self.cached_remote_visible = Arc::clone(&self.remote_cache.visible);
+            self.cached_remote_rows = Arc::clone(&self.remote_cache.rows);
+            self.cached_remote_summary = self.remote_cache.summary;
+            self.remote_entries_revision = self.remote_cache.revision;
+        }
+    }
+
+    pub fn sync_visible_caches_if_needed(&mut self, cx: &App) {
+        let parent_label = i18n().parent_dir_row_text();
+        let local_query = self.local_filter_input.read(cx).value().to_string();
+        let local_has_parent = parent_local_or_remote(&self.local_path, true).is_some();
+        if self.local_cache.sync_if_needed(
+            &self.local_entries,
+            &local_query,
+            self.show_hidden,
+            self.sort_column,
+            self.sort_ascending,
+            local_has_parent,
+            parent_label,
+        ) {
+            self.cached_local_visible = Arc::clone(&self.local_cache.visible);
+            self.cached_local_rows = Arc::clone(&self.local_cache.rows);
+            self.cached_local_summary = self.local_cache.summary;
+            self.local_entries_revision = self.local_cache.revision;
+        }
+
+        let remote_query = self.remote_filter_input.read(cx).value().to_string();
+        let remote_has_parent = parent_local_or_remote(&self.remote_path, false).is_some();
+        if self.remote_cache.sync_if_needed(
+            &self.remote_entries,
+            &remote_query,
+            self.show_hidden,
+            self.sort_column,
+            self.sort_ascending,
+            remote_has_parent,
+            parent_label,
+        ) {
+            self.cached_remote_visible = Arc::clone(&self.remote_cache.visible);
+            self.cached_remote_rows = Arc::clone(&self.remote_cache.rows);
+            self.cached_remote_summary = self.remote_cache.summary;
+            self.remote_entries_revision = self.remote_cache.revision;
         }
     }
 
@@ -217,6 +534,8 @@ impl TabSession {
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_inline_name(), window, cx));
         self.remote_action_input
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_inline_name(), window, cx));
+        self.rebuild_visible_cache(true, cx);
+        self.rebuild_visible_cache(false, cx);
     }
 }
 
@@ -340,6 +659,7 @@ pub struct RustduckWorkspace {
     pub bookmark_store: BookmarkStore,
     pub preferences_store: PreferencesStore,
     pub transfer_manager: TransferManager,
+    pub native_file_list_host: Arc<NativeFileListHost>,
     pub drawer_expanded: bool,
     pub settings_open: bool,
     pub settings_tab: SettingsTab,
@@ -371,6 +691,7 @@ impl RustduckWorkspace {
         let bookmark_store = BookmarkStore::load_or_default(config_path, vault)
             .expect("Failed to initialize BookmarkStore");
         let first_tab = TabSession::new(window, cx);
+        let native_file_list_host = Arc::new(NativeFileListHost::new());
 
         let mut ws = Self {
             tabs: vec![first_tab],
@@ -378,6 +699,7 @@ impl RustduckWorkspace {
             bookmark_store,
             preferences_store,
             transfer_manager: TransferManager::new(3),
+            native_file_list_host,
             drawer_expanded: false,
             settings_open: false,
             settings_tab: SettingsTab::General,
@@ -385,7 +707,29 @@ impl RustduckWorkspace {
         };
         ws.refresh_local_pane(0, window, cx);
         ws.start_transfer_watcher(cx);
+        ws.start_native_event_watcher(window, cx);
         ws
+    }
+
+    fn start_native_event_watcher(&self, window: &Window, cx: &mut Context<Self>) {
+        let mut wakeup_rx = self.native_file_list_host.subscribe_wakeup();
+        cx.spawn_in(window, async move |this, cx| {
+            while wakeup_rx.next().await.is_some() {
+                let alive = this
+                    .update_in(cx, |ws, window, cx| {
+                        let events = ws.native_file_list_host.drain_events();
+                        if !events.is_empty() {
+                            let active_idx = ws.active_tab.min(ws.tabs.len().saturating_sub(1));
+                            ws.handle_native_pane_events(active_idx, events, window, cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn set_language(
@@ -470,11 +814,15 @@ impl RustduckWorkspace {
         if self.tabs.len() <= 1 {
             self.tabs[0] = TabSession::new(window, cx);
             self.active_tab = 0;
+            self.native_file_list_host.hide_all();
             self.refresh_local_pane(0, window, cx);
         } else {
             self.tabs.remove(idx);
             if self.active_tab >= self.tabs.len() {
                 self.active_tab = self.tabs.len() - 1;
+            }
+            if !self.tabs[self.active_tab].is_connected {
+                self.native_file_list_host.hide_all();
             }
         }
         cx.notify();
@@ -766,8 +1114,13 @@ impl RustduckWorkspace {
                                 tab.remote_backend = Some(backend);
                                 tab.remote_path = initial_path;
                                 tab.remote_entries = entries;
-                                tab.selected_remote_path = None;
+                                sync_pane_selection(
+                                    &mut tab.selected_remote_paths,
+                                    &mut tab.selected_remote_path,
+                                    Vec::new(),
+                                );
                                 tab.remote_inline_action = None;
+                                tab.rebuild_visible_cache(false, cx);
                                 tab.status_message = Some(t.msg_connected_ready());
                             }
                             Err(e) => {
@@ -788,10 +1141,40 @@ impl RustduckWorkspace {
         tab.is_connected = false;
         tab.remote_backend = None;
         tab.remote_entries.clear();
-        tab.selected_remote_path = None;
+        sync_pane_selection(
+            &mut tab.selected_remote_paths,
+            &mut tab.selected_remote_path,
+            Vec::new(),
+        );
         tab.remote_inline_action = None;
+        tab.rebuild_visible_cache(false, cx);
         tab.title = t.default_tab_title().to_string();
         tab.status_message = None;
+        self.native_file_list_host.hide_all();
+        cx.notify();
+    }
+
+    pub fn set_selected_paths(
+        &mut self,
+        tab_idx: usize,
+        is_local: bool,
+        paths: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = &mut self.tabs[tab_idx];
+        if is_local {
+            sync_pane_selection(
+                &mut tab.selected_local_paths,
+                &mut tab.selected_local_path,
+                paths,
+            );
+        } else {
+            sync_pane_selection(
+                &mut tab.selected_remote_paths,
+                &mut tab.selected_remote_path,
+                paths,
+            );
+        }
         cx.notify();
     }
 
@@ -802,13 +1185,7 @@ impl RustduckWorkspace {
         path: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let tab = &mut self.tabs[tab_idx];
-        if is_local {
-            tab.selected_local_path = path;
-        } else {
-            tab.selected_remote_path = path;
-        }
-        cx.notify();
+        self.set_selected_paths(tab_idx, is_local, path.into_iter().collect(), cx);
     }
 
     pub fn selected_entry(&self, tab_idx: usize, is_local: bool) -> Option<FileEntry> {
@@ -824,6 +1201,19 @@ impl RustduckWorkspace {
             &tab.remote_entries
         };
         list.iter().find(|e| e.path == target).cloned()
+    }
+
+    pub fn selected_entries(&self, tab_idx: usize, is_local: bool) -> Vec<FileEntry> {
+        let tab = &self.tabs[tab_idx];
+        let (paths, list) = if is_local {
+            (&tab.selected_local_paths, &tab.local_entries)
+        } else {
+            (&tab.selected_remote_paths, &tab.remote_entries)
+        };
+        paths
+            .iter()
+            .filter_map(|p| list.iter().find(|e| e.path == *p).cloned())
+            .collect()
     }
 
     pub fn open_new_folder_prompt(
@@ -865,12 +1255,20 @@ impl RustduckWorkspace {
             original_path: entry.path.clone(),
         };
         if is_local {
-            tab.selected_local_path = Some(entry.path.clone());
+            sync_pane_selection(
+                &mut tab.selected_local_paths,
+                &mut tab.selected_local_path,
+                vec![entry.path.clone()],
+            );
             tab.local_action_input
                 .update(cx, |s, cx| s.set_value(entry.name.clone(), window, cx));
             tab.local_inline_action = Some(action);
         } else {
-            tab.selected_remote_path = Some(entry.path.clone());
+            sync_pane_selection(
+                &mut tab.selected_remote_paths,
+                &mut tab.selected_remote_path,
+                vec![entry.path.clone()],
+            );
             tab.remote_action_input
                 .update(cx, |s, cx| s.set_value(entry.name.clone(), window, cx));
             tab.remote_inline_action = Some(action);
@@ -885,15 +1283,54 @@ impl RustduckWorkspace {
         entry: &FileEntry,
         cx: &mut Context<Self>,
     ) {
+        if matches!(entry.kind, FileKind::Bucket) {
+            return;
+        }
         let tab = &mut self.tabs[tab_idx];
         let action = PaneInlineAction::ConfirmDelete {
             entry: entry.clone(),
         };
         if is_local {
-            tab.selected_local_path = Some(entry.path.clone());
+            sync_pane_selection(
+                &mut tab.selected_local_paths,
+                &mut tab.selected_local_path,
+                vec![entry.path.clone()],
+            );
             tab.local_inline_action = Some(action);
         } else {
-            tab.selected_remote_path = Some(entry.path.clone());
+            sync_pane_selection(
+                &mut tab.selected_remote_paths,
+                &mut tab.selected_remote_path,
+                vec![entry.path.clone()],
+            );
+            tab.remote_inline_action = Some(action);
+        }
+        cx.notify();
+    }
+
+    pub fn open_delete_selected_confirm(
+        &mut self,
+        tab_idx: usize,
+        is_local: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let deletable: Vec<FileEntry> = self
+            .selected_entries(tab_idx, is_local)
+            .into_iter()
+            .filter(|e| !matches!(e.kind, FileKind::Bucket))
+            .collect();
+        if deletable.is_empty() {
+            return;
+        }
+        if deletable.len() == 1 {
+            self.open_delete_confirm(tab_idx, is_local, &deletable[0], cx);
+            return;
+        }
+        let tab = &mut self.tabs[tab_idx];
+        let action = PaneInlineAction::ConfirmBatchDelete { entries: deletable };
+        if is_local {
+            tab.local_inline_action = Some(action);
+        } else {
             tab.remote_inline_action = Some(action);
         }
         cx.notify();
@@ -987,6 +1424,9 @@ impl RustduckWorkspace {
             PaneInlineAction::ConfirmDelete { entry } => {
                 self.delete_entry(tab_idx, is_local, &entry, window, cx);
             }
+            PaneInlineAction::ConfirmBatchDelete { entries } => {
+                self.delete_entries(tab_idx, is_local, entries, window, cx);
+            }
         }
     }
 
@@ -999,14 +1439,26 @@ impl RustduckWorkspace {
         cx: &mut Context<Self>,
     ) {
         if is_local {
-            self.tabs[tab_idx].local_path = path;
-            self.tabs[tab_idx].local_path_editing = false;
-            self.tabs[tab_idx].selected_local_path = None;
+            let tab = &mut self.tabs[tab_idx];
+            tab.local_path = path;
+            tab.local_path_editing = false;
+            sync_pane_selection(
+                &mut tab.selected_local_paths,
+                &mut tab.selected_local_path,
+                Vec::new(),
+            );
+            tab.rebuild_visible_cache(true, cx);
             self.refresh_local_pane(tab_idx, window, cx);
         } else {
-            self.tabs[tab_idx].remote_path = path;
-            self.tabs[tab_idx].remote_path_editing = false;
-            self.tabs[tab_idx].selected_remote_path = None;
+            let tab = &mut self.tabs[tab_idx];
+            tab.remote_path = path;
+            tab.remote_path_editing = false;
+            sync_pane_selection(
+                &mut tab.selected_remote_paths,
+                &mut tab.selected_remote_path,
+                Vec::new(),
+            );
+            tab.rebuild_visible_cache(false, cx);
             self.refresh_remote_pane(tab_idx, window, cx);
         }
     }
@@ -1031,6 +1483,12 @@ impl RustduckWorkspace {
                         match res {
                             Ok(entries) => {
                                 tab.local_entries = entries;
+                                prune_selection_against_entries(
+                                    &mut tab.selected_local_paths,
+                                    &mut tab.selected_local_path,
+                                    &tab.local_entries,
+                                );
+                                tab.rebuild_visible_cache(true, cx);
                             }
                             Err(e) => {
                                 tab.status_message = Some(format!("{e}"));
@@ -1067,6 +1525,12 @@ impl RustduckWorkspace {
                         match res {
                             Ok(entries) => {
                                 tab.remote_entries = entries;
+                                prune_selection_against_entries(
+                                    &mut tab.selected_remote_paths,
+                                    &mut tab.selected_remote_path,
+                                    &tab.remote_entries,
+                                );
+                                tab.rebuild_visible_cache(false, cx);
                                 tab.status_message = Some(t.msg_remote_dir_synced());
                             }
                             Err(e) => {
@@ -1116,16 +1580,28 @@ impl RustduckWorkspace {
     ) {
         if is_local {
             if let Some(parent) = parent_local_or_remote(&self.tabs[tab_idx].local_path, true) {
-                self.tabs[tab_idx].local_path = parent;
-                self.tabs[tab_idx].selected_local_path = None;
-                self.tabs[tab_idx].local_inline_action = None;
+                let tab = &mut self.tabs[tab_idx];
+                tab.local_path = parent;
+                sync_pane_selection(
+                    &mut tab.selected_local_paths,
+                    &mut tab.selected_local_path,
+                    Vec::new(),
+                );
+                tab.local_inline_action = None;
+                tab.rebuild_visible_cache(true, cx);
                 self.refresh_local_pane(tab_idx, window, cx);
             }
         } else if let Some(parent) = parent_local_or_remote(&self.tabs[tab_idx].remote_path, false)
         {
-            self.tabs[tab_idx].remote_path = parent;
-            self.tabs[tab_idx].selected_remote_path = None;
-            self.tabs[tab_idx].remote_inline_action = None;
+            let tab = &mut self.tabs[tab_idx];
+            tab.remote_path = parent;
+            sync_pane_selection(
+                &mut tab.selected_remote_paths,
+                &mut tab.selected_remote_path,
+                Vec::new(),
+            );
+            tab.remote_inline_action = None;
+            tab.rebuild_visible_cache(false, cx);
             self.refresh_remote_pane(tab_idx, window, cx);
         }
     }
@@ -1142,14 +1618,26 @@ impl RustduckWorkspace {
             return;
         }
         if is_local {
-            self.tabs[tab_idx].local_path = entry.path.clone();
-            self.tabs[tab_idx].selected_local_path = None;
-            self.tabs[tab_idx].local_inline_action = None;
+            let tab = &mut self.tabs[tab_idx];
+            tab.local_path = entry.path.clone();
+            sync_pane_selection(
+                &mut tab.selected_local_paths,
+                &mut tab.selected_local_path,
+                Vec::new(),
+            );
+            tab.local_inline_action = None;
+            tab.rebuild_visible_cache(true, cx);
             self.refresh_local_pane(tab_idx, window, cx);
         } else {
-            self.tabs[tab_idx].remote_path = entry.path.clone();
-            self.tabs[tab_idx].selected_remote_path = None;
-            self.tabs[tab_idx].remote_inline_action = None;
+            let tab = &mut self.tabs[tab_idx];
+            tab.remote_path = entry.path.clone();
+            sync_pane_selection(
+                &mut tab.selected_remote_paths,
+                &mut tab.selected_remote_path,
+                Vec::new(),
+            );
+            tab.remote_inline_action = None;
+            tab.rebuild_visible_cache(false, cx);
             self.refresh_remote_pane(tab_idx, window, cx);
         }
     }
@@ -1221,21 +1709,29 @@ impl RustduckWorkspace {
         .detach();
     }
 
-    pub fn rename_entry(
+    pub fn commit_inline_rename(
         &mut self,
         tab_idx: usize,
         is_local: bool,
-        entry: &FileEntry,
-        window: &mut Window,
+        original_path: &str,
+        new_name: &str,
         cx: &mut Context<Self>,
     ) {
-        let new_name = self.tabs[tab_idx]
-            .new_folder_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let target_path = match resolve_rename_target_path(&entry.path, &new_name, is_local) {
+        let entries = if is_local {
+            &self.tabs[tab_idx].local_entries
+        } else {
+            &self.tabs[tab_idx].remote_entries
+        };
+        if entries
+            .iter()
+            .any(|e| e.path == original_path && matches!(e.kind, FileKind::Bucket))
+        {
+            self.tabs[tab_idx].status_message = Some(i18n().msg_bucket_cannot_rename());
+            cx.notify();
+            return;
+        }
+
+        let target_path = match resolve_rename_target_path(original_path, new_name, is_local) {
             Ok(p) => p,
             Err(e) => {
                 self.tabs[tab_idx].status_message = Some(format!("{e}"));
@@ -1253,11 +1749,8 @@ impl RustduckWorkspace {
             remote
         };
 
-        self.tabs[tab_idx]
-            .new_folder_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
-
-        let src_path = entry.path.clone();
+        let src_path = original_path.to_string();
+        let dst_for_select = target_path.clone();
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
         tokio_runtime().spawn(async move {
@@ -1271,6 +1764,12 @@ impl RustduckWorkspace {
                     if let Some(idx) = ws.tabs.iter().position(|t| t.id == tab_id) {
                         match res {
                             Ok(()) => {
+                                ws.set_selected_paths(
+                                    idx,
+                                    is_local,
+                                    vec![dst_for_select],
+                                    cx,
+                                );
                                 if is_local {
                                     ws.spawn_local_list(idx, cx);
                                 } else {
@@ -1289,15 +1788,54 @@ impl RustduckWorkspace {
         .detach();
     }
 
+    pub fn rename_entry(
+        &mut self,
+        tab_idx: usize,
+        is_local: bool,
+        entry: &FileEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let new_name = self.tabs[tab_idx]
+            .new_folder_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.tabs[tab_idx]
+            .new_folder_input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.commit_inline_rename(tab_idx, is_local, &entry.path, &new_name, cx);
+    }
+
     pub fn delete_entry(
         &mut self,
         tab_idx: usize,
         is_local: bool,
         entry: &FileEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_entries(tab_idx, is_local, vec![entry.clone()], window, cx);
+    }
+
+    pub fn delete_entries(
+        &mut self,
+        tab_idx: usize,
+        is_local: bool,
+        entries: Vec<FileEntry>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let is_dir = matches!(entry.kind, FileKind::Directory);
+        let targets: Vec<(String, bool)> = entries
+            .into_iter()
+            .filter(|e| !matches!(e.kind, FileKind::Bucket))
+            .map(|e| (e.path, matches!(e.kind, FileKind::Directory)))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+
         let backend = if is_local {
             self.tabs[tab_idx].local_backend.clone()
         } else {
@@ -1307,31 +1845,32 @@ impl RustduckWorkspace {
             remote
         };
 
-        let target_path = entry.path.clone();
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
         tokio_runtime().spawn(async move {
-            let res = backend.remove(&target_path, is_dir).await;
-            let _ = tx.send(res);
+            let mut first_err: Option<anyhow::Error> = None;
+            for (target_path, is_dir) in targets {
+                if let Err(e) = backend.remove(&target_path, is_dir).await {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+            let _ = tx.send(first_err);
         });
 
         cx.spawn(async move |this, cx| {
-            if let Ok(res) = rx.await {
+            if let Ok(first_err) = rx.await {
                 let _ = this.update(cx, |ws, cx| {
                     if let Some(idx) = ws.tabs.iter().position(|t| t.id == tab_id) {
-                        match res {
-                            Ok(()) => {
-                                if is_local {
-                                    ws.tabs[idx].selected_local_path = None;
-                                    ws.spawn_local_list(idx, cx);
-                                } else {
-                                    ws.tabs[idx].selected_remote_path = None;
-                                    ws.spawn_remote_list(idx, cx);
-                                }
-                            }
-                            Err(e) => {
-                                ws.tabs[idx].status_message = Some(format!("{e}"));
-                            }
+                        if let Some(e) = first_err {
+                            ws.tabs[idx].status_message = Some(format!("{e}"));
+                        }
+                        ws.set_selected_paths(idx, is_local, Vec::new(), cx);
+                        if is_local {
+                            ws.spawn_local_list(idx, cx);
+                        } else {
+                            ws.spawn_remote_list(idx, cx);
                         }
                     }
                     cx.notify();
@@ -1348,6 +1887,28 @@ impl RustduckWorkspace {
         entry: &FileEntry,
         cx: &mut Context<Self>,
     ) {
+        let dest_base_dir = if from_local {
+            self.tabs[tab_idx].remote_path.clone()
+        } else {
+            self.tabs[tab_idx].local_path.clone()
+        };
+        self.enqueue_file_transfer_to_dir(tab_idx, from_local, entry, &dest_base_dir, cx);
+    }
+
+    pub fn enqueue_file_transfer_to_dir(
+        &mut self,
+        tab_idx: usize,
+        from_local: bool,
+        entry: &FileEntry,
+        dest_base_dir: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(entry.kind, FileKind::Bucket) {
+            return;
+        }
+        if !from_local && cfg!(windows) && dest_base_dir.trim() == "/" {
+            return;
+        }
         let Some(remote_backend) = self.tabs[tab_idx].remote_backend.clone() else {
             return;
         };
@@ -1362,7 +1923,7 @@ impl RustduckWorkspace {
                     TransferDirection::Upload,
                     local_backend,
                     remote_backend,
-                    join_local_or_remote(&self.tabs[tab_idx].remote_path, &entry.name, false),
+                    join_local_or_remote(dest_base_dir, &entry.name, false),
                     true,
                     false,
                 )
@@ -1371,7 +1932,7 @@ impl RustduckWorkspace {
                     TransferDirection::Download,
                     remote_backend,
                     local_backend,
-                    join_local_or_remote(&self.tabs[tab_idx].local_path, &entry.name, true),
+                    join_local_or_remote(dest_base_dir, &entry.name, true),
                     false,
                     true,
                 )
@@ -1405,8 +1966,7 @@ impl RustduckWorkspace {
         }
 
         if from_local {
-            let dest_path =
-                join_local_or_remote(&self.tabs[tab_idx].remote_path, &entry.name, false);
+            let dest_path = join_local_or_remote(dest_base_dir, &entry.name, false);
             self.transfer_manager.enqueue(
                 TransferDirection::Upload,
                 local_backend,
@@ -1417,8 +1977,7 @@ impl RustduckWorkspace {
                 entry.size,
             );
         } else {
-            let dest_path =
-                join_local_or_remote(&self.tabs[tab_idx].local_path, &entry.name, true);
+            let dest_path = join_local_or_remote(dest_base_dir, &entry.name, true);
             self.transfer_manager.enqueue(
                 TransferDirection::Download,
                 remote_backend,
@@ -1432,6 +1991,28 @@ impl RustduckWorkspace {
         cx.notify();
     }
 
+    pub fn enqueue_selected_transfers(
+        &mut self,
+        tab_idx: usize,
+        from_local: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.selected_entries(tab_idx, from_local);
+        for entry in entries {
+            if !matches!(entry.kind, FileKind::Bucket) {
+                self.enqueue_file_transfer(tab_idx, from_local, &entry, cx);
+            }
+        }
+    }
+
+    pub fn toggle_show_hidden(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+        let tab = &mut self.tabs[tab_idx];
+        tab.show_hidden = !tab.show_hidden;
+        tab.rebuild_visible_cache(true, cx);
+        tab.rebuild_visible_cache(false, cx);
+        cx.notify();
+    }
+
     pub fn toggle_sort(&mut self, tab_idx: usize, col: SortColumn, cx: &mut Context<Self>) {
         let tab = &mut self.tabs[tab_idx];
         if tab.sort_column == col {
@@ -1440,7 +2021,136 @@ impl RustduckWorkspace {
             tab.sort_column = col;
             tab.sort_ascending = true;
         }
+        tab.rebuild_visible_cache(true, cx);
+        tab.rebuild_visible_cache(false, cx);
         cx.notify();
+    }
+
+    pub fn handle_native_pane_events(
+        &mut self,
+        tab_idx: usize,
+        events: Vec<NativePaneEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+
+        for event in events {
+            match event {
+                NativePaneEvent::SelectionChanged {
+                    is_local,
+                    selected_paths,
+                } => {
+                    self.set_selected_paths(tab_idx, is_local, selected_paths, cx);
+                }
+                NativePaneEvent::ActivateEntry { is_local, entry } => {
+                    self.set_selected_paths(tab_idx, is_local, vec![entry.path.clone()], cx);
+                    if entry.kind.is_dir_like() {
+                        self.enter_directory(tab_idx, is_local, &entry, window, cx);
+                    } else {
+                        self.enqueue_file_transfer(tab_idx, is_local, &entry, cx);
+                    }
+                }
+                NativePaneEvent::NavigateUp { is_local } => {
+                    self.navigate_up(tab_idx, is_local, window, cx);
+                }
+                NativePaneEvent::SortChanged {
+                    is_local: _,
+                    column,
+                } => {
+                    self.toggle_sort(tab_idx, column, cx);
+                }
+                NativePaneEvent::InlineRenameCommitted {
+                    is_local,
+                    original_path,
+                    new_name,
+                } => {
+                    self.commit_inline_rename(tab_idx, is_local, &original_path, &new_name, cx);
+                }
+                NativePaneEvent::ContextMenuCommand { is_local, action } => match action {
+                    NativeContextMenuAction::TransferSelected => {
+                        self.enqueue_selected_transfers(tab_idx, is_local, cx);
+                    }
+                    NativeContextMenuAction::OpenSelected => {
+                        let selected = self.selected_entries(tab_idx, is_local);
+                        if selected.len() == 1 && selected[0].kind.is_dir_like() {
+                            self.enter_directory(tab_idx, is_local, &selected[0], window, cx);
+                        } else {
+                            self.enqueue_selected_transfers(tab_idx, is_local, cx);
+                        }
+                    }
+                    NativeContextMenuAction::RenameSelected => {
+                        if let Some(primary) = self.selected_entry(tab_idx, is_local) {
+                            self.open_rename_prompt(tab_idx, is_local, &primary, window, cx);
+                        }
+                    }
+                    NativeContextMenuAction::NewFolder => {
+                        self.open_new_folder_prompt(tab_idx, is_local, window, cx);
+                    }
+                    NativeContextMenuAction::DeleteSelected => {
+                        self.open_delete_selected_confirm(tab_idx, is_local, cx);
+                    }
+                    NativeContextMenuAction::CopySelectedPath => {
+                        let paths = if is_local {
+                            &self.tabs[tab_idx].selected_local_paths
+                        } else {
+                            &self.tabs[tab_idx].selected_remote_paths
+                        };
+                        if !paths.is_empty() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+                        }
+                    }
+                    NativeContextMenuAction::Refresh => {
+                        if is_local {
+                            self.refresh_local_pane(tab_idx, window, cx);
+                        } else {
+                            self.refresh_remote_pane(tab_idx, window, cx);
+                        }
+                    }
+                    NativeContextMenuAction::RevealInShell => {
+                        if is_local {
+                            if let Some(primary) = self.tabs[tab_idx].selected_local_path.as_deref()
+                            {
+                                reveal_local_path_in_os(primary);
+                            }
+                        }
+                    }
+                },
+                NativePaneEvent::FilesDropped {
+                    target_is_local,
+                    source_paths,
+                    target_dir_override,
+                } => {
+                    if target_is_local {
+                        let dest_dir = target_dir_override
+                            .unwrap_or_else(|| self.tabs[tab_idx].local_path.clone());
+                        let entries = resolve_remote_drop_sources(
+                            &self.tabs[tab_idx].remote_entries,
+                            &source_paths,
+                        );
+                        for entry in entries {
+                            self.enqueue_file_transfer_to_dir(
+                                tab_idx, false, &entry, &dest_dir, cx,
+                            );
+                        }
+                    } else {
+                        let dest_dir = target_dir_override
+                            .unwrap_or_else(|| self.tabs[tab_idx].remote_path.clone());
+                        let entries = resolve_local_drop_sources(
+                            &self.tabs[tab_idx].local_entries,
+                            &source_paths,
+                        );
+                        for entry in entries {
+                            self.enqueue_file_transfer_to_dir(
+                                tab_idx, true, &entry, &dest_dir, cx,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn render_custom_title_bar(
@@ -1605,10 +2315,37 @@ impl RustduckWorkspace {
     }
 }
 
+fn reveal_local_path_in_os(path: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{path}"))
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+        }
+    }
+}
+
 impl Render for RustduckWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_idx = self.active_tab.min(self.tabs.len().saturating_sub(1));
         let is_connected = self.tabs[active_idx].is_connected;
+        if !is_connected || self.settings_open {
+            self.native_file_list_host.hide_all();
+        } else {
+            self.tabs[active_idx].sync_visible_caches_if_needed(cx);
+        }
         let active_title = &self.tabs[active_idx].title;
         window.set_window_title(&format!("Rustduck — {active_title}"));
 
@@ -1768,5 +2505,140 @@ mod tests {
         assert!(active2);
         assert!(!up_done2);
         assert!(!down_done2);
+    }
+
+    #[test]
+    fn test_pane_visible_cache_rebuilds_only_on_change_and_bumps_revision() {
+        let entries = vec![
+            FileEntry {
+                name: "b.txt".into(),
+                path: "/b.txt".into(),
+                kind: FileKind::File,
+                size: 10,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: ".secret".into(),
+                path: "/.secret".into(),
+                kind: FileKind::File,
+                size: 5,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "a.txt".into(),
+                path: "/a.txt".into(),
+                kind: FileKind::File,
+                size: 20,
+                modified_unix: None,
+                permissions: None,
+            },
+        ];
+
+        let mut cache = PaneVisibleCache::new();
+        cache.force_rebuild(&entries, "", false, SortColumn::Name, true, true, "..");
+        assert_eq!(cache.revision, 1);
+        assert_eq!(cache.rows.len(), 3);
+        assert!(cache.rows[0].is_parent_row);
+        assert_eq!(cache.rows[1].name, "a.txt");
+        assert_eq!(cache.rows[2].name, "b.txt");
+        assert_eq!(cache.summary, (0, 2, 30));
+
+        let rebuilt = cache.sync_if_needed(&entries, "", false, SortColumn::Name, true, true, "..");
+        assert!(!rebuilt);
+        assert_eq!(cache.revision, 1);
+
+        let rebuilt2 =
+            cache.sync_if_needed(&entries, "b", false, SortColumn::Name, true, true, "..");
+        assert!(rebuilt2);
+        assert_eq!(cache.revision, 2);
+        assert_eq!(cache.rows.len(), 2);
+        assert_eq!(cache.rows[1].name, "b.txt");
+    }
+
+    #[test]
+    fn test_multi_selection_state_syncs_primary_and_prunes_stale_entries() {
+        let mut selected_paths = Vec::new();
+        let mut primary_path = None;
+
+        sync_pane_selection(
+            &mut selected_paths,
+            &mut primary_path,
+            vec!["/a.txt".to_string(), "/b.txt".to_string()],
+        );
+        assert_eq!(selected_paths, vec!["/a.txt", "/b.txt"]);
+        assert_eq!(primary_path.as_deref(), Some("/a.txt"));
+
+        let refreshed = vec![
+            FileEntry {
+                name: "b.txt".into(),
+                path: "/b.txt".into(),
+                kind: FileKind::File,
+                size: 20,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "c.txt".into(),
+                path: "/c.txt".into(),
+                kind: FileKind::File,
+                size: 30,
+                modified_unix: None,
+                permissions: None,
+            },
+        ];
+        prune_selection_against_entries(&mut selected_paths, &mut primary_path, &refreshed);
+        assert_eq!(selected_paths, vec!["/b.txt"]);
+        assert_eq!(primary_path.as_deref(), Some("/b.txt"));
+
+        sync_pane_selection(&mut selected_paths, &mut primary_path, Vec::new());
+        assert!(selected_paths.is_empty());
+        assert_eq!(primary_path, None);
+    }
+
+    #[test]
+    fn test_resolve_drop_sources_handles_external_local_files_and_remote_entries() {
+        let tmp_dir = std::env::temp_dir().join(format!("rustduck_drop_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let ext_file = tmp_dir.join("external_finder_drop.bin");
+        std::fs::write(&ext_file, b"hello-native-drag-drop").unwrap();
+
+        let ext_path_str = ext_file.to_string_lossy().to_string();
+        let resolved_local = resolve_local_drop_sources(&[], std::slice::from_ref(&ext_path_str));
+        assert_eq!(resolved_local.len(), 1);
+        assert_eq!(resolved_local[0].name, "external_finder_drop.bin");
+        assert_eq!(resolved_local[0].kind, FileKind::File);
+        assert_eq!(resolved_local[0].size, 22);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        let remote_entries = vec![
+            FileEntry {
+                name: "my-bucket".into(),
+                path: "/my-bucket".into(),
+                kind: FileKind::Bucket,
+                size: 0,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "archive.tar.gz".into(),
+                path: "/my-bucket/archive.tar.gz".into(),
+                kind: FileKind::File,
+                size: 4096,
+                modified_unix: None,
+                permissions: None,
+            },
+        ];
+        let resolved_remote = resolve_remote_drop_sources(
+            &remote_entries,
+            &[
+                "/my-bucket".to_string(),
+                "/my-bucket/archive.tar.gz".to_string(),
+            ],
+        );
+        assert_eq!(resolved_remote.len(), 1);
+        assert_eq!(resolved_remote[0].name, "archive.tar.gz");
     }
 }

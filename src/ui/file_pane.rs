@@ -19,6 +19,9 @@ pub enum PaneInlineAction {
     ConfirmDelete {
         entry: FileEntry,
     },
+    ConfirmBatchDelete {
+        entries: Vec<FileEntry>,
+    },
 }
 
 pub fn filter_and_sort_entries(

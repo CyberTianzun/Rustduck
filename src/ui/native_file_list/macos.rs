@@ -1,11 +1,12 @@
 use super::{
     compute_appkit_frame, map_row_index_to_entry, resolve_drop_destination_dir,
-    should_commit_inline_rename, NativeContextMenuAction, NativePaneEvent, NativePaneSnapshot,
-    NativeRowViewModel,
+    should_commit_inline_rename, NativeContextMenuAction, NativeEventSink, NativePaneEvent,
+    NativePaneSnapshot, NativeRowViewModel,
 };
 use crate::i18n::i18n;
 use crate::models::FileEntry;
 use crate::ui::file_pane::SortColumn;
+use futures::channel::mpsc::UnboundedReceiver;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_app_kit::NSDragOperation;
@@ -80,7 +81,7 @@ struct HostInner {
     root_ns_view: usize,
     left: MacPaneState,
     right: MacPaneState,
-    events: Vec<NativePaneEvent>,
+    events: NativeEventSink,
 }
 
 struct DelegateContext {
@@ -108,7 +109,7 @@ impl PlatformHost {
                 root_ns_view: 0,
                 left: MacPaneState::new(),
                 right: MacPaneState::new(),
-                events: Vec::new(),
+                events: NativeEventSink::default(),
             })),
             suppress_selection: Arc::new(AtomicBool::new(false)),
         }
@@ -246,7 +247,17 @@ impl PlatformHost {
 
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
         let mut guard = self.state.lock().unwrap();
-        std::mem::take(&mut guard.events)
+        guard.events.drain()
+    }
+
+    pub fn subscribe_wakeup(&self) -> UnboundedReceiver<()> {
+        let mut guard = self.state.lock().unwrap();
+        guard.events.subscribe()
+    }
+
+    pub fn push_event(&self, event: NativePaneEvent) {
+        let mut guard = self.state.lock().unwrap();
+        guard.events.push(event);
     }
 
     fn ensure_views_created(&self, root_view_ptr: usize) {

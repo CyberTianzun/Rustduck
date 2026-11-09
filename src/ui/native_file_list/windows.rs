@@ -1,10 +1,12 @@
 use super::{
     map_row_index_to_entry, resolve_drop_destination_dir, should_commit_inline_rename,
-    NativeContextMenuAction, NativePaneEvent, NativePaneSnapshot, NativeRowViewModel,
+    NativeContextMenuAction, NativeEventSink, NativePaneEvent, NativePaneSnapshot,
+    NativeRowViewModel,
 };
 use crate::i18n::i18n;
 use crate::models::FileEntry;
 use crate::ui::file_pane::SortColumn;
+use futures::channel::mpsc::UnboundedReceiver;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -242,7 +244,7 @@ struct HostInner {
     icon_cache: ShellIconCache,
     left: PaneControlState,
     right: PaneControlState,
-    events: Vec<NativePaneEvent>,
+    events: NativeEventSink,
     active_remote_drag: Option<ActiveRemoteDrag>,
 }
 
@@ -274,7 +276,7 @@ impl PlatformHost {
             icon_cache: ShellIconCache::new(),
             left: PaneControlState::new(),
             right: PaneControlState::new(),
-            events: Vec::new(),
+            events: NativeEventSink::default(),
             active_remote_drag: None,
         };
 
@@ -432,7 +434,17 @@ impl PlatformHost {
 
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
         let mut guard = self.state.lock().unwrap();
-        std::mem::take(&mut guard.events)
+        guard.events.drain()
+    }
+
+    pub fn subscribe_wakeup(&self) -> UnboundedReceiver<()> {
+        let mut guard = self.state.lock().unwrap();
+        guard.events.subscribe()
+    }
+
+    pub fn push_event(&self, event: NativePaneEvent) {
+        let mut guard = self.state.lock().unwrap();
+        guard.events.push(event);
     }
 
     fn ensure_controls_created(&self, parent_hwnd_val: isize) {

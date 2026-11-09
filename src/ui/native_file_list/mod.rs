@@ -6,6 +6,7 @@ pub mod windows;
 
 use crate::models::{format_bytes, FileEntry, FileKind};
 use crate::ui::file_pane::{format_modified_time, join_local_or_remote, SortColumn};
+use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -214,6 +215,30 @@ pub fn compute_appkit_frame(
 }
 
 #[derive(Default)]
+pub(crate) struct NativeEventSink {
+    events: Vec<NativePaneEvent>,
+    wakeup_senders: Vec<UnboundedSender<()>>,
+}
+
+impl NativeEventSink {
+    pub(crate) fn push(&mut self, event: NativePaneEvent) {
+        self.events.push(event);
+        self.wakeup_senders
+            .retain(|tx| tx.unbounded_send(()).is_ok());
+    }
+
+    pub(crate) fn drain(&mut self) -> Vec<NativePaneEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    pub(crate) fn subscribe(&mut self) -> UnboundedReceiver<()> {
+        let (tx, rx) = unbounded();
+        self.wakeup_senders.push(tx);
+        rx
+    }
+}
+
+#[derive(Default)]
 pub struct NativeFileListHost {
     inner: PlatformHost,
 }
@@ -235,6 +260,14 @@ impl NativeFileListHost {
 
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
         self.inner.drain_events()
+    }
+
+    pub fn subscribe_wakeup(&self) -> UnboundedReceiver<()> {
+        self.inner.subscribe_wakeup()
+    }
+
+    pub fn push_event(&self, event: NativePaneEvent) {
+        self.inner.push_event(event);
     }
 }
 
@@ -320,5 +353,19 @@ mod tests {
 
         let flipped = compute_appkit_frame((20, 160, 800, 600), 2.0, 500.0, true);
         assert_eq!(flipped, (10.0, 80.0, 400.0, 300.0));
+    }
+
+    #[test]
+    fn test_native_file_list_host_wakeup_fires_when_event_pushed() {
+        let host = NativeFileListHost::new();
+        let mut rx = host.subscribe_wakeup();
+        assert!(rx.try_recv().is_err());
+
+        host.push_event(NativePaneEvent::NavigateUp { is_local: true });
+        assert_eq!(rx.try_recv().unwrap(), ());
+        assert_eq!(
+            host.drain_events(),
+            vec![NativePaneEvent::NavigateUp { is_local: true }]
+        );
     }
 }
