@@ -436,7 +436,7 @@ unsafe fn create_single_mac_table(
     })) as *mut c_void;
 
     let del: *mut AnyObject = msg_send![DELEGATE_CLASS, new];
-    (*del).set_ivar::<*mut c_void>(DELEGATE_IVAR, ctx_ptr);
+    set_delegate_ctx_ptr(del, ctx_ptr);
 
     let init_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, 200.0));
     let sv: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
@@ -580,11 +580,29 @@ unsafe fn sync_mac_table_selection(
     let _: () = msg_send![tv, selectRowIndexes: idx_set, byExtendingSelection: Bool::NO];
 }
 
-unsafe fn get_delegate_ctx<'a>(obj: *mut AnyObject) -> Option<&'a DelegateContext> {
-    if obj.is_null() {
-        return None;
+unsafe fn set_delegate_ctx_ptr(obj: *mut AnyObject, ctx_ptr: *mut c_void) {
+    let cls = DELEGATE_CLASS;
+    if obj.is_null() || cls.is_null() {
+        return;
     }
-    let ptr = *(*obj).get_ivar::<*mut c_void>(DELEGATE_IVAR);
+    if let Some(ivar) = (*cls).instance_variable(DELEGATE_IVAR) {
+        *ivar.load_mut::<*mut c_void>(&mut *obj) = ctx_ptr;
+    }
+}
+
+unsafe fn get_delegate_ctx_ptr(obj: *mut AnyObject) -> *mut c_void {
+    let cls = DELEGATE_CLASS;
+    if obj.is_null() || cls.is_null() {
+        return null_mut();
+    }
+    match (*cls).instance_variable(DELEGATE_IVAR) {
+        Some(ivar) => *ivar.load::<*mut c_void>(&*obj),
+        None => null_mut(),
+    }
+}
+
+unsafe fn get_delegate_ctx<'a>(obj: *mut AnyObject) -> Option<&'a DelegateContext> {
+    let ptr = get_delegate_ctx_ptr(obj);
     if ptr.is_null() {
         None
     } else {
@@ -594,9 +612,9 @@ unsafe fn get_delegate_ctx<'a>(obj: *mut AnyObject) -> Option<&'a DelegateContex
 
 extern "C" fn delegate_dealloc(this: *mut AnyObject, _cmd: Sel) {
     unsafe {
-        let ptr = *(*this).get_ivar::<*mut c_void>(DELEGATE_IVAR);
+        let ptr = get_delegate_ctx_ptr(this);
         if !ptr.is_null() {
-            (*this).set_ivar::<*mut c_void>(DELEGATE_IVAR, null_mut());
+            set_delegate_ctx_ptr(this, null_mut());
             let _ = Box::from_raw(ptr as *mut DelegateContext);
         }
         let _: () = msg_send![super(this, class!(NSObject)), dealloc];

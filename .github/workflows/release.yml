@@ -5,12 +5,9 @@ name: release
 #   release-v1.2.3-rc.1 / v1.2.3-rc.1  带 `-` 后缀的视为预发布
 on:
   push:
-    # 发布脚本改动自动试跑打包;分支构建不创建 Release。
-    branches: [master, dev]
-    paths: [".github/workflows/release.yml"]
     tags:
-      - "release-v[0-9]+.[0-9]+.[0-9]+*"
-      - "v[0-9]+.[0-9]+.[0-9]+*"
+      - "release-v[0-9]*.*[0-9]*"
+      - "v[0-9]*.*[0-9]*"
   # 手动触发只构建、上传 Actions 产物,不发 Release:用来在打 tag 前试跑一遍
   workflow_dispatch:
 
