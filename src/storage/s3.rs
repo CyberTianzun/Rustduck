@@ -409,6 +409,15 @@ pub fn resolve_effective_s3_region(config: &S3Config) -> String {
     }
 }
 
+pub fn build_put_object_acl_headers(
+    acl: crate::services::preferences::S3UploadAcl,
+) -> Vec<(String, String)> {
+    match acl.header_value() {
+        Some(val) => vec![("x-amz-acl".to_string(), val.to_string())],
+        None => Vec::new(),
+    }
+}
+
 pub fn summarize_s3_error_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -873,7 +882,9 @@ impl StorageBackend for S3Backend {
             &key,
         )?;
 
-        let headers = self.sign_request(&Method::PUT, &url, "UNSIGNED-PAYLOAD", &[])?;
+        let extra_headers =
+            build_put_object_acl_headers(crate::services::preferences::current_s3_upload_acl());
+        let headers = self.sign_request(&Method::PUT, &url, "UNSIGNED-PAYLOAD", &extra_headers)?;
         let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
 
         let mut req = self
@@ -1257,5 +1268,71 @@ mod tests {
             "SignatureDoesNotMatch: The Signature you specified is invalid."
         );
         assert!(!summary.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn test_s3_upload_stream_includes_signed_x_amz_acl_header_when_configured() {
+        use crate::models::{S3AddressingStyle, S3Config, S3Preset};
+        use crate::services::preferences::{set_current_s3_upload_acl, S3UploadAcl};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        assert!(build_put_object_acl_headers(S3UploadAcl::BucketDefault).is_empty());
+        assert_eq!(
+            build_put_object_acl_headers(S3UploadAcl::PublicRead),
+            vec![("x-amz-acl".to_string(), "public-read".to_string())]
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (header_tx, header_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut req_buf = vec![0u8; 4096];
+                let n = socket.read(&mut req_buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]).to_string();
+                let _ = header_tx.send(req_str);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        set_current_s3_upload_acl(S3UploadAcl::PublicRead);
+        let cfg = S3Config {
+            preset: S3Preset::Minio,
+            endpoint: format!("http://{addr}"),
+            region: "us-east-1".to_string(),
+            access_key_id: "minioadmin".to_string(),
+            bucket: Some("test-bkt".to_string()),
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::PathStyle,
+        };
+        let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
+
+        let mut cursor = std::io::Cursor::new(b"hello-acl".to_vec());
+        let res = backend
+            .upload_stream(
+                &mut cursor,
+                Some(9),
+                "/acl-demo.txt",
+                Arc::new(|_| {}),
+                CancellationToken::new(),
+            )
+            .await;
+        set_current_s3_upload_acl(S3UploadAcl::BucketDefault);
+
+        assert!(res.is_ok(), "upload_stream failed: {res:?}");
+        let received_headers = header_rx.await.unwrap().to_lowercase();
+        assert!(
+            received_headers.contains("x-amz-acl: public-read"),
+            "expected x-amz-acl: public-read header, got: {received_headers}"
+        );
+        assert!(
+            received_headers.contains("signedheaders=host;x-amz-acl;x-amz-content-sha256;x-amz-date"),
+            "expected x-amz-acl in SignedHeaders, got: {received_headers}"
+        );
     }
 }

@@ -1,5 +1,7 @@
 use crate::models::{S3AddressingStyle, S3Preset};
-use crate::services::preferences::{AppLanguage, ThemePreference};
+use crate::services::preferences::{
+    AppLanguage, LocalStartupDirMode, S3UploadAcl, ThemePreference,
+};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static ACTIVE_LANG: AtomicU8 = AtomicU8::new(0);
@@ -195,6 +197,104 @@ impl I18n {
         }
     }
 
+    pub fn settings_section_local_dir(&self) -> &'static str {
+        if self.is_zh() {
+            "本机初始目录"
+        } else {
+            "Local Initial Directory"
+        }
+    }
+
+    pub fn settings_section_local_dir_desc(&self) -> &'static str {
+        if self.is_zh() {
+            "设置启动或新建标签页时的默认本地路径（若原目录被删除将自动回退至系统主目录）"
+        } else {
+            "Default local directory for new tabs (automatically falls back to home directory if missing)"
+        }
+    }
+
+    pub fn local_dir_mode_title(&self, mode: LocalStartupDirMode) -> &'static str {
+        match (self.lang, mode) {
+            (AppLanguage::ZhCn, LocalStartupDirMode::RememberLast) => "记住上次目录",
+            (AppLanguage::ZhCn, LocalStartupDirMode::Custom) => "指定初始目录",
+            (AppLanguage::EnUs, LocalStartupDirMode::RememberLast) => "Remember Last",
+            (AppLanguage::EnUs, LocalStartupDirMode::Custom) => "Custom Folder",
+        }
+    }
+
+    pub fn placeholder_custom_local_dir(&self) -> &'static str {
+        if self.is_zh() {
+            "输入本地文件夹路径，或点击右侧按钮浏览选择..."
+        } else {
+            "Enter local folder path, or click Browse..."
+        }
+    }
+
+    pub fn browse_folder_btn(&self) -> &'static str {
+        if self.is_zh() {
+            "选择目录..."
+        } else {
+            "Browse..."
+        }
+    }
+
+    pub fn msg_local_dir_fallback(&self, fallback: &str) -> String {
+        if self.is_zh() {
+            format!("原本地目录不存在或已被删除，已自动回退至: {fallback}")
+        } else {
+            format!("Local directory not found; fell back to: {fallback}")
+        }
+    }
+
+    pub fn settings_section_s3_acl(&self) -> &'static str {
+        if self.is_zh() {
+            "S3 默认上传权限 (Canned ACL)"
+        } else {
+            "S3 Default Upload Permissions (Canned ACL)"
+        }
+    }
+
+    pub fn settings_section_s3_acl_desc(&self) -> &'static str {
+        if self.is_zh() {
+            "设置 S3 协议上传文件时附带的默认 x-amz-acl 权限头（若存储桶禁用了 ACL 请选择「跟随存储桶默认」）"
+        } else {
+            "Default x-amz-acl header for S3 uploads (choose \"Bucket Default\" if Bucket Owner Enforced is enabled)"
+        }
+    }
+
+    pub fn s3_acl_option_title(&self, acl: S3UploadAcl) -> &'static str {
+        match (self.lang, acl) {
+            (AppLanguage::ZhCn, S3UploadAcl::BucketDefault) => "跟随存储桶默认 (不发送 ACL)",
+            (AppLanguage::ZhCn, S3UploadAcl::Private) => "私有 (private)",
+            (AppLanguage::ZhCn, S3UploadAcl::PublicRead) => "公共读 (public-read)",
+            (AppLanguage::ZhCn, S3UploadAcl::PublicReadWrite) => "公共读写 (public-read-write)",
+            (AppLanguage::ZhCn, S3UploadAcl::AuthenticatedRead) => {
+                "认证用户读 (authenticated-read)"
+            }
+            (AppLanguage::ZhCn, S3UploadAcl::BucketOwnerRead) => {
+                "桶拥有者读 (bucket-owner-read)"
+            }
+            (AppLanguage::ZhCn, S3UploadAcl::BucketOwnerFullControl) => {
+                "桶拥有者完全控制 (bucket-owner-full-control)"
+            }
+            (AppLanguage::EnUs, S3UploadAcl::BucketDefault) => "Bucket Default (No ACL)",
+            (AppLanguage::EnUs, S3UploadAcl::Private) => "Private (private)",
+            (AppLanguage::EnUs, S3UploadAcl::PublicRead) => "Public Read (public-read)",
+            (AppLanguage::EnUs, S3UploadAcl::PublicReadWrite) => {
+                "Public Read-Write (public-read-write)"
+            }
+            (AppLanguage::EnUs, S3UploadAcl::AuthenticatedRead) => {
+                "Authenticated Read (authenticated-read)"
+            }
+            (AppLanguage::EnUs, S3UploadAcl::BucketOwnerRead) => {
+                "Bucket Owner Read (bucket-owner-read)"
+            }
+            (AppLanguage::EnUs, S3UploadAcl::BucketOwnerFullControl) => {
+                "Bucket Owner Full Control (bucket-owner-full-control)"
+            }
+        }
+    }
+
     pub fn about_tagline(&self) -> &'static str {
         if self.is_zh() {
             "基于 Rust 与 GPUI 构建的现代化跨协议文件传输工作台"
@@ -220,10 +320,79 @@ impl I18n {
     }
 
     pub fn about_update_placeholder(&self) -> &'static str {
+        self.about_update_idle_desc()
+    }
+
+    pub fn about_update_idle_desc(&self) -> &'static str {
         if self.is_zh() {
-            "当前已是最新版本（在线检查更新将在后续版本开放）"
+            "每日自动检查 GitHub Releases 更新，也可随时手动检查"
         } else {
-            "Up to date (online update checking will be available in a future release)"
+            "Automatically checks GitHub Releases daily, or check manually anytime"
+        }
+    }
+
+    pub fn about_update_checking(&self) -> &'static str {
+        if self.is_zh() {
+            "正在检查 GitHub Releases 最新版本..."
+        } else {
+            "Checking GitHub Releases for updates..."
+        }
+    }
+
+    pub fn about_update_up_to_date(&self, current_version: &str) -> String {
+        if self.is_zh() {
+            format!("当前已是最新版本 (v{current_version})")
+        } else {
+            format!("You are on the latest version (v{current_version})")
+        }
+    }
+
+    pub fn about_update_available(&self, new_version: &str) -> String {
+        if self.is_zh() {
+            format!("发现新版本 v{new_version}，点击前往 GitHub 下载")
+        } else {
+            format!("New version v{new_version} available on GitHub")
+        }
+    }
+
+    pub fn about_update_failed(&self, err: &str) -> String {
+        if self.is_zh() {
+            format!("检查更新失败: {err}")
+        } else {
+            format!("Update check failed: {err}")
+        }
+    }
+
+    pub fn about_check_update_btn(&self, is_checking: bool) -> &'static str {
+        match (self.is_zh(), is_checking) {
+            (true, true) => "检查中...",
+            (true, false) => "检查更新",
+            (false, true) => "Checking...",
+            (false, false) => "Check for Updates",
+        }
+    }
+
+    pub fn about_download_update_btn(&self, version: &str) -> String {
+        if self.is_zh() {
+            format!("前往下载 v{version}")
+        } else {
+            format!("Download v{version}")
+        }
+    }
+
+    pub fn titlebar_update_badge_label(&self, version: &str) -> String {
+        if self.is_zh() {
+            format!("新版本 v{version}")
+        } else {
+            format!("Update v{version}")
+        }
+    }
+
+    pub fn titlebar_update_badge_tooltip(&self, version: &str) -> String {
+        if self.is_zh() {
+            format!("发现新版本 v{version}，点击前往 GitHub Release 下载")
+        } else {
+            format!("New version v{version} available — click to open GitHub Release")
         }
     }
 
@@ -1483,6 +1652,30 @@ mod tests {
         assert_eq!(en.theme_option_title(ThemePreference::System), "System");
         assert!(!zh.about_update_placeholder().is_empty());
         assert!(!en.about_update_placeholder().is_empty());
+        assert_eq!(zh.about_check_update_btn(false), "检查更新");
+        assert_eq!(en.about_check_update_btn(false), "Check for Updates");
+        assert_eq!(zh.about_check_update_btn(true), "检查中...");
+        assert_eq!(en.about_check_update_btn(true), "Checking...");
+        assert!(zh.about_update_available("0.2.0").contains("v0.2.0"));
+        assert!(en.about_update_available("0.2.0").contains("v0.2.0"));
+        assert_eq!(zh.titlebar_update_badge_label("0.2.0"), "新版本 v0.2.0");
+        assert_eq!(en.titlebar_update_badge_label("0.2.0"), "Update v0.2.0");
+        assert_eq!(
+            zh.local_dir_mode_title(LocalStartupDirMode::RememberLast),
+            "记住上次目录"
+        );
+        assert_eq!(
+            en.local_dir_mode_title(LocalStartupDirMode::Custom),
+            "Custom Folder"
+        );
+        assert_eq!(
+            zh.s3_acl_option_title(S3UploadAcl::PublicRead),
+            "公共读 (public-read)"
+        );
+        assert_eq!(
+            en.s3_acl_option_title(S3UploadAcl::BucketDefault),
+            "Bucket Default (No ACL)"
+        );
     }
 
     #[test]

@@ -5,9 +5,12 @@ use crate::models::{
     TransferStatus, TransferTask, WebDavConfig,
 };
 use crate::services::bookmark_store::{BookmarkStore, KeyringCredentialVault};
-use crate::services::preferences::{AppLanguage, PreferencesStore, ThemePreference};
+use crate::services::preferences::{
+    AppLanguage, LocalStartupDirMode, PreferencesStore, S3UploadAcl, ThemePreference,
+};
 use crate::services::runtime::tokio_runtime;
 use crate::services::transfer_manager::TransferManager;
+use crate::services::update_checker::{check_github_latest_release, UpdateCheckState};
 use crate::storage::gdrive::authorize_google_drive_in_browser;
 use crate::storage::local::LocalFileSystem;
 use crate::storage::onedrive::authorize_onedrive_in_browser;
@@ -22,7 +25,7 @@ use crate::ui::native_file_list::{
     NativeRowViewModel,
 };
 use crate::ui::new_tab_view::render_new_tab_view;
-use crate::ui::settings_modal::{render_settings_modal, SettingsTab};
+use crate::ui::settings_modal::{render_settings_modal, SettingsTab, APP_VERSION};
 use crate::ui::transfer_drawer::render_transfer_drawer;
 use crate::ui::{
     accent_amber, accent_blue, accent_green, accent_red, apply_theme_preference, bg_canvas,
@@ -785,9 +788,16 @@ pub struct TabSession {
 
 impl TabSession {
     pub fn new(window: &mut Window, cx: &mut Context<RustduckWorkspace>) -> Self {
+        Self::new_with_initial_local_dir(LocalFileSystem::initial_local_dir(), window, cx)
+    }
+
+    pub fn new_with_initial_local_dir(
+        initial_local: String,
+        window: &mut Window,
+        cx: &mut Context<RustduckWorkspace>,
+    ) -> Self {
         let t = i18n();
         let local_fs = LocalFileSystem::new();
-        let initial_local = LocalFileSystem::initial_local_dir();
 
         let local_for_input = initial_local.clone();
         let local_filter_input =
@@ -1038,6 +1048,22 @@ pub fn workspace_window_options(bounds: gpui::Bounds<gpui::Pixels>) -> gpui::Win
     window_options
 }
 
+pub fn ensure_valid_local_dir_or_fallback(path: &str) -> (String, bool) {
+    let trimmed = path.trim();
+    #[cfg(target_os = "windows")]
+    if trimmed.is_empty() || trimmed == "/" || trimmed == "\\" {
+        return (trimmed.to_string(), false);
+    }
+    if !trimmed.is_empty()
+        && std::fs::metadata(trimmed)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+    {
+        return (trimmed.to_string(), false);
+    }
+    (LocalFileSystem::initial_local_dir(), true)
+}
+
 pub struct RustduckWorkspace {
     pub tabs: Vec<TabSession>,
     pub active_tab: usize,
@@ -1048,6 +1074,8 @@ pub struct RustduckWorkspace {
     pub drawer_expanded: bool,
     pub settings_open: bool,
     pub settings_tab: SettingsTab,
+    pub settings_custom_local_dir_input: Entity<InputState>,
+    pub update_state: UpdateCheckState,
     pub seen_completed_transfers: HashSet<Uuid>,
 }
 
@@ -1059,6 +1087,8 @@ impl RustduckWorkspace {
 
         let initial_lang = preferences_store.preferences().language;
         let initial_theme = preferences_store.preferences().theme;
+        let initial_custom_dir = preferences_store.preferences().custom_local_dir.clone();
+        let effective_initial_local = preferences_store.resolve_effective_local_dir();
         set_current_language(initial_lang);
         apply_theme_preference(initial_theme, Some(window), cx);
 
@@ -1071,11 +1101,23 @@ impl RustduckWorkspace {
         })
         .detach();
 
+        let settings_custom_local_dir_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n().placeholder_custom_local_dir())
+                .default_value(initial_custom_dir)
+        });
+        cx.observe(&settings_custom_local_dir_input, |ws, input, _cx| {
+            let val = input.read(_cx).value().trim().to_string();
+            let _ = ws.preferences_store.set_custom_local_dir(val);
+        })
+        .detach();
+
         let vault = Arc::new(KeyringCredentialVault::new());
         let config_path = BookmarkStore::default_config_path();
         let bookmark_store = BookmarkStore::load_or_default(config_path, vault)
             .expect("Failed to initialize BookmarkStore");
-        let first_tab = TabSession::new(window, cx);
+        let first_tab =
+            TabSession::new_with_initial_local_dir(effective_initial_local, window, cx);
         let native_file_list_host = Arc::new(NativeFileListHost::new());
 
         let mut ws = Self {
@@ -1088,12 +1130,139 @@ impl RustduckWorkspace {
             drawer_expanded: false,
             settings_open: false,
             settings_tab: SettingsTab::General,
+            settings_custom_local_dir_input,
+            update_state: UpdateCheckState::Idle,
             seen_completed_transfers: HashSet::new(),
         };
         ws.refresh_local_pane(0, window, cx);
         ws.start_transfer_watcher(cx);
         ws.start_native_event_watcher(window, cx);
+        ws.start_daily_update_checker(cx);
         ws
+    }
+
+    pub fn set_s3_default_acl(&mut self, acl: S3UploadAcl, cx: &mut Context<Self>) {
+        let _ = self.preferences_store.set_s3_default_acl(acl);
+        cx.notify();
+    }
+
+    pub fn set_local_startup_mode(&mut self, mode: LocalStartupDirMode, cx: &mut Context<Self>) {
+        let _ = self.preferences_store.set_local_startup_mode(mode);
+        cx.notify();
+    }
+
+    pub fn browse_custom_local_dir_in_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(dir_path) = paths.into_iter().next() {
+                    let dir_str = dir_path.to_string_lossy().to_string();
+                    let _ = this.update_in(cx, |ws, window, cx| {
+                        ws.settings_custom_local_dir_input.update(cx, |s, cx| {
+                            s.set_value(dir_str.clone(), window, cx);
+                        });
+                        let _ = ws.preferences_store.set_custom_local_dir(dir_str.clone());
+                        let _ = ws
+                            .preferences_store
+                            .set_local_startup_mode(LocalStartupDirMode::Custom);
+                        let active_idx = ws.active_tab.min(ws.tabs.len().saturating_sub(1));
+                        ws.jump_to_path(active_idx, true, dir_str, window, cx);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn open_url_in_browser(url: &str) {
+        let _ = open::that_detached(url);
+    }
+
+    pub fn trigger_update_check(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if matches!(self.update_state, UpdateCheckState::Checking) {
+            return;
+        }
+        let previous_available = match &self.update_state {
+            UpdateCheckState::UpdateAvailable(info) => Some(info.clone()),
+            _ => None,
+        };
+        self.update_state = UpdateCheckState::Checking;
+        cx.notify();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        tokio_runtime().spawn(async move {
+            let res = check_github_latest_release(APP_VERSION).await;
+            let _ = tx.send(res);
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.await {
+                let _ = this.update(cx, |ws, cx| {
+                    match result {
+                        Ok(state) => {
+                            let now_unix = chrono::Utc::now().timestamp();
+                            let _ = ws.preferences_store.set_last_update_check_unix(now_unix);
+                            ws.update_state = state;
+                        }
+                        Err(err) => {
+                            if manual {
+                                ws.update_state = UpdateCheckState::Failed(
+                                    format_single_line_status(&err.to_string()),
+                                );
+                            } else if let Some(prev) = previous_available {
+                                ws.update_state = UpdateCheckState::UpdateAvailable(prev);
+                            } else {
+                                ws.update_state = UpdateCheckState::Idle;
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn start_daily_update_checker(&mut self, cx: &mut Context<Self>) {
+        let now_unix = chrono::Utc::now().timestamp();
+        if self.preferences_store.should_run_daily_update_check(now_unix) {
+            self.trigger_update_check(false, cx);
+        }
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                let (tx, rx) = futures::channel::oneshot::channel();
+                tokio_runtime().spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    let _ = tx.send(());
+                });
+                if rx.await.is_err() {
+                    break;
+                }
+
+                let keep_going = this.update(cx, |ws, cx| {
+                    let now_unix = chrono::Utc::now().timestamp();
+                    if ws.preferences_store.should_run_daily_update_check(now_unix) {
+                        ws.trigger_update_check(false, cx);
+                    }
+                });
+                if keep_going.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn start_native_event_watcher(&self, window: &Window, cx: &mut Context<Self>) {
@@ -1125,6 +1294,9 @@ impl RustduckWorkspace {
     ) {
         let _ = self.preferences_store.set_language(lang);
         set_current_language(lang);
+        let custom_dir_placeholder = i18n().placeholder_custom_local_dir();
+        self.settings_custom_local_dir_input
+            .update(cx, |s, cx| s.set_placeholder(custom_dir_placeholder, window, cx));
         for tab in &mut self.tabs {
             tab.refresh_placeholders(window, cx);
         }
@@ -1188,7 +1360,8 @@ impl RustduckWorkspace {
     }
 
     pub fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let tab = TabSession::new(window, cx);
+        let initial_local = self.preferences_store.resolve_effective_local_dir();
+        let tab = TabSession::new_with_initial_local_dir(initial_local, window, cx);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.refresh_local_pane(self.active_tab, window, cx);
@@ -1197,7 +1370,8 @@ impl RustduckWorkspace {
 
     pub fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 {
-            self.tabs[0] = TabSession::new(window, cx);
+            let initial_local = self.preferences_store.resolve_effective_local_dir();
+            self.tabs[0] = TabSession::new_with_initial_local_dir(initial_local, window, cx);
             self.active_tab = 0;
             self.native_file_list_host.hide_all();
             self.refresh_local_pane(0, window, cx);
@@ -1912,8 +2086,21 @@ impl RustduckWorkspace {
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
         tokio_runtime().spawn(async move {
-            let res = backend.list_dir(&path).await;
-            let _ = tx.send(res);
+            match backend.list_dir(&path).await {
+                Ok(entries) => {
+                    let _ = tx.send(Ok((entries, None)));
+                }
+                Err(primary_err) => {
+                    let fallback = LocalFileSystem::initial_local_dir();
+                    if path != fallback {
+                        if let Ok(fallback_entries) = backend.list_dir(&fallback).await {
+                            let _ = tx.send(Ok((fallback_entries, Some(fallback))));
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Err(primary_err));
+                }
+            }
         });
 
         cx.spawn(async move |this, cx| {
@@ -1921,7 +2108,13 @@ impl RustduckWorkspace {
                 let _ = this.update(cx, |ws, cx| {
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
                         match res {
-                            Ok(entries) => {
+                            Ok((entries, fallback_opt)) => {
+                                if let Some(fallback_dir) = fallback_opt {
+                                    tab.local_path = fallback_dir.clone();
+                                    tab.status_message =
+                                        Some(i18n().msg_local_dir_fallback(&fallback_dir));
+                                    let _ = ws.preferences_store.set_last_local_dir(fallback_dir);
+                                }
                                 tab.local_entries = entries;
                                 prune_selection_against_entries(
                                     &mut tab.selected_local_paths,
@@ -1991,10 +2184,22 @@ impl RustduckWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path = self.tabs[tab_idx].local_path.clone();
+        let current = self.tabs[tab_idx].local_path.clone();
+        let (effective_path, fell_back) = ensure_valid_local_dir_or_fallback(&current);
+        if fell_back {
+            self.tabs[tab_idx].local_path = effective_path.clone();
+            self.tabs[tab_idx].status_message =
+                Some(i18n().msg_local_dir_fallback(&effective_path));
+        }
+        let is_virtual_drive_root = matches!(effective_path.as_str(), "" | "/" | "\\");
+        if !is_virtual_drive_root {
+            let _ = self
+                .preferences_store
+                .set_last_local_dir(effective_path.clone());
+        }
         self.tabs[tab_idx]
             .local_path_input
-            .update(cx, |s, cx| s.set_value(path, window, cx));
+            .update(cx, |s, cx| s.set_value(effective_path, window, cx));
         self.spawn_local_list(tab_idx, cx);
     }
 
@@ -2739,6 +2944,26 @@ impl RustduckWorkspace {
                         ),
                 )
             })
+            .when_some(
+                match &self.update_state {
+                    UpdateCheckState::UpdateAvailable(info) => Some(info.clone()),
+                    _ => None,
+                },
+                |el, info| {
+                    let url = info.html_url.clone();
+                    el.child(
+                        Button::new("top-update-available-btn")
+                            .xsmall()
+                            .primary()
+                            .icon(IconName::Download)
+                            .label(t.titlebar_update_badge_label(&info.version))
+                            .tooltip(t.titlebar_update_badge_tooltip(&info.version))
+                            .on_click(cx.listener(move |_this, _ev, _window, _cx| {
+                                Self::open_url_in_browser(&url);
+                            })),
+                    )
+                },
+            )
             .child(
                 Button::new("top-open-settings")
                     .xsmall()
@@ -3227,5 +3452,26 @@ mod tests {
         assert!(is_error_status_message("Invalid connection config: missing SecretKey"));
         assert!(!is_error_status_message("已载入收藏配置「ace-cdn-na」"));
         assert!(!is_error_status_message("Loaded favorite \"ace-cdn-na\""));
+    }
+
+    #[test]
+    fn test_ensure_valid_local_dir_or_fallback_recovers_from_deleted_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid_dir = tmp.path().join("my_folder");
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        let valid_str = valid_dir.to_string_lossy().to_string();
+
+        let (resolved, fell_back) = ensure_valid_local_dir_or_fallback(&valid_str);
+        assert!(!fell_back);
+        assert_eq!(resolved, valid_str);
+
+        std::fs::remove_dir_all(&valid_dir).unwrap();
+        let (fallback_path, fell_back_after_delete) =
+            ensure_valid_local_dir_or_fallback(&valid_str);
+        assert!(fell_back_after_delete);
+        assert_ne!(fallback_path, valid_str);
+        assert!(std::fs::metadata(&fallback_path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false));
     }
 }
