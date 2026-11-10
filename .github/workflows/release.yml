@@ -1,0 +1,164 @@
+name: release
+
+# tag 用前缀区分用途:`release-v<semver>`(或直接 `v<semver>`)触发正式发布流程:
+#   release-v1.2.3 / v1.2.3        正式版
+#   release-v1.2.3-rc.1 / v1.2.3-rc.1  带 `-` 后缀的视为预发布
+on:
+  push:
+    # 发布脚本改动自动试跑打包;分支构建不创建 Release。
+    branches: [master, dev]
+    paths: [".github/workflows/release.yml"]
+    tags:
+      - "release-v[0-9]+.[0-9]+.[0-9]+*"
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  # 手动触发只构建、上传 Actions 产物,不发 Release:用来在打 tag 前试跑一遍
+  workflow_dispatch:
+
+# 同一个 tag 重复推送时,取消前一次还在跑的
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本号取自 tag:release-v0.1.0 / v0.1.0 -> v0.1.0;并且必须和 Cargo.toml
+      # 一致,否则桌面端 Info.plist 等处会和 Release 名对不上
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#release-}"
+            expected="${version#v}"
+            actual="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error file=Cargo.toml::version 是 $actual,而 tag 是 $GITHUB_REF_NAME(期望 $expected)"
+              exit 1
+            fi
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build desktop GUI client
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Bundle desktop (macOS)
+        if: runner.os == 'macOS'
+        run: bash ./scripts/bundle-macos.sh ${{ matrix.target }}
+
+      - name: Bundle desktop (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: scripts\bundle-windows.bat ${{ matrix.target }}
+
+      # 所有产物统一收进 dist/,文件名都带版本号和 target,并各配一个 .sha256
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            archive="rustduck-${VERSION}-${{ matrix.target }}.zip"
+            # ditto 保留 .app 的权限位和扩展属性,比 zip -r 可靠
+            ditto -c -k --keepParent target/bundle/Rustduck.app "dist/$archive"
+          else
+            archive="rustduck-${VERSION}-${{ matrix.target }}.tar.gz"
+            tar -czf "dist/$archive" -C "target/${{ matrix.target }}/release" rustduck
+          fi
+          cd dist && for f in *; do shasum -a 256 "$f" > "$f.sha256"; done
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/bundle/rustduck.exe" `
+            -DestinationPath "dist/rustduck-$env:VERSION-${{ matrix.target }}.zip"
+          Get-ChildItem dist -File | ForEach-Object {
+            (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() + "  $($_.Name)" |
+              Out-File -Encoding ascii "$($_.FullName).sha256"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustduck-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # 只在一个 job 里创建 Release:多个 matrix job 并发调用 action-gh-release
+  # 会抢着建同一个 release,偶发出现重复的草稿或上传失败
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.prepare.outputs.version }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*

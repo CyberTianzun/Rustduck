@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 use gpui::{px, size, App, AppContext as _, Bounds};
 use rustduck::ui::{
     workspace::{workspace_window_options, RustduckWorkspace},

@@ -1,6 +1,5 @@
-use std::env;
-use std::fs;
-use std::path::PathBuf;
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
+use std::{env, fs, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/icons/windows/rustduck.ico");
