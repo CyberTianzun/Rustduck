@@ -15,58 +15,65 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ, ScreenToClient,
+    CreateFontIndirectW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::IDataObject;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Ole::{IDropSource, OleInitialize, OleUninitialize, DROPEFFECT_COPY};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, SetWindowTheme, HDITEMW, HDF_LEFT, HDF_RIGHT, HDF_SORTDOWN, HDF_SORTUP,
-    HDF_STRING, HDI_FORMAT, HDM_GETITEMW, HDM_SETITEMW, HEADER_CONTROL_FORMAT_FLAGS,
-    ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCFMT_LEFT, LVCFMT_RIGHT, LVCF_FMT, LVCF_TEXT,
-    LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_IMAGE, LVIF_STATE, LVIF_TEXT, LVIS_SELECTED,
-    LVITEMW, LVM_EDITLABELW, LVM_ENSUREVISIBLE, LVM_GETHEADER, LVM_GETNEXTITEM, LVM_HITTEST,
-    LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETBKCOLOR, LVM_SETCOLUMNW, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
-    LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVNI_FOCUSED, LVNI_SELECTED, LVN_BEGINDRAG,
-    LVN_BEGINLABELEDITW, LVN_COLUMNCLICK, LVN_ENDLABELEDITW, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
-    LVN_KEYDOWN, LVN_ODSTATECHANGED, LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, LVSIL_SMALL,
-    LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP,
-    LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, NMHDR, NMITEMACTIVATE,
-    NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN, NM_DBLCLK, NM_RCLICK, WC_LISTVIEWW,
+    InitCommonControlsEx, SetWindowTheme, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT,
+    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, HDITEMW, HDF_LEFT, HDF_RIGHT,
+    HDF_SORTDOWN, HDF_SORTUP, HDF_STRING, HDI_FORMAT, HDM_GETITEMW, HDM_SETITEMW,
+    HEADER_CONTROL_FORMAT_FLAGS, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCFMT_LEFT,
+    LVCFMT_RIGHT, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_IMAGE,
+    LVIF_STATE, LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_EDITLABELW, LVM_ENSUREVISIBLE,
+    LVM_GETHEADER, LVM_GETNEXTITEM, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS,
+    LVM_SETBKCOLOR, LVM_SETCOLUMNW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
+    LVNI_FOCUSED, LVNI_SELECTED, LVN_BEGINDRAG, LVN_BEGINLABELEDITW, LVN_COLUMNCLICK,
+    LVN_ENDLABELEDITW, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODSTATECHANGED,
+    LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, LVSIL_SMALL, LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS,
+    LVS_SHOWSELALWAYS, NMCUSTOMDRAW, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW,
+    NMLVKEYDOWN, NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_F2,
     VK_RETURN,
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+#[cfg(test)]
+use windows::Win32::UI::Shell::{IShellFolder, SHBindToObject, SHBindToParent};
 use windows::Win32::UI::Shell::{
-    DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, IContextMenu,
-    ILFindLastID, ILFree, IShellFolder, RemoveWindowSubclass, SHBindToObject, SHBindToParent,
-    SHCreateDataObject, SHDoDragDrop, SHGetFileInfoW, SHParseDisplayName, SetWindowSubclass,
-    CMINVOKECOMMANDINFO, CMF_NORMAL, HDROP, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
+    DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, ILFindLastID,
+    ILFree, RemoveWindowSubclass, SHCreateDataObject, SHDoDragDrop, SHGetFileInfoW,
+    SHParseDisplayName, SetWindowSubclass, HDROP, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
     SHGFI_USEFILEATTRIBUTES,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::WS_POPUP;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetCursorPos,
-    GetWindowLongW, IsChild, LoadCursorW, SendMessageW, SetCursor, SetWindowLongW, SetWindowPos,
-    ShowWindow, SystemParametersInfoW, TrackPopupMenuEx, WindowFromPoint, GWL_STYLE, HMENU,
-    IDC_ARROW, IDC_HAND, MF_GRAYED, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW,
-    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DROPFILES, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY,
-    WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetClientRect,
+    GetCursorPos, GetWindowLongW, IsChild, LoadCursorW, PostMessageW, SendMessageW, SetCursor,
+    SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    TrackPopupMenuEx, WindowFromPoint, GWL_STYLE, HMENU, IDC_ARROW, IDC_HAND, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DROPFILES,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_NULL, WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN,
+    WS_TABSTOP,
 };
 
 const PARENT_SUBCLASS_ID: usize = 0x5244_0001;
 const CHILD_SUBCLASS_ID: usize = 0x5244_0002;
 const LEFT_LISTVIEW_ID: usize = 1001;
 const RIGHT_LISTVIEW_ID: usize = 1002;
+const WM_APP_SHOW_CONTEXT_MENU: u32 = WM_APP + 0x42;
 
 const CMD_TRANSFER: u32 = 30_001;
 const CMD_OPEN: u32 = 30_002;
@@ -75,8 +82,7 @@ const CMD_NEW_FOLDER: u32 = 30_004;
 const CMD_DELETE: u32 = 30_005;
 const CMD_COPY_PATH: u32 = 30_006;
 const CMD_REFRESH: u32 = 30_007;
-const CMD_SHELL_FIRST: u32 = 31_000;
-const CMD_SHELL_LAST: u32 = 39_999;
+const CMD_REVEAL_IN_SHELL: u32 = 30_008;
 
 #[inline]
 unsafe fn send_msg(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
@@ -256,6 +262,7 @@ struct HostInner {
 pub struct PlatformHost {
     state: Arc<Mutex<HostInner>>,
     suppress_selection_events: Arc<AtomicBool>,
+    in_context_menu: Arc<AtomicBool>,
     ole_initialized: bool,
 }
 
@@ -301,6 +308,7 @@ impl PlatformHost {
         Self {
             state: Arc::new(Mutex::new(inner)),
             suppress_selection_events: Arc::new(AtomicBool::new(false)),
+            in_context_menu: Arc::new(AtomicBool::new(false)),
             ole_initialized,
         }
     }
@@ -324,6 +332,9 @@ impl PlatformHost {
         parent_hwnd_val: isize,
         snapshot: &NativePaneSnapshot,
     ) {
+        if self.in_context_menu.load(Ordering::SeqCst) {
+            return;
+        }
         self.ensure_controls_created(parent_hwnd_val);
 
         let mut guard = self.state.lock().unwrap();
@@ -531,6 +542,7 @@ impl PlatformHost {
         let ctx_ptr = Box::into_raw(Box::new(SubclassContext {
             state: Arc::downgrade(&self.state),
             suppress_selection: Arc::clone(&self.suppress_selection_events),
+            in_context_menu: Arc::clone(&self.in_context_menu),
         }));
 
         unsafe {
@@ -600,6 +612,7 @@ impl Drop for HostInner {
 struct SubclassContext {
     state: Weak<Mutex<HostInner>>,
     suppress_selection: Arc<AtomicBool>,
+    in_context_menu: Arc<AtomicBool>,
 }
 
 fn create_message_font() -> isize {
@@ -720,6 +733,34 @@ fn resize_columns_to_width(hwnd: HWND, total_width: i32) {
     }
 }
 
+unsafe fn apply_uxtheme_dark_mode(hwnd: HWND, header_hwnd: HWND, is_dark: bool) {
+    let hmod = GetModuleHandleW(w!("uxtheme.dll"))
+        .or_else(|_| LoadLibraryW(w!("uxtheme.dll")))
+        .unwrap_or_default();
+    if hmod.is_invalid() {
+        return;
+    }
+
+    // Ordinal 135: SetPreferredAppMode(mode: i32) -> i32 (2 = ForceDark, 3 = ForceLight)
+    if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(135usize as *const u8)) {
+        let set_app_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(proc);
+        let _ = set_app_mode(if is_dark { 2 } else { 3 });
+    }
+    // Ordinal 133: AllowDarkModeForWindow(hwnd: HWND, allow: bool) -> bool
+    if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(133usize as *const u8)) {
+        let allow_dark: unsafe extern "system" fn(HWND, bool) -> bool = std::mem::transmute(proc);
+        let _ = allow_dark(hwnd, is_dark);
+        if !header_hwnd.0.is_null() {
+            let _ = allow_dark(header_hwnd, is_dark);
+        }
+    }
+    // Ordinal 136: FlushMenuThemes()
+    if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(136usize as *const u8)) {
+        let flush_menus: unsafe extern "system" fn() = std::mem::transmute(proc);
+        flush_menus();
+    }
+}
+
 fn apply_listview_theme(hwnd: HWND, is_dark: bool) {
     let (bg, fg) = if is_dark {
         (rgb_colorref(0x11, 0x13, 0x18), rgb_colorref(0xf1, 0xf5, 0xf9))
@@ -728,13 +769,15 @@ fn apply_listview_theme(hwnd: HWND, is_dark: bool) {
     };
 
     unsafe {
+        let header_hwnd = HWND(send_msg(hwnd, LVM_GETHEADER, 0, 0).0 as *mut c_void);
+        apply_uxtheme_dark_mode(hwnd, header_hwnd, is_dark);
+
         let theme_name = if is_dark {
             w!("DarkMode_Explorer")
         } else {
             w!("Explorer")
         };
         let _ = SetWindowTheme(hwnd, theme_name, None);
-        let header_hwnd = HWND(send_msg(hwnd, LVM_GETHEADER, 0, 0).0 as *mut c_void);
         if !header_hwnd.0.is_null() {
             let header_theme = if is_dark {
                 w!("DarkMode_ItemsView")
@@ -746,6 +789,11 @@ fn apply_listview_theme(hwnd: HWND, is_dark: bool) {
         send_msg(hwnd, LVM_SETBKCOLOR, 0, bg.0 as isize);
         send_msg(hwnd, LVM_SETTEXTBKCOLOR, 0, bg.0 as isize);
         send_msg(hwnd, LVM_SETTEXTCOLOR, 0, fg.0 as isize);
+
+        if !header_hwnd.0.is_null() {
+            let _ = InvalidateRect(Some(header_hwnd), None, true);
+        }
+        let _ = InvalidateRect(Some(hwnd), None, true);
     }
 }
 
@@ -804,6 +852,7 @@ fn update_column_headers_and_sort(
             item.fmt = HEADER_CONTROL_FORMAT_FLAGS(fmt_bits);
             let _ = send_msg(header, HDM_SETITEMW, idx, &item as *const _ as isize);
         }
+        let _ = InvalidateRect(Some(header), None, true);
     }
 }
 
@@ -1144,8 +1193,15 @@ unsafe fn handle_listview_notify(
         NM_RCLICK => {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
-            show_pane_context_menu(ctx, lv_hwnd, is_local, pt);
-            Some(LRESULT(0))
+            let packed_pt =
+                ((pt.y as i16 as u16 as usize) << 16) | (pt.x as i16 as u16 as usize);
+            let _ = PostMessageW(
+                Some(lv_hwnd),
+                WM_APP_SHOW_CONTEXT_MENU,
+                WPARAM(usize::from(is_local)),
+                LPARAM(packed_pt as isize),
+            );
+            Some(LRESULT(1))
         }
 
         LVN_BEGINDRAG => {
@@ -1175,6 +1231,16 @@ unsafe extern "system" fn child_subclass_proc(
             };
 
             match umsg {
+                WM_NOTIFY if lparam.0 != 0 => {
+                    let hdr = &*(lparam.0 as *const NMHDR);
+                    if hdr.code == NM_CUSTOMDRAW {
+                        let header_hwnd =
+                            HWND(send_msg(hwnd, LVM_GETHEADER, 0, 0).0 as *mut c_void);
+                        if !header_hwnd.0.is_null() && hdr.hwndFrom == header_hwnd {
+                            return handle_header_custom_draw(&state, is_local, header_hwnd, lparam);
+                        }
+                    }
+                }
                 WM_DROPFILES => {
                     let hdrop = HDROP(wparam.0 as *mut c_void);
                     handle_wm_dropfiles(&state, hwnd, is_local, hdrop);
@@ -1186,9 +1252,28 @@ unsafe extern "system" fn child_subclass_proc(
                     if x == -1 && y == -1 {
                         let mut pt = POINT::default();
                         let _ = GetCursorPos(&mut pt);
-                        show_pane_context_menu(ctx, hwnd, is_local, pt);
+                        let packed_pt =
+                            ((pt.y as i16 as u16 as usize) << 16) | (pt.x as i16 as u16 as usize);
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            WM_APP_SHOW_CONTEXT_MENU,
+                            WPARAM(usize::from(is_local)),
+                            LPARAM(packed_pt as isize),
+                        );
                         return LRESULT(0);
                     }
+                }
+                WM_APP_SHOW_CONTEXT_MENU => {
+                    if ctx.in_context_menu.swap(true, Ordering::SeqCst) {
+                        return LRESULT(0);
+                    }
+                    let _ = ReleaseCapture();
+                    let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                    let menu_is_local = wparam.0 != 0;
+                    show_pane_context_menu(ctx, hwnd, menu_is_local, POINT { x, y });
+                    ctx.in_context_menu.store(false, Ordering::SeqCst);
+                    return LRESULT(0);
                 }
                 WM_MOUSEMOVE => {
                     let has_drag = state.lock().unwrap().active_remote_drag.is_some();
@@ -1219,6 +1304,142 @@ unsafe extern "system" fn child_subclass_proc(
     }
 
     DefSubclassProc(hwnd, umsg, wparam, lparam)
+}
+
+unsafe fn handle_header_custom_draw(
+    state: &Arc<Mutex<HostInner>>,
+    is_local: bool,
+    header_hwnd: HWND,
+    lparam: LPARAM,
+) -> LRESULT {
+    let nmcd = &mut *(lparam.0 as *mut NMCUSTOMDRAW);
+    let stage = nmcd.dwDrawStage;
+
+    let (ui_font, is_dark, labels, sort_col, sort_asc) = {
+        let guard = state.lock().unwrap();
+        let pane = if is_local { &guard.left } else { &guard.right };
+        (
+            guard.ui_font,
+            pane.is_dark.unwrap_or(true),
+            pane.header_labels.clone(),
+            pane.sort_col,
+            pane.sort_ascending,
+        )
+    };
+
+    let (bg_color, border_color) = if is_dark {
+        (rgb_colorref(0x16, 0x19, 0x22), rgb_colorref(0x26, 0x2b, 0x38))
+    } else {
+        (rgb_colorref(0xf1, 0xf5, 0xf9), rgb_colorref(0xe2, 0xe8, 0xf0))
+    };
+
+    if stage == CDDS_PREPAINT {
+        let mut client_rc = RECT::default();
+        if GetClientRect(header_hwnd, &mut client_rc).is_ok() {
+            let bg_brush = CreateSolidBrush(bg_color);
+            let _ = FillRect(nmcd.hdc, &client_rc, bg_brush);
+            let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+
+            let border_rc = RECT {
+                left: client_rc.left,
+                top: (client_rc.bottom - 1).max(client_rc.top),
+                right: client_rc.right,
+                bottom: client_rc.bottom,
+            };
+            let border_brush = CreateSolidBrush(border_color);
+            let _ = FillRect(nmcd.hdc, &border_rc, border_brush);
+            let _ = DeleteObject(HGDIOBJ(border_brush.0));
+        }
+        return LRESULT((CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT) as isize);
+    }
+
+    if stage == CDDS_ITEMPREPAINT {
+        let col_idx = nmcd.dwItemSpec;
+        let rc = nmcd.rc;
+
+        let bg_brush = CreateSolidBrush(bg_color);
+        let _ = FillRect(nmcd.hdc, &rc, bg_brush);
+        let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+
+        let border_brush = CreateSolidBrush(border_color);
+        let bottom_rc = RECT {
+            left: rc.left,
+            top: (rc.bottom - 1).max(rc.top),
+            right: rc.right,
+            bottom: rc.bottom,
+        };
+        let _ = FillRect(nmcd.hdc, &bottom_rc, border_brush);
+
+        let right_sep_rc = RECT {
+            left: (rc.right - 1).max(rc.left),
+            top: rc.top + 4,
+            right: rc.right,
+            bottom: (rc.bottom - 4).max(rc.top + 4),
+        };
+        let _ = FillRect(nmcd.hdc, &right_sep_rc, border_brush);
+        let _ = DeleteObject(HGDIOBJ(border_brush.0));
+
+        let active_idx = match sort_col {
+            SortColumn::Name => 0,
+            SortColumn::Modified => 1,
+            SortColumn::Size => 2,
+        };
+        let base_label = match col_idx {
+            0 => labels.0.as_str(),
+            1 => labels.1.as_str(),
+            2 => labels.2.as_str(),
+            _ => "",
+        };
+        let full_text = if col_idx == active_idx {
+            let arrow = if sort_asc { " ▲" } else { " ▼" };
+            format!("{base_label}{arrow}")
+        } else {
+            base_label.to_string()
+        };
+
+        let fg_color = if is_dark {
+            if col_idx == active_idx {
+                rgb_colorref(0xf8, 0xfa, 0xfc)
+            } else {
+                rgb_colorref(0xe2, 0xe8, 0xf0)
+            }
+        } else if col_idx == active_idx {
+            rgb_colorref(0x0f, 0x17, 0x2a)
+        } else {
+            rgb_colorref(0x33, 0x41, 0x55)
+        };
+
+        let prev_font = if ui_font != 0 {
+            Some(SelectObject(nmcd.hdc, HGDIOBJ(ui_font as *mut c_void)))
+        } else {
+            None
+        };
+        let _ = SetBkMode(nmcd.hdc, TRANSPARENT);
+        let _ = SetTextColor(nmcd.hdc, fg_color);
+
+        let mut wide: Vec<u16> = full_text.encode_utf16().collect();
+        let mut text_rc = RECT {
+            left: rc.left + 8,
+            top: rc.top,
+            right: (rc.right - 8).max(rc.left + 8),
+            bottom: (rc.bottom - 1).max(rc.top),
+        };
+        let align = if col_idx == 2 { DT_RIGHT } else { DT_LEFT };
+        let _ = DrawTextW(
+            nmcd.hdc,
+            &mut wide,
+            &mut text_rc,
+            align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+
+        if let Some(old) = prev_font {
+            let _ = SelectObject(nmcd.hdc, old);
+        }
+
+        return LRESULT(CDRF_SKIPDEFAULT as isize);
+    }
+
+    LRESULT(CDRF_DODEFAULT as isize)
 }
 
 unsafe fn handle_wm_dropfiles(
@@ -1446,10 +1667,11 @@ unsafe fn show_pane_context_menu(
     let Some(state) = ctx.state.upgrade() else {
         return;
     };
-    let (current_path, rows, entries) = {
+    let (parent_hwnd_val, current_path, rows, entries) = {
         let guard = state.lock().unwrap();
         let pane = if is_local { &guard.left } else { &guard.right };
         (
+            guard.parent_hwnd,
             pane.current_path.clone(),
             Arc::clone(&pane.rows),
             Arc::clone(&pane.entries),
@@ -1457,29 +1679,30 @@ unsafe fn show_pane_context_menu(
     };
     let selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
     let single_is_bucket = selected_paths.len() == 1
-        && entries
-            .iter()
-            .any(|e| e.path == selected_paths[0] && matches!(e.kind, crate::models::FileKind::Bucket));
-
-    if is_local && can_use_shell_context_menu(&current_path, &selected_paths) {
-        if show_local_shell_context_menu(ctx, lv_hwnd, &current_path, &selected_paths, screen_pt)
-            .is_ok()
-        {
-            return;
-        }
-    }
+        && entries.iter().any(|e| {
+            e.path == selected_paths[0] && matches!(e.kind, crate::models::FileKind::Bucket)
+        });
+    let can_reveal = is_local && can_use_shell_context_menu(&current_path, &selected_paths);
+    let owner_hwnd = if parent_hwnd_val != 0 {
+        HWND(parent_hwnd_val as *mut c_void)
+    } else {
+        lv_hwnd
+    };
 
     show_standard_native_hmenu(
         ctx,
         lv_hwnd,
+        owner_hwnd,
         is_local,
         !selected_paths.is_empty(),
         selected_paths.len() == 1 && !single_is_bucket,
         !single_is_bucket,
+        can_reveal,
         screen_pt,
     );
 }
 
+#[cfg(test)]
 unsafe fn resolve_shell_menu_pidls(
     parent_dir: &str,
     selected_paths: &[String],
@@ -1528,83 +1751,15 @@ unsafe fn resolve_shell_menu_pidls(
     }
 }
 
-unsafe fn show_local_shell_context_menu(
-    ctx: &SubclassContext,
-    lv_hwnd: HWND,
-    parent_dir: &str,
-    selected_paths: &[String],
-    screen_pt: POINT,
-) -> anyhow::Result<()> {
-    let (parent_folder, child_pidls, _pidl_guard) =
-        resolve_shell_menu_pidls(parent_dir, selected_paths)?;
-    if child_pidls.is_empty() {
-        return Err(anyhow::anyhow!("empty child pidls"));
-    }
-
-    let context_menu: IContextMenu = parent_folder.GetUIObjectOf(lv_hwnd, &child_pidls, None)?;
-    let hmenu = CreatePopupMenu()?;
-
-    let t = i18n();
-    append_menu_str(hmenu, CMD_TRANSFER, t.ctx_upload_to_remote(), true);
-    append_menu_str(hmenu, CMD_NEW_FOLDER, t.ctx_new_folder(), true);
-    append_menu_str(hmenu, CMD_REFRESH, t.ctx_refresh(), true);
-    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
-
-    let insert_pos = 4u32;
-    let _ = context_menu.QueryContextMenu(
-        hmenu,
-        insert_pos,
-        CMD_SHELL_FIRST,
-        CMD_SHELL_LAST,
-        CMF_NORMAL,
-    );
-
-    let cmd = TrackPopupMenuEx(
-        hmenu,
-        (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN).0,
-        screen_pt.x,
-        screen_pt.y,
-        lv_hwnd,
-        None,
-    )
-    .0 as u32;
-
-    let _ = DestroyMenu(hmenu);
-
-    if cmd >= CMD_SHELL_FIRST && cmd <= CMD_SHELL_LAST {
-        let offset = (cmd - CMD_SHELL_FIRST) as usize;
-        let ici = CMINVOKECOMMANDINFO {
-            cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32,
-            hwnd: lv_hwnd,
-            lpVerb: windows::core::PCSTR(offset as *const u8),
-            nShow: SW_SHOWNOACTIVATE.0,
-            ..Default::default()
-        };
-        let _ = context_menu.InvokeCommand(&ici);
-        if let Some(state) = ctx.state.upgrade() {
-            state
-                .lock()
-                .unwrap()
-                .events
-                .push(NativePaneEvent::ContextMenuCommand {
-                    is_local: true,
-                    action: NativeContextMenuAction::Refresh,
-                });
-        }
-    } else if cmd != 0 {
-        dispatch_custom_menu_cmd(ctx, lv_hwnd, true, cmd);
-    }
-
-    Ok(())
-}
-
 unsafe fn show_standard_native_hmenu(
     ctx: &SubclassContext,
     lv_hwnd: HWND,
+    owner_hwnd: HWND,
     is_local: bool,
     has_selection: bool,
     can_rename: bool,
     can_transfer: bool,
+    can_reveal: bool,
     screen_pt: POINT,
 ) {
     let Ok(hmenu) = CreatePopupMenu() else {
@@ -1630,17 +1785,22 @@ unsafe fn show_standard_native_hmenu(
     append_menu_str(hmenu, CMD_DELETE, t.ctx_delete(), has_selection);
     let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
     append_menu_str(hmenu, CMD_COPY_PATH, t.ctx_copy_path(), has_selection);
+    if is_local {
+        append_menu_str(hmenu, CMD_REVEAL_IN_SHELL, t.ctx_reveal_in_shell(), can_reveal);
+    }
     append_menu_str(hmenu, CMD_REFRESH, t.ctx_refresh(), true);
 
+    let _ = SetForegroundWindow(owner_hwnd);
     let cmd = TrackPopupMenuEx(
         hmenu,
         (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN).0,
         screen_pt.x,
         screen_pt.y,
-        lv_hwnd,
+        owner_hwnd,
         None,
     )
     .0 as u32;
+    let _ = PostMessageW(Some(owner_hwnd), WM_NULL, WPARAM(0), LPARAM(0));
 
     let _ = DestroyMenu(hmenu);
     if cmd != 0 {
@@ -1679,6 +1839,7 @@ unsafe fn dispatch_custom_menu_cmd(
         CMD_NEW_FOLDER => Some(NativeContextMenuAction::NewFolder),
         CMD_DELETE => Some(NativeContextMenuAction::DeleteSelected),
         CMD_COPY_PATH => Some(NativeContextMenuAction::CopySelectedPath),
+        CMD_REVEAL_IN_SHELL => Some(NativeContextMenuAction::RevealInShell),
         CMD_REFRESH => Some(NativeContextMenuAction::Refresh),
         _ => None,
     };
@@ -1802,5 +1963,216 @@ mod tests {
         let single_ok =
             unsafe { resolve_shell_menu_pidls(&valid_path, std::slice::from_ref(&valid_path)) };
         assert!(single_ok.is_ok());
+    }
+
+    #[test]
+    fn test_header_custom_draw_renders_light_text_in_dark_mode_on_light_os() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, SelectObject, BITMAPINFO,
+            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+
+        unsafe {
+            let hinstance = GetModuleHandleW(None).unwrap_or_default();
+            let dummy_parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("rustduck_test_header_theme"),
+                WS_POPUP,
+                0,
+                0,
+                500,
+                300,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+            .expect("dummy parent HWND");
+            let _ = ShowWindow(dummy_parent, SW_SHOWNOACTIVATE);
+
+            let host = PlatformHost::new();
+            let mut snap = NativePaneSnapshot {
+                tab_idx: 0,
+                is_local: true,
+                current_path: r"C:\".to_string(),
+                bounds_px: (0, 0, 480, 260),
+                scale_factor: 1.0,
+                visible: true,
+                is_dark: true,
+                sort_col: SortColumn::Name,
+                sort_ascending: true,
+                has_parent: false,
+                entries_revision: 1,
+                rows: Arc::new(Vec::new()),
+                entries: Arc::new(Vec::new()),
+                selected_paths: Vec::new(),
+            };
+            host.sync_pane_for_parent_hwnd(dummy_parent.0 as isize, &snap);
+
+            let lv_hwnd = HWND(host.state.lock().unwrap().left.hwnd as *mut c_void);
+            let header_hwnd = HWND(send_msg(lv_hwnd, LVM_GETHEADER, 0, 0).0 as *mut c_void);
+            assert!(!header_hwnd.0.is_null());
+
+            let w = 240i32;
+            let h = 26i32;
+            let hdc_screen = windows::Win32::Graphics::Gdi::GetDC(Some(header_hwnd));
+            let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut c_void = null_mut();
+            let hbm = CreateDIBSection(Some(hdc_mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("CreateDIBSection");
+            let old_obj = SelectObject(hdc_mem, HGDIOBJ(hbm.0));
+
+            // Render dark-mode header via WM_PRINTCLIENT (PRF_CLIENT | PRF_ERASEBKGND = 6)
+            const WM_PRINTCLIENT: u32 = 0x0318;
+            let _ = send_msg(header_hwnd, WM_PRINTCLIENT, hdc_mem.0 as usize, 6);
+
+            let slice = std::slice::from_raw_parts(bits as *const u32, (w * h) as usize);
+            let mut dark_bg_pixels = 0usize;
+            let mut bright_text_pixels = 0usize;
+            for y in 2..(h - 2) {
+                for x in 4..(w - 4) {
+                    let px = slice[(y * w + x) as usize] & 0x00FF_FFFF;
+                    let r = ((px >> 16) & 0xFF) as u8;
+                    let g = ((px >> 8) & 0xFF) as u8;
+                    let b = (px & 0xFF) as u8;
+                    if r == 0x16 && g == 0x19 && b == 0x22 {
+                        dark_bg_pixels += 1;
+                    }
+                    if r > 180 && g > 180 && b > 180 {
+                        bright_text_pixels += 1;
+                    }
+                }
+            }
+
+            // Now switch to Light Mode and verify light background + dark text pixels
+            snap.is_dark = false;
+            host.sync_pane_for_parent_hwnd(dummy_parent.0 as isize, &snap);
+            let _ = send_msg(header_hwnd, WM_PRINTCLIENT, hdc_mem.0 as usize, 6);
+            let mut light_bg_pixels = 0usize;
+            let mut dark_text_pixels = 0usize;
+            for y in 2..(h - 2) {
+                for x in 4..(w - 4) {
+                    let px = slice[(y * w + x) as usize] & 0x00FF_FFFF;
+                    let r = ((px >> 16) & 0xFF) as u8;
+                    let g = ((px >> 8) & 0xFF) as u8;
+                    let b = (px & 0xFF) as u8;
+                    if r == 0xf1 && g == 0xf5 && b == 0xf9 {
+                        light_bg_pixels += 1;
+                    }
+                    if r < 60 && g < 60 && b < 60 {
+                        dark_text_pixels += 1;
+                    }
+                }
+            }
+
+            let _ = SelectObject(hdc_mem, old_obj);
+            let _ = DeleteObject(HGDIOBJ(hbm.0));
+            let _ = DeleteDC(hdc_mem);
+            windows::Win32::Graphics::Gdi::ReleaseDC(Some(header_hwnd), hdc_screen);
+            let _ = DestroyWindow(dummy_parent);
+
+            assert!(
+                dark_bg_pixels > 100 && bright_text_pixels > 10,
+                "Expected dark header bg (#161922, got {dark_bg_pixels}) and bright text pixels (got {bright_text_pixels})"
+            );
+            assert!(
+                light_bg_pixels > 100 && dark_text_pixels > 10,
+                "Expected light header bg (#f1f5f9, got {light_bg_pixels}) and dark text pixels (got {dark_text_pixels})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nm_rclick_defers_context_menu_and_returns_nonzero_without_blocking() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        unsafe {
+            let hinstance = GetModuleHandleW(None).unwrap_or_default();
+            let dummy_parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("rustduck_test_rclick"),
+                WS_POPUP,
+                0,
+                0,
+                400,
+                300,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+            .expect("dummy parent HWND");
+
+            let host = PlatformHost::new();
+            let snap = NativePaneSnapshot {
+                tab_idx: 0,
+                is_local: true,
+                current_path: r"C:\".to_string(),
+                bounds_px: (0, 0, 360, 240),
+                scale_factor: 1.0,
+                visible: true,
+                is_dark: true,
+                sort_col: SortColumn::Name,
+                sort_ascending: true,
+                has_parent: false,
+                entries_revision: 1,
+                rows: Arc::new(Vec::new()),
+                entries: Arc::new(Vec::new()),
+                selected_paths: Vec::new(),
+            };
+            host.sync_pane_for_parent_hwnd(dummy_parent.0 as isize, &snap);
+            let lv_hwnd = HWND(host.state.lock().unwrap().left.hwnd as *mut c_void);
+
+            let nmia = NMITEMACTIVATE {
+                hdr: NMHDR {
+                    hwndFrom: lv_hwnd,
+                    idFrom: LEFT_LISTVIEW_ID,
+                    code: NM_RCLICK,
+                },
+                iItem: -1,
+                iSubItem: 0,
+                ..Default::default()
+            };
+            let res = send_msg(
+                dummy_parent,
+                WM_NOTIFY,
+                LEFT_LISTVIEW_ID,
+                &nmia as *const _ as isize,
+            );
+            let mut msg = MSG::default();
+            let queued = PeekMessageW(
+                &mut msg,
+                Some(lv_hwnd),
+                WM_APP_SHOW_CONTEXT_MENU,
+                WM_APP_SHOW_CONTEXT_MENU,
+                PM_REMOVE,
+            )
+            .as_bool();
+            let _ = DestroyWindow(dummy_parent);
+
+            assert_eq!(
+                res.0, 1,
+                "NM_RCLICK must return nonzero (1) immediately and defer popup menu via PostMessageW"
+            );
+            assert!(
+                queued,
+                "NM_RCLICK must post WM_APP_SHOW_CONTEXT_MENU to lv_hwnd so WM_RBUTTONDOWN unwinds first"
+            );
+        }
     }
 }
