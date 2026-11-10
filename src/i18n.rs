@@ -1116,6 +1116,38 @@ impl I18n {
         }
     }
 
+    pub fn msg_loaded_bookmark_missing_secret(&self, name: &str) -> String {
+        if self.is_zh() {
+            format!("已载入「{name}」— 未检测到已保存的密钥，请在右侧补填后点击「存入收藏夹」")
+        } else {
+            format!("Loaded \"{name}\" — secret not found in keychain, please enter it and click \"Save to Favorites\"")
+        }
+    }
+
+    pub fn err_s3_endpoint_empty(&self) -> &'static str {
+        if self.is_zh() {
+            "S3 服务端点 (Endpoint URL) 不能为空"
+        } else {
+            "S3 Endpoint URL cannot be empty"
+        }
+    }
+
+    pub fn err_s3_access_key_empty(&self) -> &'static str {
+        if self.is_zh() {
+            "缺少 Access Key ID / SecretId"
+        } else {
+            "Missing Access Key ID / SecretId"
+        }
+    }
+
+    pub fn err_s3_secret_key_empty(&self) -> &'static str {
+        if self.is_zh() {
+            "缺少 Secret Access Key / SecretKey（请在右侧填入密钥并点击「存入收藏夹」保存）"
+        } else {
+            "Missing Secret Access Key / SecretKey (enter it on the right and click \"Save to Favorites\")"
+        }
+    }
+
     pub fn msg_invalid_conn_params(&self, err: &dyn std::fmt::Display) -> String {
         if self.is_zh() {
             format!("连接参数无效: {err}")

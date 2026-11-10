@@ -328,6 +328,142 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+pub fn infer_s3_region_from_endpoint(endpoint: &str) -> Option<String> {
+    let raw = endpoint.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let with_scheme = if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let url = Url::parse(&with_scheme).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+
+    // Tencent Cloud COS: cos.<region>.myqcloud.com or <bucket>.cos.<region>.myqcloud.com
+    if let Some(prefix) = host.strip_suffix(".myqcloud.com") {
+        let parts: Vec<&str> = prefix.split('.').collect();
+        if parts.len() >= 2 {
+            let prev = parts[parts.len() - 2];
+            let candidate = parts[parts.len() - 1];
+            if (prev == "cos" || prev == "cos-internal")
+                && !candidate.is_empty()
+                && candidate != "accelerate"
+            {
+                return Some(candidate.to_string());
+            }
+        }
+        return None;
+    }
+
+    // Alibaba Cloud OSS: oss-<region>.aliyuncs.com or <bucket>.oss-<region>[-internal].aliyuncs.com
+    if let Some(prefix) = host.strip_suffix(".aliyuncs.com") {
+        let last_label = prefix.rsplit('.').next()?;
+        if let Some(rest) = last_label.strip_prefix("oss-") {
+            let region = rest.strip_suffix("-internal").unwrap_or(rest);
+            if !region.is_empty() && region != "accelerate" {
+                return Some(region.to_string());
+            }
+        }
+        return None;
+    }
+
+    // AWS S3: s3.<region>.amazonaws.com[.cn], <bucket>.s3.<region>.amazonaws.com[.cn], s3-<region>.amazonaws.com
+    let aws_prefix = host
+        .strip_suffix(".amazonaws.com.cn")
+        .or_else(|| host.strip_suffix(".amazonaws.com"));
+    if let Some(prefix) = aws_prefix {
+        let parts: Vec<&str> = prefix.split('.').collect();
+        if parts.len() >= 2 {
+            let prev = parts[parts.len() - 2];
+            let candidate = parts[parts.len() - 1];
+            if (prev == "s3" || prev == "dualstack")
+                && candidate.contains('-')
+                && candidate != "accelerate"
+            {
+                return Some(candidate.to_string());
+            }
+        }
+        if let Some(last_label) = parts.last() {
+            if let Some(region) = last_label.strip_prefix("s3-") {
+                if region.contains('-') && region != "accelerate" && region != "external-1" {
+                    return Some(region.to_string());
+                }
+            }
+        }
+        return None;
+    }
+
+    None
+}
+
+pub fn resolve_effective_s3_region(config: &S3Config) -> String {
+    if let Some(inferred) = infer_s3_region_from_endpoint(&config.endpoint) {
+        return inferred;
+    }
+    if config.region.trim().is_empty() {
+        "us-east-1".to_string()
+    } else {
+        config.region.trim().to_string()
+    }
+}
+
+pub fn summarize_s3_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed.starts_with('<') {
+        let mut reader = Reader::from_str(trimmed);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+        let mut current_tag = String::new();
+        let mut code = String::new();
+        let mut message = String::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => {
+                    current_tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                }
+                Ok(Event::Text(e)) => {
+                    let txt = e.unescape().unwrap_or_default().trim().to_string();
+                    match current_tag.as_str() {
+                        "Code" if code.is_empty() => code = txt,
+                        "Message" if message.is_empty() => message = txt,
+                        _ => {}
+                    }
+                }
+                Ok(Event::End(_)) => {
+                    current_tag.clear();
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        if !code.is_empty() && !message.is_empty() {
+            return format!("{code}: {message}");
+        } else if !code.is_empty() {
+            return code;
+        } else if !message.is_empty() {
+            return message;
+        }
+    }
+
+    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 220 {
+        let mut short: String = collapsed.chars().take(220).collect();
+        short.push('…');
+        short
+    } else {
+        collapsed
+    }
+}
+
 pub struct S3Backend {
     config: S3Config,
     secret_access_key: String,
@@ -336,13 +472,24 @@ pub struct S3Backend {
 
 impl S3Backend {
     pub fn new(config: S3Config, secret_access_key: String) -> anyhow::Result<Self> {
+        let t = crate::i18n::i18n();
+        if config.endpoint.trim().is_empty() {
+            return Err(anyhow!("{}", t.err_s3_endpoint_empty()));
+        }
+        if config.access_key_id.trim().is_empty() {
+            return Err(anyhow!("{}", t.err_s3_access_key_empty()));
+        }
+        let clean_secret = secret_access_key.trim().to_string();
+        if clean_secret.is_empty() {
+            return Err(anyhow!("{}", t.err_s3_secret_key_empty()));
+        }
         let client = Client::builder()
             .user_agent("Rustduck/0.1.0")
             .build()
             .context("Failed to initialize S3 HTTP client")?;
         Ok(Self {
             config,
-            secret_access_key,
+            secret_access_key: clean_secret,
             client,
         })
     }
@@ -357,11 +504,8 @@ impl S3Backend {
         let now = Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
-        let region = if self.config.region.trim().is_empty() {
-            "us-east-1"
-        } else {
-            self.config.region.trim()
-        };
+        let effective_region = resolve_effective_s3_region(&self.config);
+        let region = effective_region.as_str();
 
         let host_header = match url.port() {
             Some(port) => format!("{}:{}", url.host_str().unwrap_or_default(), port),
@@ -475,8 +619,12 @@ impl S3Backend {
         let headers = self.sign_request(&Method::DELETE, &url, &empty_hash, &[])?;
         let resp = self.client.delete(url).headers(headers).send().await?;
         if !resp.status().is_success() {
+            let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("S3 DeleteObject failed: {body}"));
+            return Err(anyhow!(
+                "S3 DeleteObject failed ({status}): {}",
+                summarize_s3_error_body(&body)
+            ));
         }
         Ok(())
     }
@@ -520,7 +668,10 @@ impl StorageBackend for S3Backend {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    return Err(anyhow!("S3 ListBuckets failed ({status}): {body}"));
+                    return Err(anyhow!(
+                        "S3 ListBuckets failed ({status}): {}",
+                        summarize_s3_error_body(&body)
+                    ));
                 }
                 parse_list_buckets_xml(&body)
             }
@@ -551,7 +702,10 @@ impl StorageBackend for S3Backend {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    return Err(anyhow!("S3 ListObjectsV2 failed ({status}): {body}"));
+                    return Err(anyhow!(
+                        "S3 ListObjectsV2 failed ({status}): {}",
+                        summarize_s3_error_body(&body)
+                    ));
                 }
                 parse_list_objects_xml(&body, &prefix, &ui_path)
             }
@@ -582,7 +736,10 @@ impl StorageBackend for S3Backend {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("S3 PutObject directory failed ({status}): {body}"));
+            return Err(anyhow!(
+                "S3 PutObject directory failed ({status}): {}",
+                summarize_s3_error_body(&body)
+            ));
         }
         Ok(())
     }
@@ -608,8 +765,12 @@ impl StorageBackend for S3Backend {
         )?;
         let resp = self.client.put(url).headers(headers).send().await?;
         if !resp.status().is_success() {
+            let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("S3 CopyObject failed: {body}"));
+            return Err(anyhow!(
+                "S3 CopyObject failed ({status}): {}",
+                summarize_s3_error_body(&body)
+            ));
         }
         self.remove(from, false).await
     }
@@ -666,7 +827,10 @@ impl StorageBackend for S3Backend {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("S3 GetObject failed ({status}): {body}"));
+            return Err(anyhow!(
+                "S3 GetObject failed ({status}): {}",
+                summarize_s3_error_body(&body)
+            ));
         }
 
         let mut stream = resp.bytes_stream();
@@ -750,7 +914,10 @@ impl StorageBackend for S3Backend {
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                return Err(anyhow!("S3 PutObject failed ({status}): {body}"));
+                return Err(anyhow!(
+                    "S3 PutObject failed ({status}): {}",
+                    summarize_s3_error_body(&body)
+                ));
             }
             Ok::<(), anyhow::Error>(())
         };
@@ -995,5 +1162,100 @@ mod tests {
             recorded.iter().any(|r| r.starts_with("DELETE /test-bkt/docs/ ")),
             "expected directory marker DELETE request, got: {recorded:?}"
         );
+    }
+
+    #[test]
+    fn test_infer_and_resolve_s3_region_from_cloud_endpoints() {
+        use crate::models::{S3AddressingStyle, S3Config, S3Preset};
+
+        assert_eq!(
+            infer_s3_region_from_endpoint("https://cos.na-siliconvalley.myqcloud.com").as_deref(),
+            Some("na-siliconvalley")
+        );
+        assert_eq!(
+            infer_s3_region_from_endpoint("https://app-125000.cos.ap-shanghai.myqcloud.com")
+                .as_deref(),
+            Some("ap-shanghai")
+        );
+        assert_eq!(
+            infer_s3_region_from_endpoint("https://oss-cn-shenzhen.aliyuncs.com").as_deref(),
+            Some("cn-shenzhen")
+        );
+        assert_eq!(
+            infer_s3_region_from_endpoint("https://my-bkt.oss-cn-beijing-internal.aliyuncs.com")
+                .as_deref(),
+            Some("cn-beijing")
+        );
+        assert_eq!(
+            infer_s3_region_from_endpoint("https://s3.us-west-2.amazonaws.com").as_deref(),
+            Some("us-west-2")
+        );
+        assert_eq!(
+            infer_s3_region_from_endpoint("https://my-bkt.s3.ap-northeast-1.amazonaws.com")
+                .as_deref(),
+            Some("ap-northeast-1")
+        );
+        assert_eq!(infer_s3_region_from_endpoint("http://127.0.0.1:9000"), None);
+
+        // Saved bookmark where endpoint is COS Silicon Valley while region stayed at default cn-hangzhou
+        let cos_cfg = S3Config {
+            preset: S3Preset::AlibabaOss,
+            endpoint: "https://cos.na-siliconvalley.myqcloud.com".to_string(),
+            region: "cn-hangzhou".to_string(),
+            access_key_id: "AKID_DEMO".to_string(),
+            bucket: None,
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::VirtualHosted,
+        };
+        assert_eq!(resolve_effective_s3_region(&cos_cfg), "na-siliconvalley");
+
+        // MinIO / custom endpoint preserves explicit region or defaults to us-east-1
+        let minio_cfg = S3Config {
+            preset: S3Preset::Minio,
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            region: "".to_string(),
+            access_key_id: "minioadmin".to_string(),
+            bucket: None,
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::PathStyle,
+        };
+        assert_eq!(resolve_effective_s3_region(&minio_cfg), "us-east-1");
+    }
+
+    #[test]
+    fn test_s3_backend_rejects_empty_credentials_upfront() {
+        use crate::models::{S3AddressingStyle, S3Config, S3Preset};
+
+        let base = S3Config {
+            preset: S3Preset::TencentCos,
+            endpoint: "https://cos.na-siliconvalley.myqcloud.com".to_string(),
+            region: "na-siliconvalley".to_string(),
+            access_key_id: "AKID_DEMO".to_string(),
+            bucket: None,
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::VirtualHosted,
+        };
+
+        assert!(S3Backend::new(base.clone(), "".to_string()).is_err());
+        assert!(S3Backend::new(base.clone(), "   ".to_string()).is_err());
+
+        let mut empty_ak = base.clone();
+        empty_ak.access_key_id = "  ".to_string();
+        assert!(S3Backend::new(empty_ak, "valid-secret".to_string()).is_err());
+
+        let mut empty_ep = base;
+        empty_ep.endpoint = "".to_string();
+        assert!(S3Backend::new(empty_ep, "valid-secret".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_format_s3_error_extracts_xml_code_and_message() {
+        let xml = "<?xml version='1.0' encoding='utf-8' ?>\n<Error>\n\t<Code>SignatureDoesNotMatch</Code>\n\t<Message>The Signature you specified is invalid.</Message>\n\t<Resource>/</Resource>\n</Error>";
+        let summary = summarize_s3_error_body(xml);
+        assert_eq!(
+            summary,
+            "SignatureDoesNotMatch: The Signature you specified is invalid."
+        );
+        assert!(!summary.contains('\n'));
     }
 }

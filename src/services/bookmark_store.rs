@@ -230,4 +230,26 @@ mod tests {
         assert_eq!(reloaded.filter("hangzhou").len(), 1);
         assert_eq!(reloaded.filter("prod-bucket").len(), 1);
     }
+
+    #[test]
+    fn test_keyring_credential_vault_persists_across_separate_instances() {
+        let id = Uuid::new_v4();
+        let secret_val = "COS_TEST_SECRET_PERSISTENCE_CHECK";
+
+        {
+            let vault_writer = KeyringCredentialVault::new();
+            vault_writer.set_secret(id, secret_val).unwrap();
+        }
+
+        let vault_reader = KeyringCredentialVault::new();
+        let loaded = vault_reader.get_secret(id).unwrap();
+        let _ = vault_reader.delete_secret(id);
+
+        assert_eq!(
+            loaded.as_deref(),
+            Some(secret_val),
+            "KeyringCredentialVault must persist secrets in OS credential store across instances"
+        );
+        assert_eq!(vault_reader.get_secret(id).unwrap(), None);
+    }
 }

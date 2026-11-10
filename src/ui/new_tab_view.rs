@@ -1,10 +1,13 @@
 use crate::i18n::i18n;
 use crate::models::{Bookmark, ProtocolKind, S3AddressingStyle, S3Preset};
 use crate::ui::{
-    accent_amber, accent_blue, bg_canvas, bg_elevated, bg_panel, bg_row_hover, bg_row_selected,
-    border_selected, border_strong, border_subtle, protocol_icon_and_color, text_muted,
-    text_primary, text_secondary,
-    workspace::{ConnectionFormInputs, RustduckWorkspace},
+    accent_amber, accent_blue, accent_red, bg_canvas, bg_elevated, bg_panel, bg_row_hover,
+    bg_row_selected, border_selected, border_strong, border_subtle, protocol_icon_and_color,
+    text_muted, text_primary, text_secondary,
+    workspace::{
+        format_single_line_status, is_error_status_message, ConnectionFormInputs,
+        RustduckWorkspace,
+    },
 };
 use gpui::{div, prelude::*, px, AnyElement, Context, IntoElement};
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -67,7 +70,13 @@ fn render_favorites_gallery(
         &form.bookmark_search_input,
         cx,
     );
-    let list_body = render_favorites_list(tab_idx, filtered_bookmarks, selected_bookmark_id, cx);
+    let list_body = render_favorites_list(
+        tab_idx,
+        filtered_bookmarks,
+        selected_bookmark_id,
+        tab.is_connecting,
+        cx,
+    );
     let footer = h_flex()
         .w_full()
         .h(px(28.0))
@@ -163,6 +172,7 @@ fn render_favorites_list(
     tab_idx: usize,
     filtered_bookmarks: Vec<Bookmark>,
     selected_bookmark_id: Option<Uuid>,
+    is_connecting: bool,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
@@ -210,7 +220,14 @@ fn render_favorites_list(
             .enumerate()
             .map(|(bm_idx, bm)| {
                 let is_selected = selected_bookmark_id == Some(bm.id);
-                render_bookmark_card(tab_idx, bm_idx, bm, is_selected, cx)
+                render_bookmark_card(
+                    tab_idx,
+                    bm_idx,
+                    bm,
+                    is_selected,
+                    is_selected && is_connecting,
+                    cx,
+                )
             })
             .collect()
     };
@@ -231,6 +248,7 @@ fn render_bookmark_card(
     bm_idx: usize,
     bm: Bookmark,
     is_selected: bool,
+    is_card_connecting: bool,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
@@ -274,7 +292,7 @@ fn render_bookmark_card(
         .on_click(cx.listener(
             move |this, ev: &gpui::ClickEvent, window, cx| {
                 this.load_bookmark_into_form(tab_idx, &bm_select, window, cx);
-                if ev.click_count() >= 2 {
+                if ev.click_count() >= 2 && !this.tabs[tab_idx].is_connecting {
                     this.connect_tab(tab_idx, cx);
                 }
             },
@@ -339,10 +357,13 @@ fn render_bookmark_card(
                         .xsmall()
                         .primary()
                         .icon(IconName::Play)
+                        .loading(is_card_connecting)
                         .label(t.connect_short_btn())
                         .on_click(cx.listener(move |this, _ev, window, cx| {
-                            this.load_bookmark_into_form(tab_idx, &bm_connect, window, cx);
-                            this.connect_tab(tab_idx, cx);
+                            if !this.tabs[tab_idx].is_connecting {
+                                this.load_bookmark_into_form(tab_idx, &bm_connect, window, cx);
+                                this.connect_tab(tab_idx, cx);
+                            }
                         })),
                 )
                 .child(
@@ -376,6 +397,8 @@ fn render_quick_connect_inspector(
 
     let header = render_inspector_header(tab_idx, has_bookmark, active_protocol, cx);
     let body = render_inspector_body(tab_idx, form, cx);
+    let status_banner =
+        render_inspector_status_banner(tab_idx, is_connecting, tab.status_message.as_deref(), cx);
     let footer = render_inspector_footer(tab_idx, is_connecting, cx);
 
     v_flex()
@@ -384,8 +407,81 @@ fn render_quick_connect_inspector(
         .bg(bg_panel())
         .child(header)
         .child(body)
+        .when_some(status_banner, |el, banner| el.child(banner))
         .child(footer)
         .into_any_element()
+}
+
+fn render_inspector_status_banner(
+    tab_idx: usize,
+    is_connecting: bool,
+    status_message: Option<&str>,
+    cx: &mut Context<RustduckWorkspace>,
+) -> Option<AnyElement> {
+    let raw = status_message?;
+    let clean = format_single_line_status(raw);
+    if clean.is_empty() {
+        return None;
+    }
+
+    let is_err = !is_connecting && is_error_status_message(&clean);
+    let (icon_name, fg_color, border_col) = if is_connecting {
+        (IconName::RefreshCw, accent_blue(), accent_blue())
+    } else if is_err {
+        (IconName::X, accent_red(), accent_red())
+    } else {
+        (IconName::CircleCheck, text_secondary(), border_subtle())
+    };
+
+    Some(
+        h_flex()
+            .w_full()
+            .px_6()
+            .py_2()
+            .bg(bg_panel())
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .rounded(px(8.0))
+                    .bg(bg_elevated())
+                    .border_1()
+                    .border_color(border_col)
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .gap_2()
+                            .items_center()
+                            .overflow_hidden()
+                            .child(Icon::new(icon_name).xsmall().text_color(fg_color))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(fg_color)
+                                    .child(clean),
+                            ),
+                    )
+                    .when(!is_connecting, |bar| {
+                        bar.child(
+                            Button::new(("dismiss-conn-status", tab_idx))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .icon(IconName::X)
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    this.tabs[tab_idx].status_message = None;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element(),
+    )
 }
 
 fn render_inspector_header(

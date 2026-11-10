@@ -22,8 +22,8 @@ use crate::ui::new_tab_view::render_new_tab_view;
 use crate::ui::settings_modal::{render_settings_modal, SettingsTab};
 use crate::ui::transfer_drawer::render_transfer_drawer;
 use crate::ui::{
-    accent_amber, accent_blue, accent_green, apply_theme_preference, bg_canvas, bg_elevated,
-    border_subtle, protocol_icon_and_color, text_muted, text_primary,
+    accent_amber, accent_blue, accent_green, accent_red, apply_theme_preference, bg_canvas,
+    bg_elevated, border_subtle, protocol_icon_and_color, text_muted, text_primary,
 };
 use futures::StreamExt as _;
 use gpui::{
@@ -954,6 +954,14 @@ impl RustduckWorkspace {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let secret_missing = secret.trim().is_empty()
+            && match &bm.config {
+                ProtocolConfig::S3(_) => true,
+                ProtocolConfig::Sftp(c) => {
+                    c.private_key_path.as_deref().unwrap_or("").trim().is_empty()
+                }
+                ProtocolConfig::Smb(_) => false,
+            };
         let tab = &mut self.tabs[tab_idx];
         tab.form.bookmark_id = Some(bm.id);
         tab.form
@@ -983,6 +991,9 @@ impl RustduckWorkspace {
                     .update(cx, |s, cx| s.set_value(c.initial_path.clone(), window, cx));
             }
             ProtocolConfig::S3(c) => {
+                let effective_region =
+                    crate::storage::s3::infer_s3_region_from_endpoint(&c.endpoint)
+                        .unwrap_or_else(|| c.region.clone());
                 tab.form.protocol = ProtocolKind::S3;
                 tab.form.s3_preset = c.preset;
                 tab.form.s3_addressing = c.addressing_style;
@@ -991,7 +1002,7 @@ impl RustduckWorkspace {
                     .update(cx, |s, cx| s.set_value(c.endpoint.clone(), window, cx));
                 tab.form
                     .s3_region_input
-                    .update(cx, |s, cx| s.set_value(c.region.clone(), window, cx));
+                    .update(cx, |s, cx| s.set_value(effective_region, window, cx));
                 tab.form
                     .s3_access_key_input
                     .update(cx, |s, cx| s.set_value(c.access_key_id.clone(), window, cx));
@@ -1024,7 +1035,11 @@ impl RustduckWorkspace {
                     .update(cx, |s, cx| s.set_value(c.initial_path.clone(), window, cx));
             }
         }
-        tab.status_message = Some(t.msg_loaded_bookmark(&bm.name));
+        tab.status_message = Some(if secret_missing {
+            t.msg_loaded_bookmark_missing_secret(&bm.name)
+        } else {
+            t.msg_loaded_bookmark(&bm.name)
+        });
         cx.notify();
     }
 
@@ -2272,16 +2287,31 @@ impl RustduckWorkspace {
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when_some(self.tabs[active_idx].status_message.clone(), |el, msg| {
+                let single_line = format_single_line_status(&msg);
+                let is_err = is_error_status_message(&single_line);
                 el.child(
                     h_flex()
+                        .max_w(px(420.0))
                         .px_2p5()
                         .py_0p5()
                         .rounded(px(99.0))
                         .bg(bg_elevated())
                         .border_1()
-                        .border_color(border_subtle())
+                        .border_color(if is_err {
+                            accent_red()
+                        } else {
+                            border_subtle()
+                        })
+                        .overflow_hidden()
                         .items_center()
-                        .child(div().text_xs().text_color(accent_blue()).child(msg)),
+                        .child(
+                            div()
+                                .max_w(px(396.0))
+                                .truncate()
+                                .text_xs()
+                                .text_color(if is_err { accent_red() } else { accent_blue() })
+                                .child(single_line),
+                        ),
                 )
             })
             .child(
@@ -2313,6 +2343,24 @@ impl RustduckWorkspace {
             .child(right_actions)
             .into_any_element()
     }
+}
+
+pub fn format_single_line_status(msg: &str) -> String {
+    msg.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn is_error_status_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    msg.contains("失败")
+        || msg.contains("无效")
+        || msg.contains("错误")
+        || msg.contains("缺少")
+        || msg.contains("未检测到")
+        || lower.contains("failed")
+        || lower.contains("invalid")
+        || lower.contains("error")
+        || lower.contains("missing")
+        || lower.contains("secret not found")
 }
 
 fn reveal_local_path_in_os(path: &str) {
@@ -2640,5 +2688,24 @@ mod tests {
         );
         assert_eq!(resolved_remote.len(), 1);
         assert_eq!(resolved_remote[0].name, "archive.tar.gz");
+    }
+
+    #[test]
+    fn test_format_single_line_status_and_error_classification() {
+        let multiline = "Connection failed:\n\tSignatureDoesNotMatch   \n  The Signature is invalid.";
+        let clean = format_single_line_status(multiline);
+        assert_eq!(
+            clean,
+            "Connection failed: SignatureDoesNotMatch The Signature is invalid."
+        );
+        assert!(!clean.contains('\n'));
+        assert!(!clean.contains('\t'));
+
+        assert!(is_error_status_message("连接失败: S3 签名错误"));
+        assert!(is_error_status_message("Connection failed: 403 Forbidden"));
+        assert!(is_error_status_message("连接参数无效: 请填写 SecretKey"));
+        assert!(is_error_status_message("Invalid connection config: missing SecretKey"));
+        assert!(!is_error_status_message("已载入收藏配置「ace-cdn-na」"));
+        assert!(!is_error_status_message("Loaded favorite \"ace-cdn-na\""));
     }
 }
