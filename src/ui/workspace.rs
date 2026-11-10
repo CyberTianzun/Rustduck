@@ -1,13 +1,16 @@
 use crate::i18n::{i18n, set_current_language, I18n};
 use crate::models::{
-    Bookmark, FileEntry, FileKind, ProtocolConfig, ProtocolKind, S3AddressingStyle, S3Config,
-    S3Preset, SftpConfig, SmbConfig, TransferDirection, TransferStatus, TransferTask,
+    Bookmark, FileEntry, FileKind, FtpConfig, GoogleDriveConfig, OneDriveConfig, ProtocolConfig,
+    ProtocolKind, S3AddressingStyle, S3Config, S3Preset, SftpConfig, SmbConfig, TransferDirection,
+    TransferStatus, TransferTask, WebDavConfig,
 };
 use crate::services::bookmark_store::{BookmarkStore, KeyringCredentialVault};
 use crate::services::preferences::{AppLanguage, PreferencesStore, ThemePreference};
 use crate::services::runtime::tokio_runtime;
 use crate::services::transfer_manager::TransferManager;
+use crate::storage::gdrive::authorize_google_drive_in_browser;
 use crate::storage::local::LocalFileSystem;
+use crate::storage::onedrive::authorize_onedrive_in_browser;
 use crate::storage::{create_backend, StorageBackend};
 use crate::ui::dual_pane_view::render_dual_pane_view;
 use crate::ui::file_pane::{
@@ -28,7 +31,7 @@ use crate::ui::{
 use futures::StreamExt as _;
 use gpui::{
     div, img, prelude::*, px, AnyElement, App, ClipboardItem, Context, Entity, IntoElement,
-    MouseButton, Render, Window,
+    MouseButton, PathPromptOptions, Render, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::InputState;
@@ -39,17 +42,258 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormFieldValues {
+    pub bookmark_id: Option<Uuid>,
+    pub protocol: ProtocolKind,
+    pub name: String,
+    pub secret: String,
+    pub initial_path: String,
+    pub sftp_host: String,
+    pub sftp_port: String,
+    pub sftp_user: String,
+    pub sftp_key_path: String,
+    pub ftp_host: String,
+    pub ftp_port: String,
+    pub ftp_user: String,
+    pub ftp_use_tls: bool,
+    pub s3_preset: S3Preset,
+    pub s3_addressing: S3AddressingStyle,
+    pub s3_endpoint: String,
+    pub s3_region: String,
+    pub s3_access_key: String,
+    pub s3_bucket: String,
+    pub smb_server: String,
+    pub smb_port: String,
+    pub smb_share: String,
+    pub smb_user: String,
+    pub smb_domain: String,
+    pub webdav_endpoint: String,
+    pub webdav_user: String,
+    pub gdrive_client_id: String,
+    pub gdrive_client_secret: String,
+    pub gdrive_proxy: String,
+    pub onedrive_client_id: String,
+    pub onedrive_proxy: String,
+}
+
+impl FormFieldValues {
+    pub fn blank_for_protocol(protocol: ProtocolKind) -> Self {
+        Self {
+            bookmark_id: None,
+            protocol,
+            name: String::new(),
+            secret: String::new(),
+            initial_path: "/".to_string(),
+            sftp_host: String::new(),
+            sftp_port: "22".to_string(),
+            sftp_user: "root".to_string(),
+            sftp_key_path: String::new(),
+            ftp_host: String::new(),
+            ftp_port: "21".to_string(),
+            ftp_user: "anonymous".to_string(),
+            ftp_use_tls: false,
+            s3_preset: S3Preset::AlibabaOss,
+            s3_addressing: S3AddressingStyle::VirtualHosted,
+            s3_endpoint: "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+            s3_region: "cn-hangzhou".to_string(),
+            s3_access_key: String::new(),
+            s3_bucket: String::new(),
+            smb_server: String::new(),
+            smb_port: "445".to_string(),
+            smb_share: String::new(),
+            smb_user: String::new(),
+            smb_domain: String::new(),
+            webdav_endpoint: String::new(),
+            webdav_user: String::new(),
+            gdrive_client_id: String::new(),
+            gdrive_client_secret: String::new(),
+            gdrive_proxy: String::new(),
+            onedrive_client_id: String::new(),
+            onedrive_proxy: String::new(),
+        }
+    }
+
+    pub fn from_bookmark(bm: &Bookmark, secret: &str) -> Self {
+        let mut vals = Self::blank_for_protocol(bm.config.kind());
+        vals.bookmark_id = Some(bm.id);
+        vals.name = bm.name.clone();
+        vals.secret = secret.to_string();
+
+        match &bm.config {
+            ProtocolConfig::Sftp(c) => {
+                vals.sftp_host = c.host.clone();
+                vals.sftp_port = c.port.to_string();
+                vals.sftp_user = c.username.clone();
+                vals.sftp_key_path = c.private_key_path.clone().unwrap_or_default();
+                vals.initial_path = c.initial_path.clone();
+            }
+            ProtocolConfig::Ftp(c) => {
+                vals.ftp_host = c.host.clone();
+                vals.ftp_port = c.port.to_string();
+                vals.ftp_user = c.username.clone();
+                vals.ftp_use_tls = c.use_tls;
+                vals.initial_path = c.initial_path.clone();
+            }
+            ProtocolConfig::S3(c) => {
+                let effective_region =
+                    crate::storage::s3::infer_s3_region_from_endpoint(&c.endpoint)
+                        .unwrap_or_else(|| c.region.clone());
+                vals.s3_preset = c.preset;
+                vals.s3_addressing = c.addressing_style;
+                vals.s3_endpoint = c.endpoint.clone();
+                vals.s3_region = effective_region;
+                vals.s3_access_key = c.access_key_id.clone();
+                vals.s3_bucket = c.bucket.clone().unwrap_or_default();
+                vals.initial_path = c.initial_prefix.clone();
+            }
+            ProtocolConfig::Smb(c) => {
+                vals.smb_server = c.server.clone();
+                vals.smb_port = c.port.to_string();
+                vals.smb_share = c.share.clone();
+                vals.smb_user = c.username.clone();
+                vals.smb_domain = c.domain.clone().unwrap_or_default();
+                vals.initial_path = c.initial_path.clone();
+            }
+            ProtocolConfig::WebDav(c) => {
+                vals.webdav_endpoint = c.endpoint.clone();
+                vals.webdav_user = c.username.clone();
+                vals.initial_path = c.initial_path.clone();
+            }
+            ProtocolConfig::GoogleDrive(c) => {
+                vals.gdrive_client_id = c.client_id.clone();
+                vals.gdrive_client_secret = c.client_secret.clone().unwrap_or_default();
+                vals.gdrive_proxy = c.proxy_url.clone().unwrap_or_default();
+                vals.initial_path = c.initial_path.clone();
+            }
+            ProtocolConfig::OneDrive(c) => {
+                vals.onedrive_client_id = c.client_id.clone();
+                vals.onedrive_proxy = c.proxy_url.clone().unwrap_or_default();
+                vals.initial_path = c.initial_path.clone();
+            }
+        }
+        vals
+    }
+
+    pub fn to_protocol_config(&self) -> ProtocolConfig {
+        let initial_path = self.initial_path.trim().to_string();
+        match self.protocol {
+            ProtocolKind::Sftp => ProtocolConfig::Sftp(SftpConfig {
+                host: self.sftp_host.trim().to_string(),
+                port: self.sftp_port.trim().parse::<u16>().unwrap_or(22),
+                username: if self.sftp_user.trim().is_empty() {
+                    "root".to_string()
+                } else {
+                    self.sftp_user.trim().to_string()
+                },
+                private_key_path: {
+                    let k = self.sftp_key_path.trim();
+                    if k.is_empty() {
+                        None
+                    } else {
+                        Some(k.to_string())
+                    }
+                },
+                initial_path,
+            }),
+            ProtocolKind::Ftp => ProtocolConfig::Ftp(FtpConfig {
+                host: self.ftp_host.trim().to_string(),
+                port: self.ftp_port.trim().parse::<u16>().unwrap_or(21),
+                username: if self.ftp_user.trim().is_empty() {
+                    "anonymous".to_string()
+                } else {
+                    self.ftp_user.trim().to_string()
+                },
+                use_tls: self.ftp_use_tls,
+                initial_path,
+            }),
+            ProtocolKind::S3 => ProtocolConfig::S3(S3Config {
+                preset: self.s3_preset,
+                endpoint: self.s3_endpoint.trim().to_string(),
+                region: self.s3_region.trim().to_string(),
+                access_key_id: self.s3_access_key.trim().to_string(),
+                bucket: {
+                    let b = self.s3_bucket.trim();
+                    if b.is_empty() {
+                        None
+                    } else {
+                        Some(b.to_string())
+                    }
+                },
+                initial_prefix: initial_path,
+                addressing_style: self.s3_addressing,
+            }),
+            ProtocolKind::Smb => ProtocolConfig::Smb(SmbConfig {
+                server: self.smb_server.trim().to_string(),
+                port: self.smb_port.trim().parse::<u16>().unwrap_or(445),
+                share: self.smb_share.trim().to_string(),
+                username: self.smb_user.trim().to_string(),
+                domain: {
+                    let d = self.smb_domain.trim();
+                    if d.is_empty() {
+                        None
+                    } else {
+                        Some(d.to_string())
+                    }
+                },
+                initial_path,
+            }),
+            ProtocolKind::WebDav => ProtocolConfig::WebDav(WebDavConfig {
+                endpoint: self.webdav_endpoint.trim().to_string(),
+                username: self.webdav_user.trim().to_string(),
+                initial_path,
+            }),
+            ProtocolKind::GoogleDrive => ProtocolConfig::GoogleDrive(GoogleDriveConfig {
+                client_id: self.gdrive_client_id.trim().to_string(),
+                client_secret: {
+                    let cs = self.gdrive_client_secret.trim();
+                    if cs.is_empty() {
+                        None
+                    } else {
+                        Some(cs.to_string())
+                    }
+                },
+                proxy_url: {
+                    let p = self.gdrive_proxy.trim();
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.to_string())
+                    }
+                },
+                initial_path,
+            }),
+            ProtocolKind::OneDrive => ProtocolConfig::OneDrive(OneDriveConfig {
+                client_id: self.onedrive_client_id.trim().to_string(),
+                proxy_url: {
+                    let p = self.onedrive_proxy.trim();
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.to_string())
+                    }
+                },
+                initial_path,
+            }),
+        }
+    }
+}
+
 pub struct ConnectionFormInputs {
     pub bookmark_id: Option<Uuid>,
     pub protocol: ProtocolKind,
     pub s3_preset: S3Preset,
     pub s3_addressing: S3AddressingStyle,
+    pub ftp_use_tls: bool,
     pub bookmark_search_input: Entity<InputState>,
     pub name_input: Entity<InputState>,
     pub sftp_host_input: Entity<InputState>,
     pub sftp_port_input: Entity<InputState>,
     pub sftp_user_input: Entity<InputState>,
     pub sftp_key_path_input: Entity<InputState>,
+    pub ftp_host_input: Entity<InputState>,
+    pub ftp_port_input: Entity<InputState>,
+    pub ftp_user_input: Entity<InputState>,
     pub s3_endpoint_input: Entity<InputState>,
     pub s3_region_input: Entity<InputState>,
     pub s3_access_key_input: Entity<InputState>,
@@ -59,6 +303,13 @@ pub struct ConnectionFormInputs {
     pub smb_share_input: Entity<InputState>,
     pub smb_user_input: Entity<InputState>,
     pub smb_domain_input: Entity<InputState>,
+    pub webdav_endpoint_input: Entity<InputState>,
+    pub webdav_user_input: Entity<InputState>,
+    pub gdrive_client_id_input: Entity<InputState>,
+    pub gdrive_client_secret_input: Entity<InputState>,
+    pub gdrive_proxy_input: Entity<InputState>,
+    pub onedrive_client_id_input: Entity<InputState>,
+    pub onedrive_proxy_input: Entity<InputState>,
     pub secret_input: Entity<InputState>,
     pub initial_path_input: Entity<InputState>,
 }
@@ -66,13 +317,25 @@ pub struct ConnectionFormInputs {
 impl ConnectionFormInputs {
     pub fn new(window: &mut Window, cx: &mut Context<RustduckWorkspace>) -> Self {
         let t = i18n();
+        let search_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_search_bookmarks()));
+        Self::new_with_search_and_protocol(search_input, ProtocolKind::S3, window, cx)
+    }
+
+    pub fn new_with_search_and_protocol(
+        bookmark_search_input: Entity<InputState>,
+        protocol: ProtocolKind,
+        window: &mut Window,
+        cx: &mut Context<RustduckWorkspace>,
+    ) -> Self {
+        let t = i18n();
         Self {
             bookmark_id: None,
-            protocol: ProtocolKind::S3,
+            protocol,
             s3_preset: S3Preset::AlibabaOss,
             s3_addressing: S3AddressingStyle::VirtualHosted,
-            bookmark_search_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_search_bookmarks())),
+            ftp_use_tls: false,
+            bookmark_search_input,
             name_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_conn_name())),
             sftp_host_input: cx
@@ -81,6 +344,10 @@ impl ConnectionFormInputs {
             sftp_user_input: cx.new(|cx| InputState::new(window, cx).default_value("root")),
             sftp_key_path_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_sftp_key_path())),
+            ftp_host_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_ftp_host())),
+            ftp_port_input: cx.new(|cx| InputState::new(window, cx).default_value("21")),
+            ftp_user_input: cx.new(|cx| InputState::new(window, cx).default_value("anonymous")),
             s3_endpoint_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .default_value("https://oss-cn-hangzhou.aliyuncs.com")
@@ -97,9 +364,27 @@ impl ConnectionFormInputs {
             smb_port_input: cx.new(|cx| InputState::new(window, cx).default_value("445")),
             smb_share_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_smb_share())),
-            smb_user_input: cx.new(|cx| InputState::new(window, cx).default_value("admin")),
+            smb_user_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("admin / guest")),
             smb_domain_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_smb_domain())),
+            webdav_endpoint_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_webdav_endpoint())),
+            webdav_user_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("username")),
+            gdrive_client_id_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_oauth_client_id())),
+            gdrive_client_secret_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(t.placeholder_oauth_client_secret())
+                    .masked(true)
+            }),
+            gdrive_proxy_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_proxy_url())),
+            onedrive_client_id_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_oauth_client_id())),
+            onedrive_proxy_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_proxy_url())),
             secret_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(t.placeholder_secret())
@@ -107,6 +392,122 @@ impl ConnectionFormInputs {
             }),
             initial_path_input: cx.new(|cx| InputState::new(window, cx).default_value("/")),
         }
+    }
+
+    pub fn snapshot_values(&self, cx: &App) -> FormFieldValues {
+        FormFieldValues {
+            bookmark_id: self.bookmark_id,
+            protocol: self.protocol,
+            name: self.name_input.read(cx).value().to_string(),
+            secret: self.secret_input.read(cx).value().to_string(),
+            initial_path: self.initial_path_input.read(cx).value().to_string(),
+            sftp_host: self.sftp_host_input.read(cx).value().to_string(),
+            sftp_port: self.sftp_port_input.read(cx).value().to_string(),
+            sftp_user: self.sftp_user_input.read(cx).value().to_string(),
+            sftp_key_path: self.sftp_key_path_input.read(cx).value().to_string(),
+            ftp_host: self.ftp_host_input.read(cx).value().to_string(),
+            ftp_port: self.ftp_port_input.read(cx).value().to_string(),
+            ftp_user: self.ftp_user_input.read(cx).value().to_string(),
+            ftp_use_tls: self.ftp_use_tls,
+            s3_preset: self.s3_preset,
+            s3_addressing: self.s3_addressing,
+            s3_endpoint: self.s3_endpoint_input.read(cx).value().to_string(),
+            s3_region: self.s3_region_input.read(cx).value().to_string(),
+            s3_access_key: self.s3_access_key_input.read(cx).value().to_string(),
+            s3_bucket: self.s3_bucket_input.read(cx).value().to_string(),
+            smb_server: self.smb_server_input.read(cx).value().to_string(),
+            smb_port: self.smb_port_input.read(cx).value().to_string(),
+            smb_share: self.smb_share_input.read(cx).value().to_string(),
+            smb_user: self.smb_user_input.read(cx).value().to_string(),
+            smb_domain: self.smb_domain_input.read(cx).value().to_string(),
+            webdav_endpoint: self.webdav_endpoint_input.read(cx).value().to_string(),
+            webdav_user: self.webdav_user_input.read(cx).value().to_string(),
+            gdrive_client_id: self.gdrive_client_id_input.read(cx).value().to_string(),
+            gdrive_client_secret: self.gdrive_client_secret_input.read(cx).value().to_string(),
+            gdrive_proxy: self.gdrive_proxy_input.read(cx).value().to_string(),
+            onedrive_client_id: self.onedrive_client_id_input.read(cx).value().to_string(),
+            onedrive_proxy: self.onedrive_proxy_input.read(cx).value().to_string(),
+        }
+    }
+
+    pub fn apply_values(
+        &mut self,
+        vals: &FormFieldValues,
+        window: &mut Window,
+        cx: &mut Context<RustduckWorkspace>,
+    ) {
+        self.bookmark_id = vals.bookmark_id;
+        self.protocol = vals.protocol;
+        self.s3_preset = vals.s3_preset;
+        self.s3_addressing = vals.s3_addressing;
+        self.ftp_use_tls = vals.ftp_use_tls;
+
+        self.name_input
+            .update(cx, |s, cx| s.set_value(vals.name.clone(), window, cx));
+        self.secret_input
+            .update(cx, |s, cx| s.set_value(vals.secret.clone(), window, cx));
+        self.initial_path_input
+            .update(cx, |s, cx| s.set_value(vals.initial_path.clone(), window, cx));
+
+        self.sftp_host_input
+            .update(cx, |s, cx| s.set_value(vals.sftp_host.clone(), window, cx));
+        self.sftp_port_input
+            .update(cx, |s, cx| s.set_value(vals.sftp_port.clone(), window, cx));
+        self.sftp_user_input
+            .update(cx, |s, cx| s.set_value(vals.sftp_user.clone(), window, cx));
+        self.sftp_key_path_input.update(cx, |s, cx| {
+            s.set_value(vals.sftp_key_path.clone(), window, cx)
+        });
+
+        self.ftp_host_input
+            .update(cx, |s, cx| s.set_value(vals.ftp_host.clone(), window, cx));
+        self.ftp_port_input
+            .update(cx, |s, cx| s.set_value(vals.ftp_port.clone(), window, cx));
+        self.ftp_user_input
+            .update(cx, |s, cx| s.set_value(vals.ftp_user.clone(), window, cx));
+
+        self.s3_endpoint_input
+            .update(cx, |s, cx| s.set_value(vals.s3_endpoint.clone(), window, cx));
+        self.s3_region_input
+            .update(cx, |s, cx| s.set_value(vals.s3_region.clone(), window, cx));
+        self.s3_access_key_input.update(cx, |s, cx| {
+            s.set_value(vals.s3_access_key.clone(), window, cx)
+        });
+        self.s3_bucket_input
+            .update(cx, |s, cx| s.set_value(vals.s3_bucket.clone(), window, cx));
+
+        self.smb_server_input
+            .update(cx, |s, cx| s.set_value(vals.smb_server.clone(), window, cx));
+        self.smb_port_input
+            .update(cx, |s, cx| s.set_value(vals.smb_port.clone(), window, cx));
+        self.smb_share_input
+            .update(cx, |s, cx| s.set_value(vals.smb_share.clone(), window, cx));
+        self.smb_user_input
+            .update(cx, |s, cx| s.set_value(vals.smb_user.clone(), window, cx));
+        self.smb_domain_input
+            .update(cx, |s, cx| s.set_value(vals.smb_domain.clone(), window, cx));
+
+        self.webdav_endpoint_input.update(cx, |s, cx| {
+            s.set_value(vals.webdav_endpoint.clone(), window, cx)
+        });
+        self.webdav_user_input
+            .update(cx, |s, cx| s.set_value(vals.webdav_user.clone(), window, cx));
+
+        self.gdrive_client_id_input.update(cx, |s, cx| {
+            s.set_value(vals.gdrive_client_id.clone(), window, cx)
+        });
+        self.gdrive_client_secret_input.update(cx, |s, cx| {
+            s.set_value(vals.gdrive_client_secret.clone(), window, cx)
+        });
+        self.gdrive_proxy_input
+            .update(cx, |s, cx| s.set_value(vals.gdrive_proxy.clone(), window, cx));
+
+        self.onedrive_client_id_input.update(cx, |s, cx| {
+            s.set_value(vals.onedrive_client_id.clone(), window, cx)
+        });
+        self.onedrive_proxy_input.update(cx, |s, cx| {
+            s.set_value(vals.onedrive_proxy.clone(), window, cx)
+        });
     }
 
     pub fn refresh_placeholders(&self, window: &mut Window, cx: &mut Context<RustduckWorkspace>) {
@@ -119,6 +520,8 @@ impl ConnectionFormInputs {
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_sftp_host(), window, cx));
         self.sftp_key_path_input
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_sftp_key_path(), window, cx));
+        self.ftp_host_input
+            .update(cx, |s, cx| s.set_placeholder(t.placeholder_ftp_host(), window, cx));
         self.s3_bucket_input
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_s3_bucket(), window, cx));
         self.smb_server_input
@@ -127,6 +530,18 @@ impl ConnectionFormInputs {
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_smb_share(), window, cx));
         self.smb_domain_input
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_smb_domain(), window, cx));
+        self.webdav_endpoint_input
+            .update(cx, |s, cx| s.set_placeholder(t.placeholder_webdav_endpoint(), window, cx));
+        self.gdrive_client_id_input
+            .update(cx, |s, cx| s.set_placeholder(t.placeholder_oauth_client_id(), window, cx));
+        self.gdrive_client_secret_input
+            .update(cx, |s, cx| s.set_placeholder(t.placeholder_oauth_client_secret(), window, cx));
+        self.gdrive_proxy_input
+            .update(cx, |s, cx| s.set_placeholder(t.placeholder_proxy_url(), window, cx));
+        self.onedrive_client_id_input
+            .update(cx, |s, cx| s.set_placeholder(t.placeholder_oauth_client_id(), window, cx));
+        self.onedrive_proxy_input
+            .update(cx, |s, cx| s.set_placeholder(t.placeholder_proxy_url(), window, cx));
         self.secret_input
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_secret(), window, cx));
     }
@@ -539,6 +954,7 @@ impl TabSession {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_protocol_config_from_values(
     protocol: ProtocolKind,
     sftp_host: &str,
@@ -558,57 +974,24 @@ pub fn build_protocol_config_from_values(
     smb_domain: &str,
     initial_path: &str,
 ) -> ProtocolConfig {
-    match protocol {
-        ProtocolKind::Sftp => ProtocolConfig::Sftp(SftpConfig {
-            host: sftp_host.trim().to_string(),
-            port: sftp_port.trim().parse::<u16>().unwrap_or(22),
-            username: if sftp_user.trim().is_empty() {
-                "root".to_string()
-            } else {
-                sftp_user.trim().to_string()
-            },
-            private_key_path: {
-                let k = sftp_key_path.trim();
-                if k.is_empty() {
-                    None
-                } else {
-                    Some(k.to_string())
-                }
-            },
-            initial_path: initial_path.trim().to_string(),
-        }),
-        ProtocolKind::S3 => ProtocolConfig::S3(S3Config {
-            preset: s3_preset,
-            endpoint: s3_endpoint.trim().to_string(),
-            region: s3_region.trim().to_string(),
-            access_key_id: s3_access_key.trim().to_string(),
-            bucket: {
-                let b = s3_bucket.trim();
-                if b.is_empty() {
-                    None
-                } else {
-                    Some(b.to_string())
-                }
-            },
-            initial_prefix: initial_path.trim().to_string(),
-            addressing_style: s3_addressing,
-        }),
-        ProtocolKind::Smb => ProtocolConfig::Smb(SmbConfig {
-            server: smb_server.trim().to_string(),
-            port: smb_port.trim().parse::<u16>().unwrap_or(445),
-            share: smb_share.trim().to_string(),
-            username: smb_user.trim().to_string(),
-            domain: {
-                let d = smb_domain.trim();
-                if d.is_empty() {
-                    None
-                } else {
-                    Some(d.to_string())
-                }
-            },
-            initial_path: initial_path.trim().to_string(),
-        }),
-    }
+    let mut vals = FormFieldValues::blank_for_protocol(protocol);
+    vals.sftp_host = sftp_host.to_string();
+    vals.sftp_port = sftp_port.to_string();
+    vals.sftp_user = sftp_user.to_string();
+    vals.sftp_key_path = sftp_key_path.to_string();
+    vals.s3_preset = s3_preset;
+    vals.s3_endpoint = s3_endpoint.to_string();
+    vals.s3_region = s3_region.to_string();
+    vals.s3_access_key = s3_access_key.to_string();
+    vals.s3_bucket = s3_bucket.to_string();
+    vals.s3_addressing = s3_addressing;
+    vals.smb_server = smb_server.to_string();
+    vals.smb_port = smb_port.to_string();
+    vals.smb_share = smb_share.to_string();
+    vals.smb_user = smb_user.to_string();
+    vals.smb_domain = smb_domain.to_string();
+    vals.initial_path = initial_path.to_string();
+    vals.to_protocol_config()
 }
 
 pub fn detect_newly_completed_transfers(
@@ -646,6 +1029,8 @@ pub fn detect_newly_completed_transfers(
 pub fn workspace_window_options(bounds: gpui::Bounds<gpui::Pixels>) -> gpui::WindowOptions {
     let mut window_options = TitleBar::window_options();
     window_options.window_bounds = Some(gpui::WindowBounds::Windowed(bounds));
+    window_options.focus = true;
+    window_options.show = true;
     // Ensure Windows taskbar and Alt+Tab display "Rustduck" while keeping custom borderless titlebar
     if let Some(titlebar) = window_options.titlebar.as_mut() {
         titlebar.title = Some("Rustduck".into());
@@ -835,18 +1220,18 @@ impl RustduckWorkspace {
         cx: &mut Context<Self>,
     ) {
         let t = i18n();
-        let tab = &mut self.tabs[tab_idx];
-        tab.form.bookmark_id = None;
-        tab.form
-            .name_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        tab.form
-            .secret_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        tab.form
-            .initial_path_input
-            .update(cx, |s, cx| s.set_value("/", window, cx));
-        tab.status_message = Some(t.msg_reset_blank_form());
+        let protocol = self.tabs[tab_idx].form.protocol;
+        let search_input = self.tabs[tab_idx].form.bookmark_search_input.clone();
+        let blank = FormFieldValues::blank_for_protocol(protocol);
+        self.tabs[tab_idx].form.apply_values(&blank, window, cx);
+        let fresh_form = ConnectionFormInputs::new_with_search_and_protocol(
+            search_input,
+            protocol,
+            window,
+            cx,
+        );
+        self.tabs[tab_idx].form = fresh_form;
+        self.tabs[tab_idx].status_message = Some(t.msg_reset_blank_form());
         cx.notify();
     }
 
@@ -873,51 +1258,15 @@ impl RustduckWorkspace {
         tab_idx: usize,
         cx: &Context<Self>,
     ) -> (String, ProtocolConfig, String) {
-        let form = &self.tabs[tab_idx].form;
-        let name = form.name_input.read(cx).value().to_string();
-        let sftp_host = form.sftp_host_input.read(cx).value().to_string();
-        let sftp_port = form.sftp_port_input.read(cx).value().to_string();
-        let sftp_user = form.sftp_user_input.read(cx).value().to_string();
-        let sftp_key = form.sftp_key_path_input.read(cx).value().to_string();
-        let s3_endpoint = form.s3_endpoint_input.read(cx).value().to_string();
-        let s3_region = form.s3_region_input.read(cx).value().to_string();
-        let s3_ak = form.s3_access_key_input.read(cx).value().to_string();
-        let s3_bucket = form.s3_bucket_input.read(cx).value().to_string();
-        let smb_server = form.smb_server_input.read(cx).value().to_string();
-        let smb_port = form.smb_port_input.read(cx).value().to_string();
-        let smb_share = form.smb_share_input.read(cx).value().to_string();
-        let smb_user = form.smb_user_input.read(cx).value().to_string();
-        let smb_domain = form.smb_domain_input.read(cx).value().to_string();
-        let secret = form.secret_input.read(cx).value().to_string();
-        let initial_path = form.initial_path_input.read(cx).value().to_string();
-
-        let cfg = build_protocol_config_from_values(
-            form.protocol,
-            &sftp_host,
-            &sftp_port,
-            &sftp_user,
-            &sftp_key,
-            form.s3_preset,
-            &s3_endpoint,
-            &s3_region,
-            &s3_ak,
-            &s3_bucket,
-            form.s3_addressing,
-            &smb_server,
-            &smb_port,
-            &smb_share,
-            &smb_user,
-            &smb_domain,
-            &initial_path,
-        );
-
-        let display_name = if name.trim().is_empty() {
+        let vals = self.tabs[tab_idx].form.snapshot_values(cx);
+        let cfg = vals.to_protocol_config();
+        let display_name = if vals.name.trim().is_empty() {
             cfg.summary()
         } else {
-            name.trim().to_string()
+            vals.name.trim().to_string()
         };
 
-        (display_name, cfg, secret)
+        (display_name, cfg, vals.secret)
     }
 
     pub fn save_current_form_as_bookmark(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
@@ -940,6 +1289,117 @@ impl RustduckWorkspace {
         cx.notify();
     }
 
+    pub fn export_bookmarks_dialog(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+        let default_dir = std::path::PathBuf::from(LocalFileSystem::initial_local_dir());
+        let rx = cx.prompt_for_new_path(&default_dir, Some("rustduck-connections.json"));
+        let tab_id = self.tabs[tab_idx].id;
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let _ = this.update(cx, |ws, cx| {
+                    let t = i18n();
+                    let msg = match ws.bookmark_store.export_to_path(&path) {
+                        Ok(count) => t.msg_exported_bookmarks(count, &path.to_string_lossy()),
+                        Err(e) => t.msg_export_failed(&e),
+                    };
+                    if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.status_message = Some(msg);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn import_bookmarks_dialog(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        let tab_id = self.tabs[tab_idx].id;
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update(cx, |ws, cx| {
+                        let t = i18n();
+                        let msg = match ws.bookmark_store.import_from_path(&path) {
+                            Ok(count) => t.msg_imported_bookmarks(count),
+                            Err(e) => t.msg_import_failed(&e),
+                        };
+                        if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            tab.status_message = Some(msg);
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn authorize_oauth_in_browser(
+        &mut self,
+        tab_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let t = i18n();
+        let (_title, config, _secret) = self.read_form_config(tab_idx, cx);
+        let provider = match config.kind() {
+            ProtocolKind::GoogleDrive => "Google Drive",
+            ProtocolKind::OneDrive => "OneDrive",
+            other => other.short_tag(),
+        };
+        self.tabs[tab_idx].is_connecting = true;
+        self.tabs[tab_idx].status_message = Some(t.msg_oauth_authorizing_browser(provider));
+        cx.notify();
+
+        let tab_id = self.tabs[tab_idx].id;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        tokio_runtime().spawn(async move {
+            let res = match config {
+                ProtocolConfig::GoogleDrive(cfg) => authorize_google_drive_in_browser(&cfg).await,
+                ProtocolConfig::OneDrive(cfg) => authorize_onedrive_in_browser(&cfg).await,
+                _ => Err(anyhow::anyhow!(
+                    "OAuth browser login is only supported for Google Drive / OneDrive"
+                )),
+            };
+            let _ = tx.send(res);
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(result) = rx.await {
+                let _ = this.update_in(cx, |ws, window, cx| {
+                    let t = i18n();
+                    if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.is_connecting = false;
+                        match result {
+                            Ok(refresh_token) => {
+                                tab.form.secret_input.update(cx, |s, cx| {
+                                    s.set_value(refresh_token.clone(), window, cx)
+                                });
+                                if let Some(bm_id) = tab.form.bookmark_id {
+                                    let _ = ws.bookmark_store.set_secret(bm_id, &refresh_token);
+                                }
+                                tab.status_message = Some(t.msg_oauth_authorized_ok(provider));
+                            }
+                            Err(e) => {
+                                tab.status_message =
+                                    Some(t.msg_oauth_authorize_failed(provider, &e));
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub fn load_bookmark_into_form(
         &mut self,
         tab_idx: usize,
@@ -956,85 +1416,21 @@ impl RustduckWorkspace {
             .unwrap_or_default();
         let secret_missing = secret.trim().is_empty()
             && match &bm.config {
-                ProtocolConfig::S3(_) => true,
+                ProtocolConfig::S3(_) | ProtocolConfig::WebDav(_) => true,
                 ProtocolConfig::Sftp(c) => {
                     c.private_key_path.as_deref().unwrap_or("").trim().is_empty()
                 }
-                ProtocolConfig::Smb(_) => false,
+                ProtocolConfig::Ftp(c) => {
+                    !c.username.trim().is_empty()
+                        && !c.username.trim().eq_ignore_ascii_case("anonymous")
+                }
+                ProtocolConfig::Smb(_)
+                | ProtocolConfig::GoogleDrive(_)
+                | ProtocolConfig::OneDrive(_) => false,
             };
+        let vals = FormFieldValues::from_bookmark(bm, &secret);
         let tab = &mut self.tabs[tab_idx];
-        tab.form.bookmark_id = Some(bm.id);
-        tab.form
-            .name_input
-            .update(cx, |s, cx| s.set_value(bm.name.clone(), window, cx));
-        tab.form
-            .secret_input
-            .update(cx, |s, cx| s.set_value(secret, window, cx));
-
-        match &bm.config {
-            ProtocolConfig::Sftp(c) => {
-                tab.form.protocol = ProtocolKind::Sftp;
-                tab.form
-                    .sftp_host_input
-                    .update(cx, |s, cx| s.set_value(c.host.clone(), window, cx));
-                tab.form
-                    .sftp_port_input
-                    .update(cx, |s, cx| s.set_value(c.port.to_string(), window, cx));
-                tab.form
-                    .sftp_user_input
-                    .update(cx, |s, cx| s.set_value(c.username.clone(), window, cx));
-                tab.form.sftp_key_path_input.update(cx, |s, cx| {
-                    s.set_value(c.private_key_path.clone().unwrap_or_default(), window, cx)
-                });
-                tab.form
-                    .initial_path_input
-                    .update(cx, |s, cx| s.set_value(c.initial_path.clone(), window, cx));
-            }
-            ProtocolConfig::S3(c) => {
-                let effective_region =
-                    crate::storage::s3::infer_s3_region_from_endpoint(&c.endpoint)
-                        .unwrap_or_else(|| c.region.clone());
-                tab.form.protocol = ProtocolKind::S3;
-                tab.form.s3_preset = c.preset;
-                tab.form.s3_addressing = c.addressing_style;
-                tab.form
-                    .s3_endpoint_input
-                    .update(cx, |s, cx| s.set_value(c.endpoint.clone(), window, cx));
-                tab.form
-                    .s3_region_input
-                    .update(cx, |s, cx| s.set_value(effective_region, window, cx));
-                tab.form
-                    .s3_access_key_input
-                    .update(cx, |s, cx| s.set_value(c.access_key_id.clone(), window, cx));
-                tab.form.s3_bucket_input.update(cx, |s, cx| {
-                    s.set_value(c.bucket.clone().unwrap_or_default(), window, cx)
-                });
-                tab.form.initial_path_input.update(cx, |s, cx| {
-                    s.set_value(c.initial_prefix.clone(), window, cx)
-                });
-            }
-            ProtocolConfig::Smb(c) => {
-                tab.form.protocol = ProtocolKind::Smb;
-                tab.form
-                    .smb_server_input
-                    .update(cx, |s, cx| s.set_value(c.server.clone(), window, cx));
-                tab.form
-                    .smb_port_input
-                    .update(cx, |s, cx| s.set_value(c.port.to_string(), window, cx));
-                tab.form
-                    .smb_share_input
-                    .update(cx, |s, cx| s.set_value(c.share.clone(), window, cx));
-                tab.form
-                    .smb_user_input
-                    .update(cx, |s, cx| s.set_value(c.username.clone(), window, cx));
-                tab.form.smb_domain_input.update(cx, |s, cx| {
-                    s.set_value(c.domain.clone().unwrap_or_default(), window, cx)
-                });
-                tab.form
-                    .initial_path_input
-                    .update(cx, |s, cx| s.set_value(c.initial_path.clone(), window, cx));
-            }
-        }
+        tab.form.apply_values(&vals, window, cx);
         tab.status_message = Some(if secret_missing {
             t.msg_loaded_bookmark_missing_secret(&bm.name)
         } else {
@@ -1043,7 +1439,12 @@ impl RustduckWorkspace {
         cx.notify();
     }
 
-    pub fn test_connection_tab(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+    pub fn test_connection_tab(
+        &mut self,
+        tab_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let t = i18n();
         let (_title, config, secret) = self.read_form_config(tab_idx, cx);
         let backend = match create_backend(&config, &secret) {
@@ -1062,18 +1463,29 @@ impl RustduckWorkspace {
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
         tokio_runtime().spawn(async move {
-            let res = backend.connect_and_verify().await;
+            let res = backend
+                .connect_and_verify()
+                .await
+                .map(|root| (root, backend.exported_secret()));
             let _ = tx.send(res);
         });
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Ok(result) = rx.await {
-                let _ = this.update(cx, |ws, cx| {
+                let _ = this.update_in(cx, |ws, window, cx| {
                     let t = i18n();
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
                         tab.is_connecting = false;
                         match result {
-                            Ok(root) => {
+                            Ok((root, maybe_secret)) => {
+                                if let Some(new_sec) = maybe_secret {
+                                    tab.form.secret_input.update(cx, |s, cx| {
+                                        s.set_value(new_sec.clone(), window, cx)
+                                    });
+                                    if let Some(bm_id) = tab.form.bookmark_id {
+                                        let _ = ws.bookmark_store.set_secret(bm_id, &new_sec);
+                                    }
+                                }
                                 tab.status_message = Some(t.msg_test_conn_ok(&root));
                             }
                             Err(e) => {
@@ -1088,7 +1500,12 @@ impl RustduckWorkspace {
         .detach();
     }
 
-    pub fn connect_tab(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+    pub fn connect_tab(
+        &mut self,
+        tab_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let t = i18n();
         let (title, config, secret) = self.read_form_config(tab_idx, cx);
         let backend = match create_backend(&config, &secret) {
@@ -1116,14 +1533,22 @@ impl RustduckWorkspace {
             let _ = tx.send(res);
         });
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Ok(result) = rx.await {
-                let _ = this.update(cx, |ws, cx| {
+                let _ = this.update_in(cx, |ws, window, cx| {
                     let t = i18n();
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
                         tab.is_connecting = false;
                         match result {
                             Ok((backend, initial_path, entries)) => {
+                                if let Some(new_sec) = backend.exported_secret() {
+                                    tab.form.secret_input.update(cx, |s, cx| {
+                                        s.set_value(new_sec.clone(), window, cx)
+                                    });
+                                    if let Some(bm_id) = tab.form.bookmark_id {
+                                        let _ = ws.bookmark_store.set_secret(bm_id, &new_sec);
+                                    }
+                                }
                                 tab.title = title;
                                 tab.is_connected = true;
                                 tab.remote_backend = Some(backend);
@@ -2449,6 +2874,101 @@ mod tests {
         let tb = opts.titlebar.expect("titlebar options must be present");
         assert_eq!(tb.title.as_deref(), Some("Rustduck"));
         assert!(tb.appears_transparent);
+    }
+
+    #[test]
+    fn test_form_field_values_from_bookmark_and_blank_reset_clears_all_credentials_and_fields() {
+        let bm_s3 = Bookmark {
+            id: Uuid::new_v4(),
+            name: "Prod OSS".into(),
+            config: ProtocolConfig::S3(S3Config {
+                preset: S3Preset::AlibabaOss,
+                endpoint: "https://oss-cn-shanghai.aliyuncs.com".into(),
+                region: "cn-shanghai".into(),
+                access_key_id: "LTAI_PROD_KEY".into(),
+                bucket: Some("prod-bucket".into()),
+                initial_prefix: "/assets".into(),
+                addressing_style: S3AddressingStyle::VirtualHosted,
+            }),
+        };
+
+        let loaded = FormFieldValues::from_bookmark(&bm_s3, "TOP_SECRET_KEY_123");
+        assert_eq!(loaded.bookmark_id, Some(bm_s3.id));
+        assert_eq!(loaded.name, "Prod OSS");
+        assert_eq!(loaded.secret, "TOP_SECRET_KEY_123");
+        assert_eq!(loaded.s3_access_key, "LTAI_PROD_KEY");
+        assert_eq!(loaded.s3_bucket, "prod-bucket");
+        assert_eq!(loaded.initial_path, "/assets");
+
+        let reset = FormFieldValues::blank_for_protocol(loaded.protocol);
+        assert_eq!(reset.bookmark_id, None);
+        assert!(reset.name.is_empty());
+        assert!(reset.secret.is_empty());
+        assert!(reset.s3_access_key.is_empty());
+        assert!(reset.s3_bucket.is_empty());
+        assert!(reset.sftp_host.is_empty());
+        assert!(reset.ftp_host.is_empty());
+        assert!(reset.smb_server.is_empty());
+        assert!(reset.webdav_endpoint.is_empty());
+        assert!(reset.gdrive_proxy.is_empty());
+        assert!(reset.onedrive_proxy.is_empty());
+        assert_eq!(reset.initial_path, "/");
+    }
+
+    #[test]
+    fn test_form_field_values_to_protocol_config_all_protocols() {
+        let mut ftp_vals = FormFieldValues::blank_for_protocol(ProtocolKind::Ftp);
+        ftp_vals.ftp_host = "ftp.example.com".into();
+        ftp_vals.ftp_port = "2121".into();
+        ftp_vals.ftp_user = "deploy".into();
+        ftp_vals.ftp_use_tls = true;
+        ftp_vals.initial_path = "/pub".into();
+        match ftp_vals.to_protocol_config() {
+            ProtocolConfig::Ftp(c) => {
+                assert_eq!(c.host, "ftp.example.com");
+                assert_eq!(c.port, 2121);
+                assert_eq!(c.username, "deploy");
+                assert!(c.use_tls);
+                assert_eq!(c.initial_path, "/pub");
+            }
+            _ => panic!("expected FTP config"),
+        }
+
+        let mut dav_vals = FormFieldValues::blank_for_protocol(ProtocolKind::WebDav);
+        dav_vals.webdav_endpoint = "https://dav.example.com/remote.php/dav".into();
+        dav_vals.webdav_user = "alice".into();
+        dav_vals.initial_path = "/notes".into();
+        match dav_vals.to_protocol_config() {
+            ProtocolConfig::WebDav(c) => {
+                assert_eq!(c.endpoint, "https://dav.example.com/remote.php/dav");
+                assert_eq!(c.username, "alice");
+                assert_eq!(c.initial_path, "/notes");
+            }
+            _ => panic!("expected WebDAV config"),
+        }
+
+        let mut gdrive_vals = FormFieldValues::blank_for_protocol(ProtocolKind::GoogleDrive);
+        gdrive_vals.gdrive_client_id = "my-cid".into();
+        gdrive_vals.gdrive_client_secret = "my-csec".into();
+        gdrive_vals.gdrive_proxy = "socks5://127.0.0.1:1080".into();
+        match gdrive_vals.to_protocol_config() {
+            ProtocolConfig::GoogleDrive(c) => {
+                assert_eq!(c.client_id, "my-cid");
+                assert_eq!(c.client_secret.as_deref(), Some("my-csec"));
+                assert_eq!(c.proxy_url.as_deref(), Some("socks5://127.0.0.1:1080"));
+            }
+            _ => panic!("expected GoogleDrive config"),
+        }
+
+        let mut od_vals = FormFieldValues::blank_for_protocol(ProtocolKind::OneDrive);
+        od_vals.onedrive_proxy = "http://127.0.0.1:7890".into();
+        match od_vals.to_protocol_config() {
+            ProtocolConfig::OneDrive(c) => {
+                assert!(c.client_id.is_empty());
+                assert_eq!(c.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+            }
+            _ => panic!("expected OneDrive config"),
+        }
     }
 
     #[test]

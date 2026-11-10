@@ -24,11 +24,13 @@ fn main() {
 
     app.run(move |cx: &mut App| {
         gpui_kit::init(cx);
+        cx.activate(true);
 
         let bounds = Bounds::centered(None, size(px(1360.0), px(860.0)), cx);
         let window_options = workspace_window_options(bounds);
 
         gpui_kit::open_window(window_options, cx, |window, cx| {
+            window.activate_window();
             cx.new(|cx| RustduckWorkspace::new(window, cx))
         })
         .expect("Failed to open Rustduck window");

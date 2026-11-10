@@ -9,7 +9,7 @@ use crate::ui::{
         RustduckWorkspace,
     },
 };
-use gpui::{div, prelude::*, px, AnyElement, Context, IntoElement};
+use gpui::{div, prelude::*, px, AnyElement, Context, IntoElement, MouseButton};
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement as _;
@@ -59,6 +59,12 @@ fn render_favorites_gallery(
             } else {
                 bm.name.to_lowercase().contains(&search_query)
                     || bm.config.summary().to_lowercase().contains(&search_query)
+                    || bm
+                        .config
+                        .kind()
+                        .short_tag()
+                        .to_lowercase()
+                        .contains(&search_query)
             }
         })
         .cloned()
@@ -149,14 +155,41 @@ fn render_favorites_header(
                         ),
                 )
                 .child(
-                    Button::new("reset-quick-connect")
-                        .xsmall()
-                        .secondary()
-                        .icon(IconName::Plus)
-                        .label(t.new_blank_conn_btn())
-                        .on_click(cx.listener(move |this, _ev, window, cx| {
-                            this.reset_form_for_new_connection(tab_idx, window, cx);
-                        })),
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(
+                            Button::new("import-bookmarks-btn")
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::FolderOpen)
+                                .label(t.import_bookmarks_btn())
+                                .tooltip(t.import_bookmarks_tooltip())
+                                .on_click(cx.listener(move |this, _ev, _window, cx| {
+                                    this.import_bookmarks_dialog(tab_idx, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("export-bookmarks-btn")
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::ExternalLink)
+                                .label(t.export_bookmarks_btn())
+                                .tooltip(t.export_bookmarks_tooltip())
+                                .on_click(cx.listener(move |this, _ev, _window, cx| {
+                                    this.export_bookmarks_dialog(tab_idx, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("reset-quick-connect")
+                                .xsmall()
+                                .secondary()
+                                .icon(IconName::Plus)
+                                .label(t.new_blank_conn_btn())
+                                .on_click(cx.listener(move |this, _ev, window, cx| {
+                                    this.reset_form_for_new_connection(tab_idx, window, cx);
+                                })),
+                        ),
                 ),
         )
         .child(
@@ -238,8 +271,11 @@ fn render_favorites_list(
         .w_full()
         .p_3()
         .gap_2()
-        .overflow_y_scrollbar()
+        .on_click(cx.listener(move |this, _ev, window, cx| {
+            this.reset_form_for_new_connection(tab_idx, window, cx);
+        }))
         .children(children)
+        .overflow_y_scrollbar()
         .into_any_element()
 }
 
@@ -257,11 +293,7 @@ fn render_bookmark_card(
     let bm_connect = bm.clone();
     let proto = bm.config.kind();
     let (proto_icon, proto_color) = protocol_icon_and_color(proto);
-    let proto_tag = match proto {
-        ProtocolKind::Sftp => "SFTP",
-        ProtocolKind::S3 => "S3",
-        ProtocolKind::Smb => "SMB",
-    };
+    let proto_tag = proto.short_tag();
 
     h_flex()
         .id(("fav-server-card", bm_idx))
@@ -289,11 +321,13 @@ fn render_bookmark_card(
         .justify_between()
         .items_center()
         .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(
             move |this, ev: &gpui::ClickEvent, window, cx| {
+                cx.stop_propagation();
                 this.load_bookmark_into_form(tab_idx, &bm_select, window, cx);
                 if ev.click_count() >= 2 && !this.tabs[tab_idx].is_connecting {
-                    this.connect_tab(tab_idx, cx);
+                    this.connect_tab(tab_idx, window, cx);
                 }
             },
         ))
@@ -352,6 +386,7 @@ fn render_bookmark_card(
             h_flex()
                 .gap_1p5()
                 .items_center()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     Button::new(("conn-bm", bm_idx))
                         .xsmall()
@@ -360,9 +395,10 @@ fn render_bookmark_card(
                         .loading(is_card_connecting)
                         .label(t.connect_short_btn())
                         .on_click(cx.listener(move |this, _ev, window, cx| {
+                            cx.stop_propagation();
                             if !this.tabs[tab_idx].is_connecting {
                                 this.load_bookmark_into_form(tab_idx, &bm_connect, window, cx);
-                                this.connect_tab(tab_idx, cx);
+                                this.connect_tab(tab_idx, window, cx);
                             }
                         })),
                 )
@@ -372,12 +408,14 @@ fn render_bookmark_card(
                         .ghost()
                         .icon(IconName::Trash)
                         .tooltip(t.remove_favorite_tooltip())
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                        .on_click(cx.listener(move |this, _ev, window, cx| {
+                            cx.stop_propagation();
                             let _ = this.bookmark_store.remove(bm_id);
                             if this.tabs[tab_idx].form.bookmark_id == Some(bm_id) {
-                                this.tabs[tab_idx].form.bookmark_id = None;
+                                this.reset_form_for_new_connection(tab_idx, window, cx);
+                            } else {
+                                cx.notify();
                             }
-                            cx.notify();
                         })),
                 ),
         )
@@ -396,7 +434,7 @@ fn render_quick_connect_inspector(
     let is_connecting = tab.is_connecting;
 
     let header = render_inspector_header(tab_idx, has_bookmark, active_protocol, cx);
-    let body = render_inspector_body(tab_idx, form, cx);
+    let body = render_inspector_body(tab_idx, form, is_connecting, cx);
     let status_banner =
         render_inspector_status_banner(tab_idx, is_connecting, tab.status_message.as_deref(), cx);
     let footer = render_inspector_footer(tab_idx, is_connecting, cx);
@@ -491,6 +529,36 @@ fn render_inspector_header(
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
+    let proto_defs = [
+        ("proto-sftp", ProtocolKind::Sftp, IconName::Terminal, t.proto_sftp_label()),
+        ("proto-ftp", ProtocolKind::Ftp, IconName::Server, t.proto_ftp_label()),
+        ("proto-s3", ProtocolKind::S3, IconName::Cloud, t.proto_s3_label()),
+        ("proto-smb", ProtocolKind::Smb, IconName::HardDrive, t.proto_smb_label()),
+        ("proto-webdav", ProtocolKind::WebDav, IconName::Globe, t.proto_webdav_label()),
+        ("proto-gdrive", ProtocolKind::GoogleDrive, IconName::FolderClosed, t.proto_gdrive_label()),
+        ("proto-onedrive", ProtocolKind::OneDrive, IconName::Database, t.proto_onedrive_label()),
+    ];
+
+    let proto_buttons: Vec<AnyElement> = proto_defs
+        .into_iter()
+        .map(|(btn_id, proto, icon, label)| {
+            Button::new(btn_id)
+                .xsmall()
+                .icon(icon)
+                .with_variant(if active_protocol == proto {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .label(label)
+                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                    this.tabs[tab_idx].form.protocol = proto;
+                    cx.notify();
+                }))
+                .into_any_element()
+        })
+        .collect();
+
     v_flex()
         .w_full()
         .px_6()
@@ -534,64 +602,12 @@ fn render_inspector_header(
                 .w_full()
                 .p_1()
                 .gap_1()
+                .flex_wrap()
                 .rounded(px(8.0))
                 .bg(bg_canvas())
                 .border_1()
                 .border_color(border_subtle())
-                .child(
-                    div().flex_1().child(
-                        Button::new("proto-sftp")
-                            .small()
-                            .w_full()
-                            .icon(IconName::Terminal)
-                            .with_variant(if active_protocol == ProtocolKind::Sftp {
-                                ButtonVariant::Primary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .label(t.proto_sftp_label())
-                            .on_click(cx.listener(move |this, _ev, _win, cx| {
-                                this.tabs[tab_idx].form.protocol = ProtocolKind::Sftp;
-                                cx.notify();
-                            })),
-                    ),
-                )
-                .child(
-                    div().flex_1().child(
-                        Button::new("proto-s3")
-                            .small()
-                            .w_full()
-                            .icon(IconName::Cloud)
-                            .with_variant(if active_protocol == ProtocolKind::S3 {
-                                ButtonVariant::Primary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .label(t.proto_s3_label())
-                            .on_click(cx.listener(move |this, _ev, _win, cx| {
-                                this.tabs[tab_idx].form.protocol = ProtocolKind::S3;
-                                cx.notify();
-                            })),
-                    ),
-                )
-                .child(
-                    div().flex_1().child(
-                        Button::new("proto-smb")
-                            .small()
-                            .w_full()
-                            .icon(IconName::HardDrive)
-                            .with_variant(if active_protocol == ProtocolKind::Smb {
-                                ButtonVariant::Primary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .label(t.proto_smb_label())
-                            .on_click(cx.listener(move |this, _ev, _win, cx| {
-                                this.tabs[tab_idx].form.protocol = ProtocolKind::Smb;
-                                cx.notify();
-                            })),
-                    ),
-                ),
+                .children(proto_buttons),
         )
         .into_any_element()
 }
@@ -599,6 +615,7 @@ fn render_inspector_header(
 fn render_inspector_body(
     tab_idx: usize,
     form: &ConnectionFormInputs,
+    is_connecting: bool,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
@@ -631,8 +648,12 @@ fn render_inspector_body(
 
     let protocol_card = match form.protocol {
         ProtocolKind::Sftp => render_sftp_form_card(form),
+        ProtocolKind::Ftp => render_ftp_form_card(tab_idx, form, cx),
         ProtocolKind::S3 => render_s3_form_card(tab_idx, form, cx),
         ProtocolKind::Smb => render_smb_form_card(form),
+        ProtocolKind::WebDav => render_webdav_form_card(form),
+        ProtocolKind::GoogleDrive => render_gdrive_form_card(tab_idx, form, is_connecting, cx),
+        ProtocolKind::OneDrive => render_onedrive_form_card(tab_idx, form, is_connecting, cx),
     };
 
     v_flex()
@@ -733,6 +754,398 @@ fn render_sftp_form_card(form: &ConnectionFormInputs) -> AnyElement {
         .child(row_host_port)
         .child(row_user_secret)
         .child(row_key_path)
+        .into_any_element()
+}
+
+fn render_ftp_form_card(
+    tab_idx: usize,
+    form: &ConnectionFormInputs,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
+    let t = i18n();
+    let use_tls = form.ftp_use_tls;
+
+    let row_host_port = h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_ftp_host()))
+                .child(
+                    Input::new(&form.ftp_host_input)
+                        .small()
+                        .prefix(Icon::new(IconName::Server).xsmall().text_color(text_muted()))
+                        .cleanable(true),
+                ),
+        )
+        .child(
+            v_flex()
+                .w(px(100.0))
+                .gap_1()
+                .child(field_label(t.label_port()))
+                .child(Input::new(&form.ftp_port_input).small()),
+        )
+        .into_any_element();
+
+    let row_tls = h_flex()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .child(field_label(t.label_ftp_tls_mode()))
+        .child(
+            h_flex()
+                .gap_1p5()
+                .child(
+                    Button::new("ftp-mode-plain")
+                        .xsmall()
+                        .with_variant(if !use_tls {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Secondary
+                        })
+                        .label(t.ftp_mode_plain())
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.tabs[tab_idx].form.ftp_use_tls = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("ftp-mode-tls")
+                        .xsmall()
+                        .with_variant(if use_tls {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Secondary
+                        })
+                        .label(t.ftp_mode_tls())
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.tabs[tab_idx].form.ftp_use_tls = true;
+                            cx.notify();
+                        })),
+                ),
+        )
+        .into_any_element();
+
+    let row_auth = h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_username()))
+                .child(Input::new(&form.ftp_user_input).small().cleanable(true)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_password()))
+                .child(Input::new(&form.secret_input).small().mask_toggle()),
+        )
+        .child(
+            v_flex()
+                .w(px(160.0))
+                .gap_1()
+                .child(field_label(t.label_initial_remote_dir()))
+                .child(
+                    Input::new(&form.initial_path_input)
+                        .small()
+                        .prefix(
+                            Icon::new(IconName::FolderOpen)
+                                .xsmall()
+                                .text_color(text_muted()),
+                        ),
+                ),
+        )
+        .into_any_element();
+
+    v_flex()
+        .w_full()
+        .p_3p5()
+        .gap_3()
+        .rounded(px(8.0))
+        .bg(bg_canvas())
+        .border_1()
+        .border_color(border_subtle())
+        .child(row_host_port)
+        .child(row_tls)
+        .child(row_auth)
+        .into_any_element()
+}
+
+fn render_webdav_form_card(form: &ConnectionFormInputs) -> AnyElement {
+    let t = i18n();
+    let row_endpoint = v_flex()
+        .w_full()
+        .gap_1()
+        .child(field_label(t.label_webdav_endpoint()))
+        .child(
+            Input::new(&form.webdav_endpoint_input)
+                .small()
+                .prefix(Icon::new(IconName::Globe).xsmall().text_color(text_muted()))
+                .cleanable(true),
+        )
+        .into_any_element();
+
+    let row_auth = h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_username()))
+                .child(Input::new(&form.webdav_user_input).small().cleanable(true)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_password()))
+                .child(Input::new(&form.secret_input).small().mask_toggle()),
+        )
+        .child(
+            v_flex()
+                .w(px(160.0))
+                .gap_1()
+                .child(field_label(t.label_initial_remote_dir()))
+                .child(
+                    Input::new(&form.initial_path_input)
+                        .small()
+                        .prefix(
+                            Icon::new(IconName::FolderOpen)
+                                .xsmall()
+                                .text_color(text_muted()),
+                        ),
+                ),
+        )
+        .into_any_element();
+
+    v_flex()
+        .w_full()
+        .p_3p5()
+        .gap_3()
+        .rounded(px(8.0))
+        .bg(bg_canvas())
+        .border_1()
+        .border_color(border_subtle())
+        .child(row_endpoint)
+        .child(row_auth)
+        .into_any_element()
+}
+
+fn render_gdrive_form_card(
+    tab_idx: usize,
+    form: &ConnectionFormInputs,
+    is_connecting: bool,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
+    let t = i18n();
+    let oauth_banner = h_flex()
+        .w_full()
+        .p_2p5()
+        .gap_3()
+        .rounded(px(8.0))
+        .bg(bg_elevated())
+        .border_1()
+        .border_color(border_subtle())
+        .justify_between()
+        .items_center()
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(text_secondary())
+                .child(t.label_oauth_refresh_token()),
+        )
+        .child(
+            Button::new("authorize-gdrive-btn")
+                .xsmall()
+                .primary()
+                .icon(IconName::ExternalLink)
+                .loading(is_connecting)
+                .label(t.oauth_browser_btn())
+                .on_click(cx.listener(move |this, _ev, window, cx| {
+                    this.authorize_oauth_in_browser(tab_idx, window, cx);
+                })),
+        )
+        .into_any_element();
+
+    let row_proxy = v_flex()
+        .w_full()
+        .gap_1()
+        .child(field_label(t.label_proxy_url()))
+        .child(
+            Input::new(&form.gdrive_proxy_input)
+                .small()
+                .prefix(Icon::new(IconName::Network).xsmall().text_color(text_muted()))
+                .cleanable(true),
+        )
+        .into_any_element();
+
+    let row_token_dir = h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_oauth_refresh_token()))
+                .child(Input::new(&form.secret_input).small().mask_toggle()),
+        )
+        .child(
+            v_flex()
+                .w(px(160.0))
+                .gap_1()
+                .child(field_label(t.label_initial_remote_dir()))
+                .child(
+                    Input::new(&form.initial_path_input)
+                        .small()
+                        .prefix(
+                            Icon::new(IconName::FolderOpen)
+                                .xsmall()
+                                .text_color(text_muted()),
+                        ),
+                ),
+        )
+        .into_any_element();
+
+    let row_custom_client = h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_oauth_client_id()))
+                .child(
+                    Input::new(&form.gdrive_client_id_input)
+                        .small()
+                        .prefix(Icon::new(IconName::Key).xsmall().text_color(text_muted()))
+                        .cleanable(true),
+                ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_oauth_client_secret()))
+                .child(Input::new(&form.gdrive_client_secret_input).small().mask_toggle()),
+        )
+        .into_any_element();
+
+    v_flex()
+        .w_full()
+        .p_3p5()
+        .gap_3()
+        .rounded(px(8.0))
+        .bg(bg_canvas())
+        .border_1()
+        .border_color(border_subtle())
+        .child(oauth_banner)
+        .child(row_proxy)
+        .child(row_token_dir)
+        .child(row_custom_client)
+        .into_any_element()
+}
+
+fn render_onedrive_form_card(
+    tab_idx: usize,
+    form: &ConnectionFormInputs,
+    is_connecting: bool,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
+    let t = i18n();
+    let oauth_banner = h_flex()
+        .w_full()
+        .p_2p5()
+        .gap_3()
+        .rounded(px(8.0))
+        .bg(bg_elevated())
+        .border_1()
+        .border_color(border_subtle())
+        .justify_between()
+        .items_center()
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(text_secondary())
+                .child(t.label_oauth_refresh_token()),
+        )
+        .child(
+            Button::new("authorize-onedrive-btn")
+                .xsmall()
+                .primary()
+                .icon(IconName::ExternalLink)
+                .loading(is_connecting)
+                .label(t.oauth_browser_btn())
+                .on_click(cx.listener(move |this, _ev, window, cx| {
+                    this.authorize_oauth_in_browser(tab_idx, window, cx);
+                })),
+        )
+        .into_any_element();
+
+    let row_proxy = v_flex()
+        .w_full()
+        .gap_1()
+        .child(field_label(t.label_proxy_url()))
+        .child(
+            Input::new(&form.onedrive_proxy_input)
+                .small()
+                .prefix(Icon::new(IconName::Network).xsmall().text_color(text_muted()))
+                .cleanable(true),
+        )
+        .into_any_element();
+
+    let row_token_dir = h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_oauth_refresh_token()))
+                .child(Input::new(&form.secret_input).small().mask_toggle()),
+        )
+        .child(
+            v_flex()
+                .w(px(160.0))
+                .gap_1()
+                .child(field_label(t.label_initial_remote_dir()))
+                .child(
+                    Input::new(&form.initial_path_input)
+                        .small()
+                        .prefix(
+                            Icon::new(IconName::FolderOpen)
+                                .xsmall()
+                                .text_color(text_muted()),
+                        ),
+                ),
+        )
+        .into_any_element();
+
+    let row_custom_client = v_flex()
+        .w_full()
+        .gap_1()
+        .child(field_label(t.label_oauth_client_id()))
+        .child(
+            Input::new(&form.onedrive_client_id_input)
+                .small()
+                .prefix(Icon::new(IconName::Key).xsmall().text_color(text_muted()))
+                .cleanable(true),
+        )
+        .into_any_element();
+
+    v_flex()
+        .w_full()
+        .p_3p5()
+        .gap_3()
+        .rounded(px(8.0))
+        .bg(bg_canvas())
+        .border_1()
+        .border_color(border_subtle())
+        .child(oauth_banner)
+        .child(row_proxy)
+        .child(row_token_dir)
+        .child(row_custom_client)
         .into_any_element()
 }
 
@@ -1055,8 +1468,8 @@ fn render_inspector_footer(
                         .icon(IconName::CircleCheck)
                         .loading(is_connecting)
                         .label(t.test_conn_btn())
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
-                            this.test_connection_tab(tab_idx, cx);
+                        .on_click(cx.listener(move |this, _ev, window, cx| {
+                            this.test_connection_tab(tab_idx, window, cx);
                         })),
                 )
                 .child(
@@ -1077,8 +1490,8 @@ fn render_inspector_footer(
                 .icon(IconName::Play)
                 .loading(is_connecting)
                 .label(t.connect_now_btn(is_connecting))
-                .on_click(cx.listener(move |this, _ev, _win, cx| {
-                    this.connect_tab(tab_idx, cx);
+                .on_click(cx.listener(move |this, _ev, window, cx| {
+                    this.connect_tab(tab_idx, window, cx);
                 })),
         )
         .into_any_element()

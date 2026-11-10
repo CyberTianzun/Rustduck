@@ -260,8 +260,12 @@ pub fn entry_icon_and_color(entry: &FileEntry) -> (IconName, Hsla) {
 pub fn protocol_icon_and_color(protocol: ProtocolKind) -> (IconName, Hsla) {
     match protocol {
         ProtocolKind::Sftp => (IconName::Terminal, accent_green()),
+        ProtocolKind::Ftp => (IconName::Server, accent_blue()),
         ProtocolKind::S3 => (IconName::Cloud, accent_amber()),
         ProtocolKind::Smb => (IconName::HardDrive, accent_purple()),
+        ProtocolKind::WebDav => (IconName::Globe, accent_blue()),
+        ProtocolKind::GoogleDrive => (IconName::Cloud, accent_green()),
+        ProtocolKind::OneDrive => (IconName::Cloud, accent_blue()),
     }
 }
 

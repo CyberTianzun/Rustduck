@@ -431,8 +431,12 @@ fn render_language_card(
 fn render_about_settings() -> AnyElement {
     let t = i18n();
     let (sftp_icon, sftp_col) = protocol_icon_and_color(ProtocolKind::Sftp);
+    let (ftp_icon, ftp_col) = protocol_icon_and_color(ProtocolKind::Ftp);
     let (s3_icon, s3_col) = protocol_icon_and_color(ProtocolKind::S3);
     let (smb_icon, smb_col) = protocol_icon_and_color(ProtocolKind::Smb);
+    let (webdav_icon, webdav_col) = protocol_icon_and_color(ProtocolKind::WebDav);
+    let (gdrive_icon, gdrive_col) = protocol_icon_and_color(ProtocolKind::GoogleDrive);
+    let (onedrive_icon, onedrive_col) = protocol_icon_and_color(ProtocolKind::OneDrive);
 
     let brand_card = h_flex()
         .w_full()
@@ -501,8 +505,12 @@ fn render_about_settings() -> AnyElement {
                 .gap_2()
                 .flex_wrap()
                 .child(render_protocol_pill(sftp_icon, sftp_col, t.proto_sftp_label()))
+                .child(render_protocol_pill(ftp_icon, ftp_col, t.proto_ftp_label()))
                 .child(render_protocol_pill(s3_icon, s3_col, t.proto_s3_label()))
-                .child(render_protocol_pill(smb_icon, smb_col, t.proto_smb_label())),
+                .child(render_protocol_pill(smb_icon, smb_col, t.proto_smb_label()))
+                .child(render_protocol_pill(webdav_icon, webdav_col, t.proto_webdav_label()))
+                .child(render_protocol_pill(gdrive_icon, gdrive_col, t.proto_gdrive_label()))
+                .child(render_protocol_pill(onedrive_icon, onedrive_col, t.proto_onedrive_label())),
         );
 
     let updates_card = v_flex()

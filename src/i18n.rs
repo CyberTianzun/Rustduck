@@ -1219,6 +1219,232 @@ impl I18n {
             "Remote directory synced".to_string()
         }
     }
+
+    // --- Import / Export Bookmarks ---
+    pub fn import_bookmarks_btn(&self) -> &'static str {
+        if self.is_zh() {
+            "导入"
+        } else {
+            "Import"
+        }
+    }
+
+    pub fn export_bookmarks_btn(&self) -> &'static str {
+        if self.is_zh() {
+            "导出"
+        } else {
+            "Export"
+        }
+    }
+
+    pub fn import_bookmarks_tooltip(&self) -> &'static str {
+        if self.is_zh() {
+            "从 JSON 备份文件导入连接配置与密钥"
+        } else {
+            "Import connections and credentials from a JSON backup file"
+        }
+    }
+
+    pub fn export_bookmarks_tooltip(&self) -> &'static str {
+        if self.is_zh() {
+            "将收藏夹连接与密钥导出为 JSON 文件以便迁移到其他电脑"
+        } else {
+            "Export saved connections and credentials to a JSON file for another computer"
+        }
+    }
+
+    pub fn msg_exported_bookmarks(&self, count: usize, path: &str) -> String {
+        if self.is_zh() {
+            format!("已成功导出 {count} 个连接配置至: {path}")
+        } else {
+            format!("Exported {count} connections to: {path}")
+        }
+    }
+
+    pub fn msg_export_failed(&self, err: &dyn std::fmt::Display) -> String {
+        if self.is_zh() {
+            format!("导出连接失败: {err}")
+        } else {
+            format!("Failed to export connections: {err}")
+        }
+    }
+
+    pub fn msg_imported_bookmarks(&self, count: usize) -> String {
+        if self.is_zh() {
+            format!("已成功导入 {count} 个连接配置（含密钥凭据）")
+        } else {
+            format!("Successfully imported {count} connections (with credentials)")
+        }
+    }
+
+    pub fn msg_import_failed(&self, err: &dyn std::fmt::Display) -> String {
+        if self.is_zh() {
+            format!("导入连接失败: {err}")
+        } else {
+            format!("Failed to import connections: {err}")
+        }
+    }
+
+    // --- Extended Protocols (FTP, WebDAV, Google Drive, OneDrive) ---
+    pub fn proto_ftp_label(&self) -> &'static str {
+        "FTP / FTPS"
+    }
+
+    pub fn proto_webdav_label(&self) -> &'static str {
+        "WebDAV"
+    }
+
+    pub fn proto_gdrive_label(&self) -> &'static str {
+        "Google Drive"
+    }
+
+    pub fn proto_onedrive_label(&self) -> &'static str {
+        "OneDrive"
+    }
+
+    pub fn label_ftp_host(&self) -> &'static str {
+        if self.is_zh() {
+            "FTP 主机地址 (Host / IP)"
+        } else {
+            "FTP Host / IP"
+        }
+    }
+
+    pub fn placeholder_ftp_host(&self) -> &'static str {
+        if self.is_zh() {
+            "例如: ftp.example.com"
+        } else {
+            "e.g. ftp.example.com"
+        }
+    }
+
+    pub fn label_ftp_tls_mode(&self) -> &'static str {
+        if self.is_zh() {
+            "加密传输模式 (FTP / FTPS)"
+        } else {
+            "Encryption Mode (FTP / FTPS)"
+        }
+    }
+
+    pub fn ftp_mode_plain(&self) -> &'static str {
+        if self.is_zh() {
+            "标准明文 FTP"
+        } else {
+            "Plain FTP"
+        }
+    }
+
+    pub fn ftp_mode_tls(&self) -> &'static str {
+        if self.is_zh() {
+            "FTPS (TLS 加密)"
+        } else {
+            "FTPS (Explicit/Implicit TLS)"
+        }
+    }
+
+    pub fn label_webdav_endpoint(&self) -> &'static str {
+        if self.is_zh() {
+            "WebDAV 服务端点 URL (支持 HTTP / HTTPS)"
+        } else {
+            "WebDAV Server Endpoint URL (HTTP / HTTPS)"
+        }
+    }
+
+    pub fn placeholder_webdav_endpoint(&self) -> &'static str {
+        if self.is_zh() {
+            "例如: https://dav.example.com/remote.php/webdav"
+        } else {
+            "e.g. https://dav.example.com/remote.php/webdav"
+        }
+    }
+
+    pub fn label_proxy_url(&self) -> &'static str {
+        if self.is_zh() {
+            "网络代理地址 (Proxy，支持 HTTP / HTTPS / SOCKS5)"
+        } else {
+            "Proxy Server URL (Supports HTTP / HTTPS / SOCKS5)"
+        }
+    }
+
+    pub fn placeholder_proxy_url(&self) -> &'static str {
+        if self.is_zh() {
+            "选填: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+        } else {
+            "Optional: http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
+        }
+    }
+
+    pub fn label_oauth_client_id(&self) -> &'static str {
+        if self.is_zh() {
+            "OAuth Client ID (选填，留空使用内置桌面端 Client ID)"
+        } else {
+            "OAuth Client ID (Optional, leave empty for built-in default)"
+        }
+    }
+
+    pub fn placeholder_oauth_client_id(&self) -> &'static str {
+        if self.is_zh() {
+            "选填: 自定义 OAuth Client ID"
+        } else {
+            "Optional: Custom OAuth Client ID"
+        }
+    }
+
+    pub fn label_oauth_client_secret(&self) -> &'static str {
+        if self.is_zh() {
+            "OAuth Client Secret (选填)"
+        } else {
+            "OAuth Client Secret (Optional)"
+        }
+    }
+
+    pub fn placeholder_oauth_client_secret(&self) -> &'static str {
+        if self.is_zh() {
+            "选填: 自定义 Client Secret"
+        } else {
+            "Optional: Custom Client Secret"
+        }
+    }
+
+    pub fn label_oauth_refresh_token(&self) -> &'static str {
+        if self.is_zh() {
+            "授权凭证 (Refresh Token，点击下方按钮通过浏览器自动获取)"
+        } else {
+            "OAuth Refresh Token (Click button below to authorize in browser)"
+        }
+    }
+
+    pub fn oauth_browser_btn(&self) -> &'static str {
+        if self.is_zh() {
+            "浏览器登录授权 (本地回调)"
+        } else {
+            "Authorize in Browser (Loopback)"
+        }
+    }
+
+    pub fn msg_oauth_authorizing_browser(&self, provider: &str) -> String {
+        if self.is_zh() {
+            format!("已拉起系统浏览器进行 {provider} 登录授权，请在浏览器中完成确认...")
+        } else {
+            format!("Opened browser for {provider} OAuth login — please complete authorization in your browser...")
+        }
+    }
+
+    pub fn msg_oauth_authorized_ok(&self, provider: &str) -> String {
+        if self.is_zh() {
+            format!("{provider} 浏览器回调授权成功！Refresh Token 已自动填入")
+        } else {
+            format!("{provider} browser authorization complete! Refresh Token populated")
+        }
+    }
+
+    pub fn msg_oauth_authorize_failed(&self, provider: &str, err: &dyn std::fmt::Display) -> String {
+        if self.is_zh() {
+            format!("{provider} 浏览器授权失败: {err}")
+        } else {
+            format!("{provider} authorization failed: {err}")
+        }
+    }
 }
 
 #[cfg(test)]

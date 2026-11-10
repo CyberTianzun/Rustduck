@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 futures = "0.3"
@@ -16,19 +17,25 @@ gpui-kit-assets = "0.9.0"
 hex = "0.4"
 hmac = "0.12"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
+open = "5"
 percent-encoding = "2"
 quick-xml = "0.37"
+rand = "0.8"
 raw-window-handle = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks"] }
 russh = "0.50"
 russh-sftp = "2.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 smb = "0.12.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7", features = ["io"] }
+url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+webpki-roots = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
