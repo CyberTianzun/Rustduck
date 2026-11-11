@@ -20,6 +20,11 @@ use gpui_component::{h_flex, v_flex, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const SETTINGS_MODAL_WIDTH_PX: f32 = 820.0;
+pub const SETTINGS_MODAL_HEIGHT_PX: f32 = 620.0;
+pub const SETTINGS_SIDEBAR_WIDTH_PX: f32 = 168.0;
+pub const SETTINGS_CONTENT_WIDTH_PX: f32 =
+    SETTINGS_MODAL_WIDTH_PX - SETTINGS_SIDEBAR_WIDTH_PX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsTab {
@@ -73,7 +78,8 @@ pub fn render_settings_modal(
         );
 
     let sidebar = v_flex()
-        .w(px(156.0))
+        .w(px(SETTINGS_SIDEBAR_WIDTH_PX))
+        .flex_shrink_0()
         .h_full()
         .p_2p5()
         .gap_1()
@@ -104,8 +110,8 @@ pub fn render_settings_modal(
 
     let modal_card = v_flex()
         .id("settings-modal-card")
-        .w(px(640.0))
-        .h(px(520.0))
+        .w(px(SETTINGS_MODAL_WIDTH_PX))
+        .h(px(SETTINGS_MODAL_HEIGHT_PX))
         .rounded(px(12.0))
         .bg(bg_elevated())
         .border_1()
@@ -119,13 +125,18 @@ pub fn render_settings_modal(
             h_flex()
                 .flex_1()
                 .w_full()
+                .min_h_0()
                 .overflow_hidden()
                 .child(sidebar)
                 .child(
                     v_flex()
-                        .flex_1()
+                        .id("settings-modal-content-pane")
+                        .w(px(SETTINGS_CONTENT_WIDTH_PX))
+                        .min_w_0()
+                        .min_h_0()
                         .h_full()
-                        .p_5()
+                        .px_6()
+                        .py_5()
                         .bg(bg_canvas())
                         .overflow_y_scrollbar()
                         .child(content_body),
@@ -352,10 +363,11 @@ fn render_general_settings(
         .child(
             h_flex()
                 .w_full()
+                .min_w_0()
                 .gap_2()
                 .items_center()
                 .child(
-                    div().flex_1().child(
+                    div().flex_1().min_w_0().child(
                         Input::new(&ws.settings_custom_local_dir_input)
                             .small()
                             .prefix(
@@ -386,9 +398,12 @@ fn render_general_settings(
 
     let s3_acl_section = v_flex()
         .w_full()
+        .min_w_0()
         .gap_2p5()
         .child(
             v_flex()
+                .w_full()
+                .min_w_0()
                 .gap_0p5()
                 .child(
                     div()
@@ -399,15 +414,24 @@ fn render_general_settings(
                 )
                 .child(
                     div()
+                        .w_full()
                         .text_xs()
                         .text_color(text_muted())
                         .child(t.settings_section_s3_acl_desc()),
                 ),
         )
-        .child(h_flex().w_full().gap_2().flex_wrap().children(acl_pills));
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .flex_wrap()
+                .children(acl_pills),
+        );
 
     v_flex()
         .w_full()
+        .min_w_0()
         .gap_5()
         .child(theme_section)
         .child(language_section)
@@ -720,6 +744,8 @@ fn render_about_settings(
         )
         .child(
             h_flex()
+                .w_full()
+                .min_w_0()
                 .gap_2()
                 .flex_wrap()
                 .child(render_protocol_pill(sftp_icon, sftp_col, t.proto_sftp_label()))
@@ -835,6 +861,7 @@ fn render_about_settings(
 
     v_flex()
         .w_full()
+        .min_w_0()
         .gap_3p5()
         .child(brand_card)
         .child(protocols_card)
@@ -870,5 +897,26 @@ mod tests {
         assert_eq!(SettingsTab::default(), SettingsTab::General);
         assert_ne!(SettingsTab::General, SettingsTab::About);
         assert!(!APP_VERSION.is_empty());
+    }
+
+    #[test]
+    fn test_settings_modal_dimensions_and_content_width_constraints() {
+        let prod_src = include_str!("settings_modal.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source before #[cfg(test)]");
+        assert!(
+            prod_src.contains("SETTINGS_MODAL_WIDTH_PX: f32 = 820.0"),
+            "Settings modal width must be at least 820px to display all options comfortably"
+        );
+        assert!(
+            prod_src.contains("SETTINGS_MODAL_HEIGHT_PX: f32 = 620.0"),
+            "Settings modal height must be at least 620px to fit all 4 general sections"
+        );
+        assert!(
+            prod_src.contains(".w(px(SETTINGS_CONTENT_WIDTH_PX))")
+                && prod_src.contains(".min_w_0()"),
+            "Settings content pane must have explicit width and min_w_0 so flex_wrap pills do not overflow horizontally"
+        );
     }
 }

@@ -11,20 +11,21 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::ptr::{null, null_mut};
+use std::ptr::null;
+#[cfg(test)]
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect,
-    ScreenToClient, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, TRANSPARENT,
+    ClientToScreen, CreateFontIndirectW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect,
+    InvalidateRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS,
+    DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
-use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Ole::{IDropSource, OleInitialize, OleUninitialize, DROPEFFECT_COPY};
+use windows::Win32::System::Ole::{OleInitialize, OleUninitialize, RevokeDragDrop};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, SetWindowTheme, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT,
     CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, HDITEMW, HDF_LEFT, HDF_RIGHT,
@@ -46,27 +47,29 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_F2,
     VK_RETURN,
 };
+#[cfg(test)]
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 #[cfg(test)]
-use windows::Win32::UI::Shell::{IShellFolder, SHBindToObject, SHBindToParent};
 use windows::Win32::UI::Shell::{
-    DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, ILFindLastID,
-    ILFree, RemoveWindowSubclass, SHCreateDataObject, SHDoDragDrop, SHGetFileInfoW,
-    SHParseDisplayName, SetWindowSubclass, HDROP, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
-    SHGFI_USEFILEATTRIBUTES,
+    ILFindLastID, ILFree, IShellFolder, SHBindToObject, SHBindToParent, SHParseDisplayName,
+};
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint,
+    RemoveWindowSubclass, SHGetFileInfoW, SetWindowSubclass, HDROP, SHFILEINFOW, SHGFI_SMALLICON,
+    SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::WS_POPUP;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetClientRect,
-    GetCursorPos, GetWindowLongW, IsChild, LoadCursorW, PostMessageW, SendMessageW, SetCursor,
+    GetCursorPos, GetWindowLongW, LoadCursorW, PostMessageW, SendMessageW, SetCursor,
     SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    TrackPopupMenuEx, WindowFromPoint, GWL_STYLE, HMENU, IDC_ARROW, IDC_HAND, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DROPFILES,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_NULL, WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN,
-    WS_TABSTOP,
+    TrackPopupMenuEx, GWL_STYLE, HMENU, IDC_ARROW, IDC_HAND, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNOACTIVATE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DROPFILES, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NOTIFY, WM_NULL, WM_RBUTTONDOWN, WM_SETFONT,
+    WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP,
 };
 
 const PARENT_SUBCLASS_ID: usize = 0x5244_0001;
@@ -95,6 +98,29 @@ pub fn can_use_shell_context_menu(current_path: &str, selected_paths: &[String])
         return false;
     }
     !selected_paths.is_empty()
+}
+
+pub fn resolve_drag_source_paths(
+    selected_paths: &[String],
+    dragged_row: i32,
+    has_parent: bool,
+    entries: &[FileEntry],
+) -> Vec<String> {
+    if dragged_row >= 0 {
+        match map_row_index_to_entry(dragged_row as usize, has_parent, entries) {
+            Some(Ok(entry)) => {
+                if matches!(entry.kind, crate::models::FileKind::Bucket) {
+                    return Vec::new();
+                }
+                if selected_paths.iter().any(|p| p == &entry.path) {
+                    return selected_paths.to_vec();
+                }
+                return vec![entry.path.clone()];
+            }
+            _ => return Vec::new(),
+        }
+    }
+    selected_paths.to_vec()
 }
 
 pub struct ShellIconCache {
@@ -244,7 +270,8 @@ impl PaneControlState {
     }
 }
 
-struct ActiveRemoteDrag {
+struct ActivePaneDrag {
+    from_local: bool,
     source_paths: Vec<String>,
 }
 
@@ -256,7 +283,7 @@ struct HostInner {
     left: PaneControlState,
     right: PaneControlState,
     events: NativeEventSink,
-    active_remote_drag: Option<ActiveRemoteDrag>,
+    active_pane_drag: Option<ActivePaneDrag>,
 }
 
 pub struct PlatformHost {
@@ -302,7 +329,7 @@ impl PlatformHost {
             left: PaneControlState::new(),
             right: PaneControlState::new(),
             events: NativeEventSink::default(),
-            active_remote_drag: None,
+            active_pane_drag: None,
         };
 
         Self {
@@ -375,6 +402,9 @@ impl PlatformHost {
             if vis_changed {
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
+                    if parent_hwnd_val != 0 {
+                        let _ = SetFocus(Some(HWND(parent_hwnd_val as *mut c_void)));
+                    }
                 }
             }
             return;
@@ -478,13 +508,21 @@ impl PlatformHost {
     }
 
     pub fn hide_all(&self) {
-        let (left_hwnd, right_hwnd) = {
+        let (left_hwnd, right_hwnd, parent_hwnd_val) = {
             let mut guard = self.state.lock().unwrap();
-            (guard.left.take_hide_hwnd(), guard.right.take_hide_hwnd())
+            (
+                guard.left.take_hide_hwnd(),
+                guard.right.take_hide_hwnd(),
+                guard.parent_hwnd,
+            )
         };
+        let any_hidden = left_hwnd.is_some() || right_hwnd.is_some();
         unsafe {
             for hwnd in [left_hwnd, right_hwnd].into_iter().flatten() {
                 let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            if any_hidden && parent_hwnd_val != 0 {
+                let _ = SetFocus(Some(HWND(parent_hwnd_val as *mut c_void)));
             }
         }
     }
@@ -537,6 +575,9 @@ impl PlatformHost {
             if (style & WS_CLIPCHILDREN.0) == 0 {
                 SetWindowLongW(parent_hwnd, GWL_STYLE, (style | WS_CLIPCHILDREN.0) as i32);
             }
+            // Revoke GPUI's default OLE IDropTarget on parent_hwnd so WM_DROPFILES (DragAcceptFiles)
+            // reaches the native child ListViews when dragging from Windows Explorer.
+            let _ = RevokeDragDrop(parent_hwnd);
         }
 
         let ctx_ptr = Box::into_raw(Box::new(SubclassContext {
@@ -699,12 +740,15 @@ fn create_single_listview(
     hwnd
 }
 
+pub const MODIFIED_COLUMN_WIDTH_PX: i32 = 175;
+pub const SIZE_COLUMN_WIDTH_PX: i32 = 100;
+
 fn insert_initial_columns(hwnd: HWND) {
     let t = i18n();
     let cols = [
         (t.col_name(), 260, LVCFMT_LEFT),
-        (t.col_modified(), 145, LVCFMT_LEFT),
-        (t.col_size(), 95, LVCFMT_RIGHT),
+        (t.col_modified(), MODIFIED_COLUMN_WIDTH_PX, LVCFMT_LEFT),
+        (t.col_size(), SIZE_COLUMN_WIDTH_PX, LVCFMT_RIGHT),
     ];
     for (idx, (label, width, fmt)) in cols.into_iter().enumerate() {
         let mut wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
@@ -722,8 +766,8 @@ fn insert_initial_columns(hwnd: HWND) {
 }
 
 fn resize_columns_to_width(hwnd: HWND, total_width: i32) {
-    let mod_w = 145;
-    let size_w = 95;
+    let mod_w = MODIFIED_COLUMN_WIDTH_PX;
+    let size_w = SIZE_COLUMN_WIDTH_PX;
     let scrollbar_pad = 22;
     let name_w = (total_width - mod_w - size_w - scrollbar_pad).max(120);
     unsafe {
@@ -909,6 +953,9 @@ unsafe extern "system" fn parent_subclass_proc(
     _uidsubclass: usize,
     dwrefdata: usize,
 ) -> LRESULT {
+    if matches!(umsg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+        let _ = SetFocus(Some(hwnd));
+    }
     if umsg == WM_NOTIFY && lparam.0 != 0 && dwrefdata != 0 {
         let ctx = &*(dwrefdata as *const SubclassContext);
         if let Some(state) = ctx.state.upgrade() {
@@ -1276,7 +1323,7 @@ unsafe extern "system" fn child_subclass_proc(
                     return LRESULT(0);
                 }
                 WM_MOUSEMOVE => {
-                    let has_drag = state.lock().unwrap().active_remote_drag.is_some();
+                    let has_drag = state.lock().unwrap().active_pane_drag.is_some();
                     if has_drag {
                         if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
                             SetCursor(Some(cursor));
@@ -1285,18 +1332,28 @@ unsafe extern "system" fn child_subclass_proc(
                     }
                 }
                 WM_LBUTTONUP => {
-                    let drag_opt = state.lock().unwrap().active_remote_drag.take();
+                    let drag_opt = state.lock().unwrap().active_pane_drag.take();
                     if let Some(drag) = drag_opt {
                         let _ = ReleaseCapture();
                         if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
                             SetCursor(Some(cursor));
                         }
-                        finish_remote_to_local_drag(&state, drag.source_paths);
+                        let mut drop_screen_pt = POINT {
+                            x: (lparam.0 & 0xFFFF) as i16 as i32,
+                            y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                        };
+                        let _ = ClientToScreen(hwnd, &mut drop_screen_pt);
+                        finish_pane_drag(
+                            &state,
+                            drag.from_local,
+                            drag.source_paths,
+                            drop_screen_pt,
+                        );
                         return LRESULT(0);
                     }
                 }
                 WM_CAPTURECHANGED => {
-                    state.lock().unwrap().active_remote_drag = None;
+                    state.lock().unwrap().active_pane_drag = None;
                 }
                 _ => {}
             }
@@ -1514,29 +1571,30 @@ unsafe fn start_pane_drag(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, 
         )
     };
 
-    let mut selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
-    if selected_paths.is_empty() && dragged_row >= 0 {
-        if let Some(Ok(e)) = map_row_index_to_entry(dragged_row as usize, has_parent, &entries) {
-            selected_paths.push(e.path.clone());
-        }
-    }
-
-    if selected_paths.is_empty() {
+    if is_local && current_path.trim() == "/" {
         return;
     }
 
-    if is_local && current_path != "/" {
-        let _ = run_local_shell_drag(&current_path, &selected_paths, lv_hwnd);
-    } else if !is_local {
-        state.lock().unwrap().active_remote_drag = Some(ActiveRemoteDrag {
-            source_paths: selected_paths,
-        });
-        SetCapture(lv_hwnd);
+    let selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
+    let source_paths = resolve_drag_source_paths(&selected_paths, dragged_row, has_parent, &entries);
+    if source_paths.is_empty() {
+        return;
+    }
+
+    state.lock().unwrap().active_pane_drag = Some(ActivePaneDrag {
+        from_local: is_local,
+        source_paths,
+    });
+    SetCapture(lv_hwnd);
+    if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+        SetCursor(Some(cursor));
     }
 }
 
+#[cfg(test)]
 struct PidlListGuard(Vec<*mut ITEMIDLIST>);
 
+#[cfg(test)]
 impl PidlListGuard {
     fn new() -> Self {
         Self(Vec::new())
@@ -1549,6 +1607,7 @@ impl PidlListGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for PidlListGuard {
     fn drop(&mut self) {
         unsafe {
@@ -1561,98 +1620,68 @@ impl Drop for PidlListGuard {
     }
 }
 
-unsafe fn run_local_shell_drag(
-    parent_dir: &str,
-    file_paths: &[String],
-    hwnd: HWND,
-) -> anyhow::Result<()> {
-    let mut guard = PidlListGuard::new();
-    let parent_wide: Vec<u16> = parent_dir.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut parent_pidl: *mut ITEMIDLIST = null_mut();
-    SHParseDisplayName(
-        PCWSTR(parent_wide.as_ptr()),
-        None,
-        &mut parent_pidl,
-        0,
-        None,
-    )?;
-    guard.push(parent_pidl);
-
-    let mut child_pidls: Vec<*const ITEMIDLIST> = Vec::new();
-    for path in file_paths {
-        let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut pidl: *mut ITEMIDLIST = null_mut();
-        if SHParseDisplayName(PCWSTR(wpath.as_ptr()), None, &mut pidl, 0, None).is_ok()
-            && !pidl.is_null()
-        {
-            guard.push(pidl);
-            child_pidls.push(ILFindLastID(pidl) as *const ITEMIDLIST);
-        }
-    }
-
-    if !child_pidls.is_empty() {
-        if let Ok(data_obj) = SHCreateDataObject::<_, IDataObject>(
-            Some(parent_pidl as *const ITEMIDLIST),
-            Some(&child_pidls),
-            None::<&IDataObject>,
-        ) {
-            let _ = SHDoDragDrop(Some(hwnd), &data_obj, None::<&IDropSource>, DROPEFFECT_COPY);
-        }
-    }
-
-    Ok(())
-}
-
-unsafe fn finish_remote_to_local_drag(
+unsafe fn finish_pane_drag(
     state: &Arc<Mutex<HostInner>>,
+    from_local: bool,
     source_paths: Vec<String>,
+    screen_pt: POINT,
 ) {
-    let mut screen_pt = POINT::default();
-    if GetCursorPos(&mut screen_pt).is_err() {
-        return;
-    }
-    let target_hwnd = WindowFromPoint(screen_pt);
-    if target_hwnd.0.is_null() {
-        return;
-    }
-
-    let (left_hwnd, left_path) = {
+    let target_is_local = !from_local;
+    let (target_hwnd, target_visible) = {
         let guard = state.lock().unwrap();
-        (
-            HWND(guard.left.hwnd as *mut c_void),
-            guard.left.current_path.clone(),
-        )
+        let pane = if target_is_local {
+            &guard.left
+        } else {
+            &guard.right
+        };
+        (HWND(pane.hwnd as *mut c_void), pane.visible)
     };
-    if left_hwnd.0.is_null() {
-        return;
-    }
-
-    let is_over_left = target_hwnd == left_hwnd || IsChild(left_hwnd, target_hwnd).as_bool();
-    if !is_over_left || left_path == "/" {
+    if target_hwnd.0.is_null() || !target_visible {
         return;
     }
 
     let mut client_pt = screen_pt;
-    let _ = ScreenToClient(left_hwnd, &mut client_pt);
+    let _ = ScreenToClient(target_hwnd, &mut client_pt);
+    let mut client_rc = RECT::default();
+    if GetClientRect(target_hwnd, &mut client_rc).is_err() {
+        return;
+    }
+    if client_pt.x < client_rc.left
+        || client_pt.x >= client_rc.right
+        || client_pt.y < client_rc.top
+        || client_pt.y >= client_rc.bottom
+    {
+        return;
+    }
+
     let mut hti = LVHITTESTINFO {
         pt: client_pt,
         ..Default::default()
     };
-    let hit_row = send_msg(left_hwnd, LVM_HITTEST, 0, &mut hti as *mut _ as isize).0;
+    let hit_row = send_msg(target_hwnd, LVM_HITTEST, 0, &mut hti as *mut _ as isize).0;
 
     let mut guard = state.lock().unwrap();
+    let pane = if target_is_local {
+        &guard.left
+    } else {
+        &guard.right
+    };
     let hovered_entry = if hit_row >= 0 {
-        match map_row_index_to_entry(hit_row as usize, guard.left.has_parent, &guard.left.entries) {
+        match map_row_index_to_entry(hit_row as usize, pane.has_parent, &pane.entries) {
             Some(Ok(e)) => Some(e),
             _ => None,
         }
     } else {
         None
     };
-    let dest_dir = resolve_drop_destination_dir(&guard.left.current_path, hovered_entry, true);
+    let dest_dir =
+        resolve_drop_destination_dir(&pane.current_path, hovered_entry, target_is_local);
+    if target_is_local && dest_dir.trim() == "/" {
+        return;
+    }
 
     guard.events.push(NativePaneEvent::FilesDropped {
-        target_is_local: true,
+        target_is_local,
         source_paths,
         target_dir_override: Some(dest_dir),
     });
@@ -2174,5 +2203,191 @@ mod tests {
                 "NM_RCLICK must post WM_APP_SHOW_CONTEXT_MENU to lv_hwnd so WM_RBUTTONDOWN unwinds first"
             );
         }
+    }
+
+    #[test]
+    fn test_resolve_drag_source_paths_handles_unselected_row_multi_select_and_parent_row() {
+        use crate::models::FileKind;
+
+        let entries = vec![
+            FileEntry {
+                name: "a.txt".into(),
+                path: r"C:\work\a.txt".into(),
+                kind: FileKind::File,
+                size: 10,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "b.txt".into(),
+                path: r"C:\work\b.txt".into(),
+                kind: FileKind::File,
+                size: 20,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "my-bucket".into(),
+                path: "/my-bucket".into(),
+                kind: FileKind::Bucket,
+                size: 0,
+                modified_unix: None,
+                permissions: None,
+            },
+        ];
+
+        // Row 0 is ".." when has_parent == true -> must not drag anything even if a.txt is selected
+        assert!(
+            resolve_drag_source_paths(&[r"C:\work\a.txt".to_string()], 0, true, &entries)
+                .is_empty()
+        );
+
+        // Dragging unselected row 2 ("b.txt" when has_parent == true) while "a.txt" was selected -> drags "b.txt"
+        assert_eq!(
+            resolve_drag_source_paths(&[r"C:\work\a.txt".to_string()], 2, true, &entries),
+            vec![r"C:\work\b.txt".to_string()]
+        );
+
+        // Dragging selected row 1 ("a.txt" when has_parent == true) in a multi-selection -> drags entire selection
+        let multi = vec![r"C:\work\a.txt".to_string(), r"C:\work\b.txt".to_string()];
+        assert_eq!(
+            resolve_drag_source_paths(&multi, 1, true, &entries),
+            multi
+        );
+
+        // Dragging a bucket row (row 3 when has_parent == true) -> must not drag
+        assert!(resolve_drag_source_paths(&[], 3, true, &entries).is_empty());
+    }
+
+    #[test]
+    fn test_left_to_right_drag_and_drop_emits_files_dropped_for_remote_pane() {
+        use super::super::build_native_row_models;
+        use crate::models::FileKind;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+
+        unsafe {
+            let hinstance = GetModuleHandleW(None).unwrap_or_default();
+            let dummy_parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("rustduck_test_left_to_right_dnd"),
+                WS_POPUP,
+                0,
+                0,
+                800,
+                400,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+            .expect("dummy parent HWND");
+            let _ = ShowWindow(dummy_parent, SW_SHOWNOACTIVATE);
+
+            let host = PlatformHost::new();
+            let local_entries = Arc::new(vec![FileEntry {
+                name: "upload_me.txt".into(),
+                path: r"C:\Users\Admin\upload_me.txt".into(),
+                kind: FileKind::File,
+                size: 512,
+                modified_unix: None,
+                permissions: None,
+            }]);
+            let local_rows = Arc::new(build_native_row_models(&local_entries, true, ".."));
+            let left_snap = NativePaneSnapshot {
+                tab_idx: 0,
+                is_local: true,
+                current_path: r"C:\Users\Admin".to_string(),
+                bounds_px: (0, 0, 380, 360),
+                scale_factor: 1.0,
+                visible: true,
+                is_dark: true,
+                sort_col: SortColumn::Name,
+                sort_ascending: true,
+                has_parent: true,
+                entries_revision: 1,
+                rows: local_rows,
+                entries: local_entries,
+                selected_paths: vec![r"C:\Users\Admin\upload_me.txt".to_string()],
+            };
+
+            let remote_entries = Arc::new(vec![FileEntry {
+                name: "releases".into(),
+                path: "/prod-bucket/releases".into(),
+                kind: FileKind::Directory,
+                size: 0,
+                modified_unix: None,
+                permissions: None,
+            }]);
+            let remote_rows = Arc::new(build_native_row_models(&remote_entries, true, ".."));
+            let right_snap = NativePaneSnapshot {
+                tab_idx: 0,
+                is_local: false,
+                current_path: "/prod-bucket".to_string(),
+                bounds_px: (400, 0, 380, 360),
+                scale_factor: 1.0,
+                visible: true,
+                is_dark: true,
+                sort_col: SortColumn::Name,
+                sort_ascending: true,
+                has_parent: true,
+                entries_revision: 1,
+                rows: remote_rows,
+                entries: remote_entries,
+                selected_paths: Vec::new(),
+            };
+
+            host.sync_pane_for_parent_hwnd(dummy_parent.0 as isize, &left_snap);
+            host.sync_pane_for_parent_hwnd(dummy_parent.0 as isize, &right_snap);
+            let _ = host.drain_events();
+
+            let left_hwnd = HWND(host.state.lock().unwrap().left.hwnd as *mut c_void);
+
+            // Begin drag on row 1 ("upload_me.txt", since row 0 is "..") in the left local pane
+            let nmlv = NMLISTVIEW {
+                hdr: NMHDR {
+                    hwndFrom: left_hwnd,
+                    idFrom: LEFT_LISTVIEW_ID,
+                    code: LVN_BEGINDRAG,
+                },
+                iItem: 1,
+                iSubItem: 0,
+                ..Default::default()
+            };
+            let _ = send_msg(
+                dummy_parent,
+                WM_NOTIFY,
+                LEFT_LISTVIEW_ID,
+                &nmlv as *const _ as isize,
+            );
+
+            // Release mouse button at x=500, y=200 (relative to left_hwnd at x=0, y=0 -> hits right_hwnd at x=100, y=200)
+            let drop_x: i16 = 500;
+            let drop_y: i16 = 200;
+            let packed_lparam =
+                ((drop_y as u16 as usize) << 16) | (drop_x as u16 as usize);
+            let _ = send_msg(left_hwnd, WM_LBUTTONUP, 0, packed_lparam as isize);
+
+            let events = host.drain_events();
+            let _ = DestroyWindow(dummy_parent);
+
+            assert_eq!(
+                events,
+                vec![NativePaneEvent::FilesDropped {
+                    target_is_local: false,
+                    source_paths: vec![r"C:\Users\Admin\upload_me.txt".to_string()],
+                    target_dir_override: Some("/prod-bucket".to_string()),
+                }],
+                "Dragging a file from the left local pane and releasing over the right remote pane must emit FilesDropped(target_is_local: false)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_modified_column_width_fits_timestamp() {
+        assert!(
+            MODIFIED_COLUMN_WIDTH_PX >= 170,
+            "Modified column default width ({MODIFIED_COLUMN_WIDTH_PX}px) must be wide enough for YYYY-MM-DD HH:mm timestamps"
+        );
     }
 }

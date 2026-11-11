@@ -20,7 +20,7 @@ impl ProtocolKind {
         match self {
             ProtocolKind::Sftp => "SSH / SFTP",
             ProtocolKind::Ftp => "FTP / FTPS",
-            ProtocolKind::S3 => "S3 (通用对象存储)",
+            ProtocolKind::S3 => crate::i18n::i18n().proto_s3_label(),
             ProtocolKind::Smb => "SMB",
             ProtocolKind::WebDav => "WebDAV",
             ProtocolKind::GoogleDrive => "Google Drive",
@@ -50,10 +50,7 @@ pub enum S3AddressingStyle {
 
 impl S3AddressingStyle {
     pub fn label(&self) -> &'static str {
-        match self {
-            S3AddressingStyle::VirtualHosted => "Virtual-Hosted (阿里云/腾讯云/AWS)",
-            S3AddressingStyle::PathStyle => "Path-Style (MinIO/自建)",
-        }
+        crate::i18n::i18n().s3_addressing_label(*self)
     }
 }
 
@@ -69,13 +66,7 @@ pub enum S3Preset {
 
 impl S3Preset {
     pub fn label(&self) -> &'static str {
-        match self {
-            S3Preset::AlibabaOss => "阿里云 OSS",
-            S3Preset::TencentCos => "腾讯云 COS",
-            S3Preset::Minio => "MinIO / 私有云",
-            S3Preset::AwsS3 => "AWS S3",
-            S3Preset::Custom => "自定义 S3 Endpoint",
-        }
+        crate::i18n::i18n().s3_preset_label(*self)
     }
 
     pub fn default_endpoint(&self, region: &str) -> String {
@@ -285,7 +276,10 @@ impl ProtocolConfig {
                 format!("{tag} · {}@{}:{}", c.username, c.host, c.port)
             }
             ProtocolConfig::S3(c) => {
-                let bkt = c.bucket.as_deref().unwrap_or("全部 Bucket");
+                let bkt = c
+                    .bucket
+                    .as_deref()
+                    .unwrap_or_else(|| crate::i18n::i18n().s3_all_buckets_summary());
                 format!("S3 · {} ({})", c.endpoint, bkt)
             }
             ProtocolConfig::Smb(c) => format!("SMB · //{}/{}", c.server, c.share),

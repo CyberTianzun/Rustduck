@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, Weak};
 
 const DELEGATE_IVAR: &CStr = c"rustduckDelegateCtx";
+const RUSTDUCK_LOCAL_PB_TYPE: &str = "app.rustduck.local-paths";
 const RUSTDUCK_REMOTE_PB_TYPE: &str = "app.rustduck.remote-paths";
 
 static REGISTER_CLASSES: Once = Once::new();
@@ -158,6 +159,10 @@ impl PlatformHost {
             if vis_changed {
                 unsafe {
                     let _: () = msg_send![sv, setHidden: Bool::YES];
+                    let win: *mut AnyObject = msg_send![root_view, window];
+                    if !win.is_null() {
+                        let _: Bool = msg_send![win, makeFirstResponder: root_view];
+                    }
                 }
             }
             return;
@@ -244,17 +249,26 @@ impl PlatformHost {
     }
 
     pub fn hide_all(&self) {
-        let (left_sv, right_sv) = {
+        let (left_sv, right_sv, root_view_ptr) = {
             let mut guard = self.state.lock().unwrap();
             (
                 guard.left.take_hide_scroll_view(),
                 guard.right.take_hide_scroll_view(),
+                guard.root_ns_view,
             )
         };
+        let any_hidden = left_sv.is_some() || right_sv.is_some();
         unsafe {
             for sv_ptr in [left_sv, right_sv].into_iter().flatten() {
                 let sv = sv_ptr as *mut AnyObject;
                 let _: () = msg_send![sv, setHidden: Bool::YES];
+            }
+            if any_hidden && root_view_ptr != 0 {
+                let root_view = root_view_ptr as *mut AnyObject;
+                let win: *mut AnyObject = msg_send![root_view, window];
+                if !win.is_null() {
+                    let _: Bool = msg_send![win, makeFirstResponder: root_view];
+                }
             }
         }
     }
@@ -456,8 +470,8 @@ unsafe fn create_single_mac_table(
     let _: () = msg_send![tv, setRowHeight: 24.0f64];
 
     add_mac_column(tv, "name", "Name", 240.0);
-    add_mac_column(tv, "modified", "Date Modified", 140.0);
-    add_mac_column(tv, "size", "Size", 90.0);
+    add_mac_column(tv, "modified", "Date Modified", 170.0);
+    add_mac_column(tv, "size", "Size", 95.0);
 
     let _: () = msg_send![tv, setDataSource: del];
     let _: () = msg_send![tv, setDelegate: del];
@@ -470,13 +484,18 @@ unsafe fn create_single_mac_table(
     let _: () = msg_send![tv, setMenu: menu];
     let _: *mut AnyObject = msg_send![menu, autorelease];
 
-    // Drag & Drop registration (Finder file URLs + cross-pane remote paths)
+    // Drag & Drop registration (Finder file URLs + cross-pane local/remote paths)
     let file_url_type = NSString::from_str("public.file-url");
+    let local_pb_type = NSString::from_str(RUSTDUCK_LOCAL_PB_TYPE);
     let remote_pb_type = NSString::from_str(RUSTDUCK_REMOTE_PB_TYPE);
     let types: *mut AnyObject = msg_send![
         class!(NSArray),
-        arrayWithObjects: [ &*file_url_type as *const NSString, &*remote_pb_type as *const NSString ].as_ptr(),
-        count: 2usize
+        arrayWithObjects: [
+            &*file_url_type as *const NSString,
+            &*local_pb_type as *const NSString,
+            &*remote_pb_type as *const NSString
+        ].as_ptr(),
+        count: 3usize
     ];
     let _: () = msg_send![tv, registerForDraggedTypes: types];
 
@@ -505,8 +524,8 @@ unsafe fn resize_mac_columns(tv: *mut AnyObject, total_width: f64) {
     if count < 3 {
         return;
     }
-    let mod_w = 140.0f64;
-    let size_w = 90.0f64;
+    let mod_w = 170.0f64;
+    let size_w = 95.0f64;
     let name_w = (total_width - mod_w - size_w - 24.0).max(120.0);
     let c0: *mut AnyObject = msg_send![cols, objectAtIndex: 0usize];
     let c1: *mut AnyObject = msg_send![cols, objectAtIndex: 1usize];
@@ -1241,6 +1260,8 @@ extern "C" fn write_rows_to_pasteboard(
         }
 
         let _: () = msg_send![pboard, clearContents];
+        let joined = dragged.join("\n");
+        let ns_payload = NSString::from_str(&joined);
         if ctx.is_local {
             let urls: Vec<_> = dragged
                 .iter()
@@ -1253,10 +1274,10 @@ extern "C" fn write_rows_to_pasteboard(
                 count: ptrs.len()
             ];
             let _: Bool = msg_send![pboard, writeObjects: arr];
+            let pb_type = NSString::from_str(RUSTDUCK_LOCAL_PB_TYPE);
+            let _: Bool = msg_send![pboard, setString: &*ns_payload, forType: &*pb_type];
         } else {
-            let joined = dragged.join("\n");
             let pb_type = NSString::from_str(RUSTDUCK_REMOTE_PB_TYPE);
-            let ns_payload = NSString::from_str(&joined);
             let _: Bool = msg_send![pboard, setString: &*ns_payload, forType: &*pb_type];
         }
         Bool::YES
@@ -1312,21 +1333,35 @@ extern "C" fn accept_drop(
                 }
             }
         } else {
-            let classes: *mut AnyObject =
-                msg_send![class!(NSArray), arrayWithObject: class!(NSURL)];
-            let urls: *mut AnyObject =
-                msg_send![pboard, readObjectsForClasses: classes, options: null::<AnyObject>()];
-            if !urls.is_null() {
-                let count: NSUInteger = msg_send![urls, count];
-                for i in 0..count {
-                    let url: *mut AnyObject = msg_send![urls, objectAtIndex: i];
-                    let path_ns: *mut AnyObject = msg_send![url, path];
-                    if !path_ns.is_null() {
-                        let utf8: *const i8 = msg_send![path_ns, UTF8String];
-                        if !utf8.is_null() {
-                            let p = CStr::from_ptr(utf8).to_string_lossy().to_string();
-                            if !p.is_empty() {
-                                source_paths.push(p);
+            let local_pb_type = NSString::from_str(RUSTDUCK_LOCAL_PB_TYPE);
+            let s: *mut AnyObject = msg_send![pboard, stringForType: &*local_pb_type];
+            if !s.is_null() {
+                let utf8: *const i8 = msg_send![s, UTF8String];
+                if !utf8.is_null() {
+                    for line in CStr::from_ptr(utf8).to_string_lossy().lines() {
+                        if !line.trim().is_empty() {
+                            source_paths.push(line.to_string());
+                        }
+                    }
+                }
+            }
+            if source_paths.is_empty() {
+                let classes: *mut AnyObject =
+                    msg_send![class!(NSArray), arrayWithObject: class!(NSURL)];
+                let urls: *mut AnyObject =
+                    msg_send![pboard, readObjectsForClasses: classes, options: null::<AnyObject>()];
+                if !urls.is_null() {
+                    let count: NSUInteger = msg_send![urls, count];
+                    for i in 0..count {
+                        let url: *mut AnyObject = msg_send![urls, objectAtIndex: i];
+                        let path_ns: *mut AnyObject = msg_send![url, path];
+                        if !path_ns.is_null() {
+                            let utf8: *const i8 = msg_send![path_ns, UTF8String];
+                            if !utf8.is_null() {
+                                let p = CStr::from_ptr(utf8).to_string_lossy().to_string();
+                                if !p.is_empty() {
+                                    source_paths.push(p);
+                                }
                             }
                         }
                     }

@@ -15,6 +15,7 @@ use crate::storage::gdrive::authorize_google_drive_in_browser;
 use crate::storage::local::LocalFileSystem;
 use crate::storage::onedrive::authorize_onedrive_in_browser;
 use crate::storage::{create_backend, StorageBackend};
+use crate::ui::action_modal::render_pane_action_modal;
 use crate::ui::dual_pane_view::render_dual_pane_view;
 use crate::ui::file_pane::{
     filter_and_sort_entries, join_local_or_remote, parent_local_or_remote,
@@ -959,8 +960,24 @@ impl TabSession {
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_inline_name(), window, cx));
         self.remote_action_input
             .update(cx, |s, cx| s.set_placeholder(t.placeholder_inline_name(), window, cx));
+        self.new_folder_input
+            .update(cx, |s, cx| s.set_placeholder(t.placeholder_inline_name(), window, cx));
         self.rebuild_visible_cache(true, cx);
         self.rebuild_visible_cache(false, cx);
+    }
+
+    pub fn active_action_modal(&self) -> Option<(bool, PaneInlineAction)> {
+        if let Some(act) = &self.local_inline_action {
+            Some((true, act.clone()))
+        } else {
+            self.remote_inline_action
+                .as_ref()
+                .map(|act| (false, act.clone()))
+        }
+    }
+
+    pub fn has_action_modal(&self) -> bool {
+        self.local_inline_action.is_some() || self.remote_inline_action.is_some()
     }
 }
 
@@ -1837,14 +1854,21 @@ impl RustduckWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.native_file_list_host.hide_all();
         let tab = &mut self.tabs[tab_idx];
         if is_local {
-            tab.local_action_input
-                .update(cx, |s, cx| s.set_value("", window, cx));
+            tab.remote_inline_action = None;
+            tab.local_action_input.update(cx, |s, cx| {
+                s.set_value("", window, cx);
+                s.focus(window, cx);
+            });
             tab.local_inline_action = Some(PaneInlineAction::NewFolder);
         } else {
-            tab.remote_action_input
-                .update(cx, |s, cx| s.set_value("", window, cx));
+            tab.local_inline_action = None;
+            tab.remote_action_input.update(cx, |s, cx| {
+                s.set_value("", window, cx);
+                s.focus(window, cx);
+            });
             tab.remote_inline_action = Some(PaneInlineAction::NewFolder);
         }
         cx.notify();
@@ -1863,28 +1887,35 @@ impl RustduckWorkspace {
             cx.notify();
             return;
         }
+        self.native_file_list_host.hide_all();
         let tab = &mut self.tabs[tab_idx];
         let action = PaneInlineAction::Rename {
             original_name: entry.name.clone(),
             original_path: entry.path.clone(),
         };
         if is_local {
+            tab.remote_inline_action = None;
             sync_pane_selection(
                 &mut tab.selected_local_paths,
                 &mut tab.selected_local_path,
                 vec![entry.path.clone()],
             );
-            tab.local_action_input
-                .update(cx, |s, cx| s.set_value(entry.name.clone(), window, cx));
+            tab.local_action_input.update(cx, |s, cx| {
+                s.set_value(entry.name.clone(), window, cx);
+                s.focus(window, cx);
+            });
             tab.local_inline_action = Some(action);
         } else {
+            tab.local_inline_action = None;
             sync_pane_selection(
                 &mut tab.selected_remote_paths,
                 &mut tab.selected_remote_path,
                 vec![entry.path.clone()],
             );
-            tab.remote_action_input
-                .update(cx, |s, cx| s.set_value(entry.name.clone(), window, cx));
+            tab.remote_action_input.update(cx, |s, cx| {
+                s.set_value(entry.name.clone(), window, cx);
+                s.focus(window, cx);
+            });
             tab.remote_inline_action = Some(action);
         }
         cx.notify();
@@ -1900,11 +1931,13 @@ impl RustduckWorkspace {
         if matches!(entry.kind, FileKind::Bucket) {
             return;
         }
+        self.native_file_list_host.hide_all();
         let tab = &mut self.tabs[tab_idx];
         let action = PaneInlineAction::ConfirmDelete {
             entry: entry.clone(),
         };
         if is_local {
+            tab.remote_inline_action = None;
             sync_pane_selection(
                 &mut tab.selected_local_paths,
                 &mut tab.selected_local_path,
@@ -1912,6 +1945,7 @@ impl RustduckWorkspace {
             );
             tab.local_inline_action = Some(action);
         } else {
+            tab.local_inline_action = None;
             sync_pane_selection(
                 &mut tab.selected_remote_paths,
                 &mut tab.selected_remote_path,
@@ -1940,11 +1974,14 @@ impl RustduckWorkspace {
             self.open_delete_confirm(tab_idx, is_local, &deletable[0], cx);
             return;
         }
+        self.native_file_list_host.hide_all();
         let tab = &mut self.tabs[tab_idx];
         let action = PaneInlineAction::ConfirmBatchDelete { entries: deletable };
         if is_local {
+            tab.remote_inline_action = None;
             tab.local_inline_action = Some(action);
         } else {
+            tab.local_inline_action = None;
             tab.remote_inline_action = Some(action);
         }
         cx.notify();
@@ -3006,10 +3043,12 @@ pub fn is_error_status_message(msg: &str) -> bool {
         || msg.contains("错误")
         || msg.contains("缺少")
         || msg.contains("未检测到")
+        || msg.contains("不能")
         || lower.contains("failed")
         || lower.contains("invalid")
         || lower.contains("error")
         || lower.contains("missing")
+        || lower.contains("cannot")
         || lower.contains("secret not found")
 }
 
@@ -3039,7 +3078,8 @@ impl Render for RustduckWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_idx = self.active_tab.min(self.tabs.len().saturating_sub(1));
         let is_connected = self.tabs[active_idx].is_connected;
-        if !is_connected || self.settings_open {
+        let has_action_modal = self.tabs[active_idx].has_action_modal();
+        if !is_connected || self.settings_open || has_action_modal {
             self.native_file_list_host.hide_all();
         } else {
             self.tabs[active_idx].sync_visible_caches_if_needed(cx);
@@ -3065,6 +3105,9 @@ impl Render for RustduckWorkspace {
             render_new_tab_view(active_idx, self, cx)
         };
         let drawer_el = render_transfer_drawer(&transfer_tasks, self.drawer_expanded, cx);
+        let action_modal_el = is_connected
+            .then(|| render_pane_action_modal(active_idx, self, cx))
+            .flatten();
         let settings_modal_el = self
             .settings_open
             .then(|| render_settings_modal(self, cx));
@@ -3083,6 +3126,7 @@ impl Render for RustduckWorkspace {
                     .child(body_el),
             )
             .child(drawer_el)
+            .when_some(action_modal_el, |el, modal| el.child(modal))
             .when_some(settings_modal_el, |el, modal| el.child(modal))
     }
 }

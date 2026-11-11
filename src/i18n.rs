@@ -918,6 +918,97 @@ impl I18n {
         }
     }
 
+    pub fn breadcrumb_local_drives_root(&self) -> &'static str {
+        if self.is_zh() {
+            "磁盘"
+        } else {
+            "Drives"
+        }
+    }
+
+    pub fn breadcrumb_remote_root(&self) -> &'static str {
+        if self.is_zh() {
+            "根目录"
+        } else {
+            "Root"
+        }
+    }
+
+    pub fn err_rename_empty(&self) -> &'static str {
+        if self.is_zh() {
+            "新名称不能为空"
+        } else {
+            "New name cannot be empty"
+        }
+    }
+
+    pub fn err_rename_invalid_sep(&self) -> &'static str {
+        if self.is_zh() {
+            "新名称不能包含路径分隔符"
+        } else {
+            "New name cannot contain path separators"
+        }
+    }
+
+    pub fn s3_all_buckets_summary(&self) -> &'static str {
+        if self.is_zh() {
+            "全部 Bucket"
+        } else {
+            "All Buckets"
+        }
+    }
+
+    pub fn action_modal_new_folder_title(&self, is_local: bool) -> &'static str {
+        match (self.is_zh(), is_local) {
+            (true, true) => "新建本地文件夹",
+            (true, false) => "新建远程文件夹",
+            (false, true) => "New Local Folder",
+            (false, false) => "New Remote Folder",
+        }
+    }
+
+    pub fn action_modal_new_folder_desc(&self, parent_path: &str) -> String {
+        if self.is_zh() {
+            format!("将在目录 {parent_path} 下创建新文件夹")
+        } else {
+            format!("Create a new folder inside {parent_path}")
+        }
+    }
+
+    pub fn action_modal_rename_title(&self, is_local: bool) -> &'static str {
+        match (self.is_zh(), is_local) {
+            (true, true) => "重命名本地项目",
+            (true, false) => "重命名远程项目",
+            (false, true) => "Rename Local Item",
+            (false, false) => "Rename Remote Item",
+        }
+    }
+
+    pub fn action_modal_rename_desc(&self, original_name: &str) -> String {
+        if self.is_zh() {
+            format!("原名称: {original_name}")
+        } else {
+            format!("Original name: {original_name}")
+        }
+    }
+
+    pub fn action_modal_delete_title(&self, is_local: bool) -> &'static str {
+        match (self.is_zh(), is_local) {
+            (true, true) => "删除本地项目",
+            (true, false) => "删除远程项目",
+            (false, true) => "Delete Local Item",
+            (false, false) => "Delete Remote Item",
+        }
+    }
+
+    pub fn action_modal_delete_warning(&self) -> &'static str {
+        if self.is_zh() {
+            "此操作不可撤销，请确认是否继续。"
+        } else {
+            "This action cannot be undone."
+        }
+    }
+
     pub fn inline_new_folder_label(&self) -> &'static str {
         if self.is_zh() {
             "新建文件夹:"

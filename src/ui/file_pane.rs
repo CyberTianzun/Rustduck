@@ -1,3 +1,4 @@
+use crate::i18n::{i18n, I18n};
 use crate::models::{FileEntry, FileKind};
 use chrono::{TimeZone, Utc};
 use std::cmp::Ordering;
@@ -119,12 +120,21 @@ pub fn resolve_rename_target_path(
     new_name: &str,
     is_local: bool,
 ) -> anyhow::Result<String> {
+    resolve_rename_target_path_with_i18n(current_entry_path, new_name, is_local, i18n())
+}
+
+pub fn resolve_rename_target_path_with_i18n(
+    current_entry_path: &str,
+    new_name: &str,
+    is_local: bool,
+    t: I18n,
+) -> anyhow::Result<String> {
     let trimmed = new_name.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::anyhow!("新名称不能为空"));
+        return Err(anyhow::anyhow!(t.err_rename_empty()));
     }
     if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(anyhow::anyhow!("新名称不能包含路径分隔符"));
+        return Err(anyhow::anyhow!(t.err_rename_invalid_sep()));
     }
     let parent =
         parent_local_or_remote(current_entry_path, is_local).unwrap_or_else(|| "/".to_string());
@@ -133,9 +143,17 @@ pub fn resolve_rename_target_path(
 
 /// Splits a local or remote path into clickable `(label, target_path)` breadcrumb segments.
 pub fn split_breadcrumb_segments(path: &str, is_local: bool) -> Vec<(String, String)> {
+    split_breadcrumb_segments_with_i18n(path, is_local, i18n())
+}
+
+pub fn split_breadcrumb_segments_with_i18n(
+    path: &str,
+    is_local: bool,
+    t: I18n,
+) -> Vec<(String, String)> {
     let trimmed = path.trim();
     if is_local {
-        let mut crumbs = vec![("磁盘".to_string(), "/".to_string())];
+        let mut crumbs = vec![(t.breadcrumb_local_drives_root().to_string(), "/".to_string())];
         if trimmed.is_empty() || trimmed == "/" || trimmed == "\\" {
             return crumbs;
         }
@@ -159,7 +177,7 @@ pub fn split_breadcrumb_segments(path: &str, is_local: bool) -> Vec<(String, Str
         }
         crumbs
     } else {
-        let mut crumbs = vec![("根目录".to_string(), "/".to_string())];
+        let mut crumbs = vec![(t.breadcrumb_remote_root().to_string(), "/".to_string())];
         let norm = crate::models::normalize_remote_path(trimmed);
         if norm == "/" {
             return crumbs;
@@ -246,19 +264,41 @@ mod tests {
 
     #[test]
     fn test_resolve_rename_target_path_validates_and_joins_parent() {
+        let zh = I18n::new(crate::services::preferences::AppLanguage::ZhCn);
+        let en = I18n::new(crate::services::preferences::AppLanguage::EnUs);
+
         let remote_renamed =
             resolve_rename_target_path("/bucket/docs/old.txt", "new.txt", false).unwrap();
         assert_eq!(remote_renamed, "/bucket/docs/new.txt");
 
-        assert!(resolve_rename_target_path("/bucket/docs/old.txt", "   ", false).is_err());
-        assert!(resolve_rename_target_path("/bucket/docs/old.txt", "sub/new.txt", false).is_err());
+        let zh_empty_err =
+            resolve_rename_target_path_with_i18n("/bucket/docs/old.txt", "   ", false, zh)
+                .unwrap_err()
+                .to_string();
+        assert_eq!(zh_empty_err, "新名称不能为空");
+
+        let en_empty_err =
+            resolve_rename_target_path_with_i18n("/bucket/docs/old.txt", "   ", false, en)
+                .unwrap_err()
+                .to_string();
+        assert_eq!(en_empty_err, "New name cannot be empty");
+
+        let en_sep_err =
+            resolve_rename_target_path_with_i18n("/bucket/docs/old.txt", "sub/new.txt", false, en)
+                .unwrap_err()
+                .to_string();
+        assert_eq!(en_sep_err, "New name cannot contain path separators");
     }
 
     #[test]
-    fn test_split_breadcrumb_segments_local_and_remote() {
-        let remote_crumbs = split_breadcrumb_segments("/prod-bucket/releases/v1", false);
+    fn test_split_breadcrumb_segments_local_and_remote_bilingual() {
+        let zh = I18n::new(crate::services::preferences::AppLanguage::ZhCn);
+        let en = I18n::new(crate::services::preferences::AppLanguage::EnUs);
+
+        let remote_crumbs_zh =
+            split_breadcrumb_segments_with_i18n("/prod-bucket/releases/v1", false, zh);
         assert_eq!(
-            remote_crumbs,
+            remote_crumbs_zh,
             vec![
                 ("根目录".to_string(), "/".to_string()),
                 ("prod-bucket".to_string(), "/prod-bucket".to_string()),
@@ -267,11 +307,34 @@ mod tests {
             ]
         );
 
-        let win_crumbs = split_breadcrumb_segments(r"C:\Users\Admin", true);
+        let remote_crumbs_en =
+            split_breadcrumb_segments_with_i18n("/prod-bucket/releases/v1", false, en);
         assert_eq!(
-            win_crumbs,
+            remote_crumbs_en,
+            vec![
+                ("Root".to_string(), "/".to_string()),
+                ("prod-bucket".to_string(), "/prod-bucket".to_string()),
+                ("releases".to_string(), "/prod-bucket/releases".to_string()),
+                ("v1".to_string(), "/prod-bucket/releases/v1".to_string()),
+            ]
+        );
+
+        let win_crumbs_zh = split_breadcrumb_segments_with_i18n(r"C:\Users\Admin", true, zh);
+        assert_eq!(
+            win_crumbs_zh,
             vec![
                 ("磁盘".to_string(), "/".to_string()),
+                ("C:".to_string(), r"C:\".to_string()),
+                ("Users".to_string(), r"C:\Users".to_string()),
+                ("Admin".to_string(), r"C:\Users\Admin".to_string()),
+            ]
+        );
+
+        let win_crumbs_en = split_breadcrumb_segments_with_i18n(r"C:\Users\Admin", true, en);
+        assert_eq!(
+            win_crumbs_en,
+            vec![
+                ("Drives".to_string(), "/".to_string()),
                 ("C:".to_string(), r"C:\".to_string()),
                 ("Users".to_string(), r"C:\Users".to_string()),
                 ("Admin".to_string(), r"C:\Users\Admin".to_string()),

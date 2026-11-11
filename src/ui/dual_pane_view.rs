@@ -1,15 +1,14 @@
 use crate::i18n::i18n;
 use crate::models::{format_bytes, FileEntry, FileKind};
 use crate::ui::file_pane::{
-    parent_local_or_remote, split_breadcrumb_segments, PaneInlineAction, SortColumn,
+    parent_local_or_remote, split_breadcrumb_segments, SortColumn,
 };
 use crate::ui::native_file_list::{
     compute_pane_visibility, NativeFileListHost, NativePaneSnapshot, NativeRowViewModel,
 };
 use crate::ui::{
-    accent_amber, accent_blue, accent_red, bg_canvas, bg_elevated, bg_panel, bg_row_selected,
-    border_selected, border_subtle, is_dark_theme, protocol_icon_and_color, text_muted,
-    text_primary, workspace::RustduckWorkspace,
+    accent_blue, bg_canvas, bg_elevated, bg_panel, border_subtle, is_dark_theme,
+    protocol_icon_and_color, text_muted, text_primary, workspace::RustduckWorkspace,
 };
 use gpui::{
     div, prelude::*, px, relative, AnyElement, App, Bounds, Context, Element, ElementId, Entity,
@@ -172,20 +171,10 @@ fn render_single_pane(
     } else {
         &tab.remote_path_input
     };
-    let action_input = if is_local {
-        &tab.local_action_input
-    } else {
-        &tab.remote_action_input
-    };
     let is_editing_path = if is_local {
         tab.local_path_editing
     } else {
         tab.remote_path_editing
-    };
-    let inline_action = if is_local {
-        tab.local_inline_action.clone()
-    } else {
-        tab.remote_inline_action.clone()
     };
     let (entries, rows, (dir_count, file_count, total_bytes), entries_revision, selected_paths) =
         if is_local {
@@ -227,8 +216,6 @@ fn render_single_pane(
         breadcrumbs,
         cx,
     );
-    let inline_action_bar =
-        inline_action.map(|act| render_pane_inline_action(tab_idx, is_local, act, action_input, cx));
     let file_table = render_pane_file_table(
         tab_idx,
         is_local,
@@ -254,7 +241,6 @@ fn render_single_pane(
         .bg(bg_canvas())
         .child(action_header)
         .child(breadcrumb_bar)
-        .when_some(inline_action_bar, |el, bar| el.child(bar))
         .child(file_table)
         .child(footer)
         .into_any_element()
@@ -532,191 +518,27 @@ fn render_pane_breadcrumb_bar(
                     .compact()
                     .icon(IconName::Pencil)
                     .tooltip(t.edit_path_tooltip())
-                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                    .on_click(cx.listener(move |this, _ev, window, cx| {
+                        let tab = &mut this.tabs[tab_idx];
                         if is_local {
-                            this.tabs[tab_idx].local_path_editing = true;
+                            tab.local_path_editing = true;
+                            let path_val = tab.local_path.clone();
+                            tab.local_path_input.update(cx, |s, cx| {
+                                s.set_value(path_val, window, cx);
+                                s.focus(window, cx);
+                            });
                         } else {
-                            this.tabs[tab_idx].remote_path_editing = true;
+                            tab.remote_path_editing = true;
+                            let path_val = tab.remote_path.clone();
+                            tab.remote_path_input.update(cx, |s, cx| {
+                                s.set_value(path_val, window, cx);
+                                s.focus(window, cx);
+                            });
                         }
                         cx.notify();
                     })),
             )
         })
-        .into_any_element()
-}
-
-fn render_pane_inline_action(
-    tab_idx: usize,
-    is_local: bool,
-    action: PaneInlineAction,
-    action_input: &Entity<InputState>,
-    cx: &mut Context<RustduckWorkspace>,
-) -> AnyElement {
-    let t = i18n();
-    let side_prefix = if is_local { "local" } else { "remote" };
-    match action {
-        PaneInlineAction::NewFolder => h_flex()
-            .w_full()
-            .px_3()
-            .py_2()
-            .gap_2()
-            .bg(bg_row_selected())
-            .border_b_1()
-            .border_color(border_selected())
-            .items_center()
-            .child(
-                Icon::new(IconName::FolderPlus)
-                    .xsmall()
-                    .text_color(accent_blue()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(text_primary())
-                    .child(t.inline_new_folder_label()),
-            )
-            .child(div().flex_1().child(Input::new(action_input).xsmall()))
-            .child(
-                Button::new((side_prefix, 20usize))
-                    .xsmall()
-                    .primary()
-                    .icon(IconName::Check)
-                    .label(t.create_btn())
-                    .on_click(cx.listener(move |this, _ev, window, cx| {
-                        this.submit_inline_action(tab_idx, is_local, window, cx);
-                    })),
-            )
-            .child(
-                Button::new((side_prefix, 21usize))
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::X)
-                    .label(t.cancel_btn())
-                    .on_click(cx.listener(move |this, _ev, _win, cx| {
-                        this.cancel_inline_action(tab_idx, is_local, cx);
-                    })),
-            )
-            .into_any_element(),
-        PaneInlineAction::Rename { original_name, .. } => h_flex()
-            .w_full()
-            .px_3()
-            .py_2()
-            .gap_2()
-            .bg(bg_row_selected())
-            .border_b_1()
-            .border_color(border_selected())
-            .items_center()
-            .child(
-                Icon::new(IconName::Pencil)
-                    .xsmall()
-                    .text_color(accent_amber()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(text_primary())
-                    .child(t.inline_rename_label(&original_name)),
-            )
-            .child(div().flex_1().child(Input::new(action_input).xsmall()))
-            .child(
-                Button::new((side_prefix, 22usize))
-                    .xsmall()
-                    .primary()
-                    .icon(IconName::Check)
-                    .label(t.confirm_btn())
-                    .on_click(cx.listener(move |this, _ev, window, cx| {
-                        this.submit_inline_action(tab_idx, is_local, window, cx);
-                    })),
-            )
-            .child(
-                Button::new((side_prefix, 23usize))
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::X)
-                    .label(t.cancel_btn())
-                    .on_click(cx.listener(move |this, _ev, _win, cx| {
-                        this.cancel_inline_action(tab_idx, is_local, cx);
-                    })),
-            )
-            .into_any_element(),
-        PaneInlineAction::ConfirmDelete { entry } => render_delete_confirm_bar(
-            tab_idx,
-            is_local,
-            side_prefix,
-            t.inline_delete_confirm_prompt(entry.kind.is_dir_like(), &entry.name),
-            cx,
-        ),
-        PaneInlineAction::ConfirmBatchDelete { entries } => {
-            let summary =
-                t.pane_footer_multi_selection(entries.len(), entries.first().map(|e| e.name.as_str()));
-            render_delete_confirm_bar(
-                tab_idx,
-                is_local,
-                side_prefix,
-                t.inline_delete_confirm_prompt(false, &summary),
-                cx,
-            )
-        }
-    }
-}
-
-fn render_delete_confirm_bar(
-    tab_idx: usize,
-    is_local: bool,
-    side_prefix: &'static str,
-    prompt_text: String,
-    cx: &mut Context<RustduckWorkspace>,
-) -> AnyElement {
-    let t = i18n();
-    h_flex()
-        .w_full()
-        .px_3()
-        .py_2()
-        .gap_2()
-        .bg(bg_elevated())
-        .border_b_1()
-        .border_color(accent_red())
-        .justify_between()
-        .items_center()
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(Icon::new(IconName::Trash).xsmall().text_color(accent_red()))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(text_primary())
-                        .child(prompt_text),
-                ),
-        )
-        .child(
-            h_flex()
-                .gap_1p5()
-                .child(
-                    Button::new((side_prefix, 24usize))
-                        .xsmall()
-                        .danger()
-                        .icon(IconName::Check)
-                        .label(t.confirm_delete_btn())
-                        .on_click(cx.listener(move |this, _ev, window, cx| {
-                            this.submit_inline_action(tab_idx, is_local, window, cx);
-                        })),
-                )
-                .child(
-                    Button::new((side_prefix, 25usize))
-                        .xsmall()
-                        .ghost()
-                        .icon(IconName::X)
-                        .label(t.cancel_btn())
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
-                            this.cancel_inline_action(tab_idx, is_local, cx);
-                        })),
-                ),
-        )
         .into_any_element()
 }
 
@@ -858,7 +680,7 @@ fn render_pane_file_table(
         tab_idx,
         is_local,
         is_connected: tab.is_connected,
-        settings_open: ws.settings_open,
+        settings_open: ws.settings_open || tab.has_action_modal(),
         current_path,
         is_dark: is_dark_theme(),
         sort_col: tab.sort_column,
