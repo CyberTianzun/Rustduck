@@ -14,6 +14,22 @@ A modern, GPU-accelerated cross-protocol file transfer studio crafted in **100% 
 
 ---
 
+## Preview
+
+<p align="center">
+  <img src="assets/screenshots/quick-connect.png" width="100%" alt="Rustduck Favorites & Quick Connect Studio" />
+  <br />
+  <sub><b>Favorites & Quick Connect Inspector</b> — Manage multi-protocol servers, cloud buckets, and OS keychain-protected credentials in one place.</sub>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/dual-pane-transfer.png" width="100%" alt="Rustduck Dual-Pane Native File Transfer Workspace" />
+  <br />
+  <sub><b>Dual-Pane Native Transfer Workspace</b> — Side-by-side local and remote OS-native virtualized file lists with drag-and-drop and real-time transfer queue.</sub>
+</p>
+
+---
+
 ## Why Rustduck?
 
 Modern infrastructure is fragmented across Linux servers (`SSH / SFTP`), cloud object storage (`S3 / OSS / COS / R2 / MinIO`), enterprise file shares (`SMB / NAS`, `FTP / FTPS`, `WebDAV`), and personal cloud drives (`Google Drive`, `OneDrive`).

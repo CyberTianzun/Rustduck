@@ -14,6 +14,22 @@
 
 ---
 
+## 界面预览
+
+<p align="center">
+  <img src="assets/screenshots/quick-connect.png" width="100%" alt="Rustduck 收藏夹与快速连接工作台" />
+  <br />
+  <sub><b>收藏夹与快速连接工作台</b> — 集中管理多协议服务器与对象存储站点，敏感凭据由系统原生密钥链加密保护。</sub>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/dual-pane-transfer.png" width="100%" alt="Rustduck 双栏原生文件列表传输工作区" />
+  <br />
+  <sub><b>双栏原生文件传输工作区</b> — 本地与远程并排的操作系统级虚拟化文件列表，支持跨工作区直接拖拽与底部实时队列追踪。</sub>
+</p>
+
+---
+
 ## 为什么做 Rustduck？
 
 今天开发者的基础设施早已分布在各个角落：Linux 生产服务器（`SSH / SFTP`）、云厂商对象存储（`S3 / 阿里云 OSS / 腾讯云 COS / Cloudflare R2 / MinIO`）、内网共享存储（`SMB / NAS`、`FTP / FTPS`、`WebDAV`），以及个人云盘（`Google Drive`、`OneDrive`）。
