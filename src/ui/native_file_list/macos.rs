@@ -344,6 +344,21 @@ impl PlatformHost {
         guard.events.drain()
     }
 
+    pub fn teardown(&self) {
+        let (left_ptrs, right_ptrs, icons) = {
+            let mut guard = self.state.lock().unwrap();
+            guard.root_ns_view = 0;
+            guard.host_ns_view = 0;
+            guard.events.close();
+            take_mac_teardown_ptrs(&mut guard)
+        };
+        if left_ptrs != (0, 0, 0) || right_ptrs != (0, 0, 0) || !icons.is_empty() {
+            autoreleasepool(|_| unsafe {
+                teardown_mac_controls(left_ptrs, right_ptrs, icons);
+            });
+        }
+    }
+
     pub fn subscribe_wakeup(&self) -> UnboundedReceiver<()> {
         let mut guard = self.state.lock().unwrap();
         guard.events.subscribe()
@@ -355,13 +370,21 @@ impl PlatformHost {
     }
 
     fn ensure_views_created(&self, root_view_ptr: usize) {
-        {
-            let guard = self.state.lock().unwrap();
+        let stale = {
+            let mut guard = self.state.lock().unwrap();
             if guard.root_ns_view == root_view_ptr
                 && guard.left.scroll_view != 0
                 && guard.right.scroll_view != 0
             {
                 return;
+            }
+            guard.root_ns_view = 0;
+            guard.host_ns_view = 0;
+            take_mac_teardown_ptrs(&mut guard)
+        };
+        if stale.0 != (0, 0, 0) || stale.1 != (0, 0, 0) || !stale.2.is_empty() {
+            unsafe {
+                teardown_mac_controls(stale.0, stale.1, stale.2);
             }
         }
 
@@ -399,35 +422,62 @@ impl PlatformHost {
     }
 }
 
+fn take_mac_teardown_ptrs(
+    inner: &mut HostInner,
+) -> ((usize, usize, usize), (usize, usize, usize), Vec<usize>) {
+    let take_pane = |pane: &mut MacPaneState| {
+        let tup = (pane.scroll_view, pane.table_view, pane.delegate_obj);
+        pane.scroll_view = 0;
+        pane.table_view = 0;
+        pane.delegate_obj = 0;
+        pane.visible = false;
+        tup
+    };
+    let left = take_pane(&mut inner.left);
+    let right = take_pane(&mut inner.right);
+    let icons: Vec<usize> = inner.icon_cache.drain().map(|(_, ptr)| ptr).collect();
+    (left, right, icons)
+}
+
+unsafe fn teardown_mac_controls(
+    left: (usize, usize, usize),
+    right: (usize, usize, usize),
+    icons: Vec<usize>,
+) {
+    unsafe {
+        for (sv_ptr, tv_ptr, del_ptr) in [left, right] {
+            if tv_ptr != 0 {
+                let tv = tv_ptr as *mut AnyObject;
+                let _: () = msg_send![tv, setDelegate: null::<AnyObject>()];
+                let _: () = msg_send![tv, setDataSource: null::<AnyObject>()];
+                let _: () = msg_send![tv, setTarget: null::<AnyObject>()];
+            }
+            if sv_ptr != 0 {
+                let sv = sv_ptr as *mut AnyObject;
+                let _: () = msg_send![sv, removeFromSuperview];
+                let _: () = msg_send![sv, release];
+            }
+            if del_ptr != 0 {
+                let del = del_ptr as *mut AnyObject;
+                let _: () = msg_send![del, release];
+            }
+        }
+        for icon_ptr in icons {
+            if icon_ptr != 0 {
+                let icon = icon_ptr as *mut AnyObject;
+                let _: () = msg_send![icon, release];
+            }
+        }
+    }
+}
+
 impl Drop for HostInner {
     fn drop(&mut self) {
-        unsafe {
-            for pane in [&mut self.left, &mut self.right] {
-                if pane.table_view != 0 {
-                    let tv = pane.table_view as *mut AnyObject;
-                    let _: () = msg_send![tv, setDelegate: null::<AnyObject>()];
-                    let _: () = msg_send![tv, setDataSource: null::<AnyObject>()];
-                    let _: () = msg_send![tv, setTarget: null::<AnyObject>()];
-                    pane.table_view = 0;
-                }
-                if pane.scroll_view != 0 {
-                    let sv = pane.scroll_view as *mut AnyObject;
-                    let _: () = msg_send![sv, removeFromSuperview];
-                    let _: () = msg_send![sv, release];
-                    pane.scroll_view = 0;
-                }
-                if pane.delegate_obj != 0 {
-                    let del = pane.delegate_obj as *mut AnyObject;
-                    let _: () = msg_send![del, release];
-                    pane.delegate_obj = 0;
-                }
-            }
-            for (_, icon_ptr) in self.icon_cache.drain() {
-                if icon_ptr != 0 {
-                    let icon = icon_ptr as *mut AnyObject;
-                    let _: () = msg_send![icon, release];
-                }
-            }
+        let (left, right, icons) = take_mac_teardown_ptrs(self);
+        if left != (0, 0, 0) || right != (0, 0, 0) || !icons.is_empty() {
+            autoreleasepool(|_| unsafe {
+                teardown_mac_controls(left, right, icons);
+            });
         }
     }
 }
@@ -452,7 +502,8 @@ unsafe fn restore_focus_if_inside_scroll_view(root_view: *mut AnyObject, sv: *mu
         return;
     }
     unsafe {
-        let win: *mut AnyObject = msg_send![root_view, window];
+        // Query `window` on `sv` (retained +1 by HostInner) rather than unretained `root_view`.
+        let win: *mut AnyObject = msg_send![sv, window];
         if win.is_null() {
             return;
         }

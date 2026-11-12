@@ -104,8 +104,10 @@ impl TransferManager {
             {
                 let mut guard = inner.write().expect("transfer lock poisoned");
                 if let Some(item) = guard.iter_mut().find(|m| m.task.id == id) {
-                    if matches!(item.task.status, TransferStatus::Paused | TransferStatus::Cancelled)
-                    {
+                    if matches!(
+                        item.task.status,
+                        TransferStatus::Paused | TransferStatus::Cancelled
+                    ) {
                         return;
                     }
                     item.task.status = TransferStatus::InProgress;
@@ -252,6 +254,14 @@ impl TransferManager {
                 TransferStatus::Completed | TransferStatus::Cancelled
             )
         });
+    }
+
+    pub fn shutdown(&self) {
+        let mut guard = self.inner.write().expect("transfer lock poisoned");
+        for item in guard.iter_mut() {
+            item.cancel_token.cancel();
+        }
+        guard.clear();
     }
 
     pub fn snapshot(&self) -> Vec<TransferTask> {
@@ -456,7 +466,10 @@ mod tests {
         // Wait until both enter InProgress and report upload progress
         for _ in 0..30 {
             let snap = mgr.snapshot();
-            if snap.iter().all(|t| t.status == TransferStatus::InProgress && t.transferred_bytes == 1024) {
+            if snap
+                .iter()
+                .all(|t| t.status == TransferStatus::InProgress && t.transferred_bytes == 1024)
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -522,6 +535,46 @@ mod tests {
         assert_eq!(
             std::fs::read(dst_dir.path().join("project").join("sub").join("deep.bin")).unwrap(),
             b"world123"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transfer_manager_shutdown_cancels_active_and_releases_backends() {
+        let mock: Arc<dyn StorageBackend> = Arc::new(SlowCompleteBackend);
+        let mgr = TransferManager::new(2);
+
+        mgr.enqueue(
+            TransferDirection::Upload,
+            mock.clone(),
+            "/src_shutdown".to_string(),
+            mock.clone(),
+            "/dst_shutdown".to_string(),
+            "shutdown.bin".to_string(),
+            1024,
+        );
+
+        for _ in 0..30 {
+            let snap = mgr.snapshot();
+            if snap.iter().any(|t| t.status == TransferStatus::InProgress) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(Arc::strong_count(&mock) > 1);
+
+        mgr.shutdown();
+        assert!(mgr.snapshot().is_empty());
+
+        for _ in 0..30 {
+            if Arc::strong_count(&mock) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&mock),
+            1,
+            "shutdown must cancel worker tasks and release all StorageBackend Arcs"
         );
     }
 }

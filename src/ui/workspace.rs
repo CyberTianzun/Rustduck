@@ -1,4 +1,4 @@
-use crate::i18n::{i18n, set_current_language, I18n};
+use crate::i18n::{I18n, i18n, set_current_language};
 use crate::models::{
     Bookmark, FileEntry, FileKind, FtpConfig, GoogleDriveConfig, OneDriveConfig, ProtocolConfig,
     ProtocolKind, S3AddressingStyle, S3Config, S3Preset, SftpConfig, SmbConfig, TransferDirection,
@@ -10,23 +10,23 @@ use crate::services::preferences::{
 };
 use crate::services::runtime::tokio_runtime;
 use crate::services::transfer_manager::TransferManager;
-use crate::services::update_checker::{check_github_latest_release, UpdateCheckState};
+use crate::services::update_checker::{UpdateCheckState, check_github_latest_release};
 use crate::storage::gdrive::authorize_google_drive_in_browser;
 use crate::storage::local::LocalFileSystem;
 use crate::storage::onedrive::authorize_onedrive_in_browser;
-use crate::storage::{create_backend, StorageBackend};
+use crate::storage::{StorageBackend, create_backend};
 use crate::ui::action_modal::render_pane_action_modal;
 use crate::ui::dual_pane_view::render_dual_pane_view;
 use crate::ui::file_pane::{
-    filter_and_sort_entries, join_local_or_remote, parent_local_or_remote,
-    resolve_rename_target_path, summarize_pane_entries, PaneInlineAction, SortColumn,
+    PaneInlineAction, SortColumn, filter_and_sort_entries, join_local_or_remote,
+    parent_local_or_remote, resolve_rename_target_path, summarize_pane_entries,
 };
 use crate::ui::native_file_list::{
-    build_native_row_models, NativeContextMenuAction, NativeFileListHost, NativePaneEvent,
-    NativeRowViewModel,
+    NativeContextMenuAction, NativeFileListHost, NativePaneEvent, NativeRowViewModel,
+    build_native_row_models,
 };
 use crate::ui::new_tab_view::render_new_tab_view;
-use crate::ui::settings_modal::{render_settings_modal, SettingsTab, APP_VERSION};
+use crate::ui::settings_modal::{APP_VERSION, SettingsTab, render_settings_modal};
 use crate::ui::transfer_drawer::render_transfer_drawer;
 use crate::ui::{
     accent_amber, accent_blue, accent_green, accent_red, apply_theme_preference, bg_canvas,
@@ -34,13 +34,13 @@ use crate::ui::{
 };
 use futures::StreamExt as _;
 use gpui::{
-    div, img, prelude::*, px, AnyElement, App, ClipboardItem, Context, Entity, IntoElement,
-    MouseButton, PathPromptOptions, Render, Window,
+    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, MouseButton, PathPromptOptions,
+    Render, Window, div, img, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::InputState;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{h_flex, v_flex, Icon, Sizable as _, TitleBar};
+use gpui_component::{Icon, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -321,8 +321,8 @@ pub struct ConnectionFormInputs {
 impl ConnectionFormInputs {
     pub fn new(window: &mut Window, cx: &mut Context<RustduckWorkspace>) -> Self {
         let t = i18n();
-        let search_input = cx
-            .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_search_bookmarks()));
+        let search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t.placeholder_search_bookmarks()));
         Self::new_with_search_and_protocol(search_input, ProtocolKind::S3, window, cx)
     }
 
@@ -353,29 +353,24 @@ impl ConnectionFormInputs {
             ftp_port_input: cx.new(|cx| InputState::new(window, cx).default_value("21")),
             ftp_user_input: cx.new(|cx| InputState::new(window, cx).default_value("anonymous")),
             s3_endpoint_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value("https://oss-cn-hangzhou.aliyuncs.com")
+                InputState::new(window, cx).default_value("https://oss-cn-hangzhou.aliyuncs.com")
             }),
-            s3_region_input: cx
-                .new(|cx| InputState::new(window, cx).default_value("cn-hangzhou")),
+            s3_region_input: cx.new(|cx| InputState::new(window, cx).default_value("cn-hangzhou")),
             s3_access_key_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder("Access Key ID / SecretId")),
-            s3_bucket_input: cx.new(|cx| {
-                InputState::new(window, cx).placeholder(t.placeholder_s3_bucket())
-            }),
+            s3_bucket_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_s3_bucket())),
             smb_server_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_smb_server())),
             smb_port_input: cx.new(|cx| InputState::new(window, cx).default_value("445")),
             smb_share_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_smb_share())),
-            smb_user_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("admin / guest")),
+            smb_user_input: cx.new(|cx| InputState::new(window, cx).placeholder("admin / guest")),
             smb_domain_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_smb_domain())),
             webdav_endpoint_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_webdav_endpoint())),
-            webdav_user_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("username")),
+            webdav_user_input: cx.new(|cx| InputState::new(window, cx).placeholder("username")),
             gdrive_client_id_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_oauth_client_id())),
             gdrive_client_secret_input: cx.new(|cx| {
@@ -450,8 +445,9 @@ impl ConnectionFormInputs {
             .update(cx, |s, cx| s.set_value(vals.name.clone(), window, cx));
         self.secret_input
             .update(cx, |s, cx| s.set_value(vals.secret.clone(), window, cx));
-        self.initial_path_input
-            .update(cx, |s, cx| s.set_value(vals.initial_path.clone(), window, cx));
+        self.initial_path_input.update(cx, |s, cx| {
+            s.set_value(vals.initial_path.clone(), window, cx)
+        });
 
         self.sftp_host_input
             .update(cx, |s, cx| s.set_value(vals.sftp_host.clone(), window, cx));
@@ -470,8 +466,9 @@ impl ConnectionFormInputs {
         self.ftp_user_input
             .update(cx, |s, cx| s.set_value(vals.ftp_user.clone(), window, cx));
 
-        self.s3_endpoint_input
-            .update(cx, |s, cx| s.set_value(vals.s3_endpoint.clone(), window, cx));
+        self.s3_endpoint_input.update(cx, |s, cx| {
+            s.set_value(vals.s3_endpoint.clone(), window, cx)
+        });
         self.s3_region_input
             .update(cx, |s, cx| s.set_value(vals.s3_region.clone(), window, cx));
         self.s3_access_key_input.update(cx, |s, cx| {
@@ -494,8 +491,9 @@ impl ConnectionFormInputs {
         self.webdav_endpoint_input.update(cx, |s, cx| {
             s.set_value(vals.webdav_endpoint.clone(), window, cx)
         });
-        self.webdav_user_input
-            .update(cx, |s, cx| s.set_value(vals.webdav_user.clone(), window, cx));
+        self.webdav_user_input.update(cx, |s, cx| {
+            s.set_value(vals.webdav_user.clone(), window, cx)
+        });
 
         self.gdrive_client_id_input.update(cx, |s, cx| {
             s.set_value(vals.gdrive_client_id.clone(), window, cx)
@@ -503,8 +501,9 @@ impl ConnectionFormInputs {
         self.gdrive_client_secret_input.update(cx, |s, cx| {
             s.set_value(vals.gdrive_client_secret.clone(), window, cx)
         });
-        self.gdrive_proxy_input
-            .update(cx, |s, cx| s.set_value(vals.gdrive_proxy.clone(), window, cx));
+        self.gdrive_proxy_input.update(cx, |s, cx| {
+            s.set_value(vals.gdrive_proxy.clone(), window, cx)
+        });
 
         self.onedrive_client_id_input.update(cx, |s, cx| {
             s.set_value(vals.onedrive_client_id.clone(), window, cx)
@@ -516,38 +515,54 @@ impl ConnectionFormInputs {
 
     pub fn refresh_placeholders(&self, window: &mut Window, cx: &mut Context<RustduckWorkspace>) {
         let t = i18n();
-        self.bookmark_search_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_search_bookmarks(), window, cx));
-        self.name_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_conn_name(), window, cx));
-        self.sftp_host_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_sftp_host(), window, cx));
-        self.sftp_key_path_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_sftp_key_path(), window, cx));
-        self.ftp_host_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_ftp_host(), window, cx));
-        self.s3_bucket_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_s3_bucket(), window, cx));
-        self.smb_server_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_smb_server(), window, cx));
-        self.smb_share_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_smb_share(), window, cx));
-        self.smb_domain_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_smb_domain(), window, cx));
-        self.webdav_endpoint_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_webdav_endpoint(), window, cx));
-        self.gdrive_client_id_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_oauth_client_id(), window, cx));
-        self.gdrive_client_secret_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_oauth_client_secret(), window, cx));
-        self.gdrive_proxy_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_proxy_url(), window, cx));
-        self.onedrive_client_id_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_oauth_client_id(), window, cx));
-        self.onedrive_proxy_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_proxy_url(), window, cx));
-        self.secret_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_secret(), window, cx));
+        self.bookmark_search_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_search_bookmarks(), window, cx)
+        });
+        self.name_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_conn_name(), window, cx)
+        });
+        self.sftp_host_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_sftp_host(), window, cx)
+        });
+        self.sftp_key_path_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_sftp_key_path(), window, cx)
+        });
+        self.ftp_host_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_ftp_host(), window, cx)
+        });
+        self.s3_bucket_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_s3_bucket(), window, cx)
+        });
+        self.smb_server_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_smb_server(), window, cx)
+        });
+        self.smb_share_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_smb_share(), window, cx)
+        });
+        self.smb_domain_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_smb_domain(), window, cx)
+        });
+        self.webdav_endpoint_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_webdav_endpoint(), window, cx)
+        });
+        self.gdrive_client_id_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_oauth_client_id(), window, cx)
+        });
+        self.gdrive_client_secret_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_oauth_client_secret(), window, cx)
+        });
+        self.gdrive_proxy_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_proxy_url(), window, cx)
+        });
+        self.onedrive_client_id_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_oauth_client_id(), window, cx)
+        });
+        self.onedrive_proxy_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_proxy_url(), window, cx)
+        });
+        self.secret_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_secret(), window, cx)
+        });
     }
 }
 
@@ -946,22 +961,31 @@ impl TabSession {
         }
     }
 
-    pub fn refresh_placeholders(&mut self, window: &mut Window, cx: &mut Context<RustduckWorkspace>) {
+    pub fn refresh_placeholders(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<RustduckWorkspace>,
+    ) {
         let t = i18n();
         if !self.is_connected && I18n::is_default_tab_title(&self.title) {
             self.title = t.default_tab_title().to_string();
         }
         self.form.refresh_placeholders(window, cx);
-        self.local_filter_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_filter_local(), window, cx));
-        self.remote_filter_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_filter_remote(), window, cx));
-        self.local_action_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_inline_name(), window, cx));
-        self.remote_action_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_inline_name(), window, cx));
-        self.new_folder_input
-            .update(cx, |s, cx| s.set_placeholder(t.placeholder_inline_name(), window, cx));
+        self.local_filter_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_filter_local(), window, cx)
+        });
+        self.remote_filter_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_filter_remote(), window, cx)
+        });
+        self.local_action_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_inline_name(), window, cx)
+        });
+        self.remote_action_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_inline_name(), window, cx)
+        });
+        self.new_folder_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_inline_name(), window, cx)
+        });
         self.rebuild_visible_cache(true, cx);
         self.rebuild_visible_cache(false, cx);
     }
@@ -1046,11 +1070,7 @@ pub fn detect_newly_completed_transfers(
         }
     }
 
-    (
-        has_active,
-        newly_completed_upload,
-        newly_completed_download,
-    )
+    (has_active, newly_completed_upload, newly_completed_download)
 }
 
 pub fn workspace_window_options(bounds: gpui::Bounds<gpui::Pixels>) -> gpui::WindowOptions {
@@ -1063,6 +1083,50 @@ pub fn workspace_window_options(bounds: gpui::Bounds<gpui::Pixels>) -> gpui::Win
         titlebar.title = Some("Rustduck".into());
     }
     window_options
+}
+
+gpui_kit::actions!(rustduck, [QuitApp]);
+
+/// Returns the application quit policy. Unlike GPUI's `QuitMode::Default` (which uses
+/// `QuitMode::Explicit` on macOS and leaves a windowless Dock icon), Rustduck always
+/// exits the process when the main/last window closes.
+pub fn preferred_app_quit_mode() -> gpui::QuitMode {
+    gpui::QuitMode::LastWindowClosed
+}
+
+/// Determines whether closing a window should immediately quit the application process.
+pub fn should_quit_after_window_closed(is_main_window: bool, remaining_windows: usize) -> bool {
+    is_main_window || remaining_windows == 0
+}
+
+pub fn macos_quit_keybinding() -> gpui::KeyBinding {
+    gpui::KeyBinding::new("cmd-q", QuitApp, None)
+}
+
+pub fn build_macos_app_menus() -> Vec<gpui::Menu> {
+    vec![gpui::Menu::new("Rustduck").items([gpui::MenuItem::action("Quit Rustduck", QuitApp)])]
+}
+
+pub fn configure_app_lifecycle(cx: &mut App) {
+    cx.set_quit_mode(preferred_app_quit_mode());
+    cx.on_action(|_: &QuitApp, cx| {
+        cx.quit();
+    });
+    #[cfg(target_os = "macos")]
+    {
+        cx.bind_keys([macos_quit_keybinding()]);
+        cx.set_menus(build_macos_app_menus());
+    }
+}
+
+pub fn register_main_window_close_quit(main_window: gpui::AnyWindowHandle, cx: &mut App) {
+    let main_window_id = main_window.window_id();
+    cx.on_window_closed(move |cx, closed_id| {
+        if should_quit_after_window_closed(closed_id == main_window_id, cx.windows().len()) {
+            cx.quit();
+        }
+    })
+    .detach();
 }
 
 pub fn ensure_valid_local_dir_or_fallback(path: &str) -> (String, bool) {
@@ -1134,8 +1198,7 @@ impl RustduckWorkspace {
         let config_path = BookmarkStore::default_config_path();
         let bookmark_store = BookmarkStore::load_or_default(config_path, vault)
             .expect("Failed to initialize BookmarkStore");
-        let first_tab =
-            TabSession::new_with_initial_local_dir(effective_initial_local, window, cx);
+        let first_tab = TabSession::new_with_initial_local_dir(effective_initial_local, window, cx);
         let native_file_list_host = Arc::new(NativeFileListHost::new());
 
         let mut ws = Self {
@@ -1157,7 +1220,24 @@ impl RustduckWorkspace {
         ws.start_transfer_watcher(cx);
         ws.start_native_event_watcher(window, cx);
         ws.start_daily_update_checker(cx);
+        cx.on_app_quit(|ws, _cx| {
+            ws.release_all_resources();
+            std::future::ready(())
+        })
+        .detach();
         ws
+    }
+
+    /// Deterministically cancels active/queued transfers, drops all open remote storage
+    /// connections across tabs, and tears down native OS file list controls & event streams.
+    /// Idempotent across `on_app_quit` and `Drop`.
+    pub fn release_all_resources(&mut self) {
+        self.transfer_manager.shutdown();
+        for tab in &mut self.tabs {
+            tab.remote_backend = None;
+            tab.is_connected = false;
+        }
+        self.native_file_list_host.teardown();
     }
 
     pub fn set_s3_default_acl(&mut self, acl: S3UploadAcl, cx: &mut Context<Self>) {
@@ -1255,7 +1335,10 @@ impl RustduckWorkspace {
 
     fn start_daily_update_checker(&mut self, cx: &mut Context<Self>) {
         let now_unix = chrono::Utc::now().timestamp();
-        if self.preferences_store.should_run_daily_update_check(now_unix) {
+        if self
+            .preferences_store
+            .should_run_daily_update_check(now_unix)
+        {
             self.trigger_update_check(false, cx);
         }
 
@@ -1305,17 +1388,13 @@ impl RustduckWorkspace {
         .detach();
     }
 
-    pub fn set_language(
-        &mut self,
-        lang: AppLanguage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_language(&mut self, lang: AppLanguage, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self.preferences_store.set_language(lang);
         set_current_language(lang);
         let custom_dir_placeholder = i18n().placeholder_custom_local_dir();
-        self.settings_custom_local_dir_input
-            .update(cx, |s, cx| s.set_placeholder(custom_dir_placeholder, window, cx));
+        self.settings_custom_local_dir_input.update(cx, |s, cx| {
+            s.set_placeholder(custom_dir_placeholder, window, cx)
+        });
         for tab in &mut self.tabs {
             tab.refresh_placeholders(window, cx);
         }
@@ -1417,12 +1496,8 @@ impl RustduckWorkspace {
         let search_input = self.tabs[tab_idx].form.bookmark_search_input.clone();
         let blank = FormFieldValues::blank_for_protocol(protocol);
         self.tabs[tab_idx].form.apply_values(&blank, window, cx);
-        let fresh_form = ConnectionFormInputs::new_with_search_and_protocol(
-            search_input,
-            protocol,
-            window,
-            cx,
-        );
+        let fresh_form =
+            ConnectionFormInputs::new_with_search_and_protocol(search_input, protocol, window, cx);
         self.tabs[tab_idx].form = fresh_form;
         self.tabs[tab_idx].status_message = Some(t.msg_reset_blank_form());
         cx.notify();
@@ -1610,9 +1685,12 @@ impl RustduckWorkspace {
         let secret_missing = secret.trim().is_empty()
             && match &bm.config {
                 ProtocolConfig::S3(_) | ProtocolConfig::WebDav(_) => true,
-                ProtocolConfig::Sftp(c) => {
-                    c.private_key_path.as_deref().unwrap_or("").trim().is_empty()
-                }
+                ProtocolConfig::Sftp(c) => c
+                    .private_key_path
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty(),
                 ProtocolConfig::Ftp(c) => {
                     !c.username.trim().is_empty()
                         && !c.username.trim().eq_ignore_ascii_case("anonymous")
@@ -1693,12 +1771,7 @@ impl RustduckWorkspace {
         .detach();
     }
 
-    pub fn connect_tab(
-        &mut self,
-        tab_idx: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn connect_tab(&mut self, tab_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let t = i18n();
         let (title, config, secret) = self.read_form_config(tab_idx, cx);
         let backend = match create_backend(&config, &secret) {
@@ -1989,12 +2062,7 @@ impl RustduckWorkspace {
         cx.notify();
     }
 
-    pub fn cancel_inline_action(
-        &mut self,
-        tab_idx: usize,
-        is_local: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn cancel_inline_action(&mut self, tab_idx: usize, is_local: bool, cx: &mut Context<Self>) {
         let tab = &mut self.tabs[tab_idx];
         if is_local {
             tab.local_inline_action = None;
@@ -2448,12 +2516,7 @@ impl RustduckWorkspace {
                     if let Some(idx) = ws.tabs.iter().position(|t| t.id == tab_id) {
                         match res {
                             Ok(()) => {
-                                ws.set_selected_paths(
-                                    idx,
-                                    is_local,
-                                    vec![dst_for_select],
-                                    cx,
-                                );
+                                ws.set_selected_paths(idx, is_local, vec![dst_for_select], cx);
                                 if is_local {
                                     ws.spawn_local_list(idx, cx);
                                 } else {
@@ -2827,9 +2890,7 @@ impl RustduckWorkspace {
                             &source_paths,
                         );
                         for entry in entries {
-                            self.enqueue_file_transfer_to_dir(
-                                tab_idx, true, &entry, &dest_dir, cx,
-                            );
+                            self.enqueue_file_transfer_to_dir(tab_idx, true, &entry, &dest_dir, cx);
                         }
                     }
                 }
@@ -2898,21 +2959,17 @@ impl RustduckWorkspace {
             }))
             .children(tab_items)
             .suffix(
-                div()
-                    .pl_1()
-                    .flex()
-                    .items_center()
-                    .child(
-                        Button::new("new-tab-btn")
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .icon(IconName::Plus)
-                            .tooltip(t.new_tab_tooltip())
-                            .on_click(cx.listener(|this, _ev, window, cx| {
-                                this.add_tab(window, cx);
-                            })),
-                    ),
+                div().pl_1().flex().items_center().child(
+                    Button::new("new-tab-btn")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Plus)
+                        .tooltip(t.new_tab_tooltip())
+                        .on_click(cx.listener(|this, _ev, window, cx| {
+                            this.add_tab(window, cx);
+                        })),
+                ),
             );
 
         let left_brand_and_tabs = h_flex()
@@ -3095,7 +3152,12 @@ impl Render for RustduckWorkspace {
         let transfer_tasks = self.transfer_manager.snapshot();
         let active_transfer_count = transfer_tasks
             .iter()
-            .filter(|t| matches!(t.status, TransferStatus::InProgress | TransferStatus::Queued))
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TransferStatus::InProgress | TransferStatus::Queued
+                )
+            })
             .count();
 
         let title_bar_el = self.render_custom_title_bar(
@@ -3113,9 +3175,7 @@ impl Render for RustduckWorkspace {
         let action_modal_el = is_connected
             .then(|| render_pane_action_modal(active_idx, self, cx))
             .flatten();
-        let settings_modal_el = self
-            .settings_open
-            .then(|| render_settings_modal(self, cx));
+        let settings_modal_el = self.settings_open.then(|| render_settings_modal(self, cx));
 
         v_flex()
             .relative()
@@ -3123,23 +3183,23 @@ impl Render for RustduckWorkspace {
             .bg(bg_canvas())
             .text_color(text_primary())
             .child(title_bar_el)
-            .child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(body_el),
-            )
+            .child(div().flex_1().w_full().overflow_hidden().child(body_el))
             .child(drawer_el)
             .when_some(action_modal_el, |el, modal| el.child(modal))
             .when_some(settings_modal_el, |el, modal| el.child(modal))
     }
 }
 
+impl Drop for RustduckWorkspace {
+    fn drop(&mut self) {
+        self.release_all_resources();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{px, size, Bounds, Point};
+    use gpui::{Bounds, Point, px, size};
 
     #[test]
     fn test_workspace_window_options_sets_taskbar_title_and_custom_titlebar() {
@@ -3486,7 +3546,8 @@ mod tests {
 
     #[test]
     fn test_format_single_line_status_and_error_classification() {
-        let multiline = "Connection failed:\n\tSignatureDoesNotMatch   \n  The Signature is invalid.";
+        let multiline =
+            "Connection failed:\n\tSignatureDoesNotMatch   \n  The Signature is invalid.";
         let clean = format_single_line_status(multiline);
         assert_eq!(
             clean,
@@ -3498,7 +3559,9 @@ mod tests {
         assert!(is_error_status_message("连接失败: S3 签名错误"));
         assert!(is_error_status_message("Connection failed: 403 Forbidden"));
         assert!(is_error_status_message("连接参数无效: 请填写 SecretKey"));
-        assert!(is_error_status_message("Invalid connection config: missing SecretKey"));
+        assert!(is_error_status_message(
+            "Invalid connection config: missing SecretKey"
+        ));
         assert!(!is_error_status_message("已载入收藏配置「ace-cdn-na」"));
         assert!(!is_error_status_message("Loaded favorite \"ace-cdn-na\""));
     }
@@ -3519,8 +3582,40 @@ mod tests {
             ensure_valid_local_dir_or_fallback(&valid_str);
         assert!(fell_back_after_delete);
         assert_ne!(fallback_path, valid_str);
-        assert!(std::fs::metadata(&fallback_path)
-            .map(|m| m.is_dir())
-            .unwrap_or(false));
+        assert!(
+            std::fs::metadata(&fallback_path)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn test_quit_mode_and_main_window_close_policy_exits_cleanly_on_macos() {
+        // On macOS, gpui::QuitMode::Default leaves the app running in the Dock with no window.
+        // Rustduck must explicitly use QuitMode::LastWindowClosed across all platforms.
+        assert_eq!(preferred_app_quit_mode(), gpui::QuitMode::LastWindowClosed);
+
+        // Closing the main window must always trigger process exit, even if an auxiliary window exists.
+        assert!(should_quit_after_window_closed(true, 1));
+        assert!(should_quit_after_window_closed(true, 0));
+        // Closing the last remaining window must also trigger process exit.
+        assert!(should_quit_after_window_closed(false, 0));
+        // Closing a non-main auxiliary window while the main window remains open must not quit.
+        assert!(!should_quit_after_window_closed(false, 1));
+
+        // Verify macOS menu bar & Cmd+Q keybinding construct cleanly without runtime parse panics.
+        let _kb = macos_quit_keybinding();
+        let menus = build_macos_app_menus();
+        assert_eq!(menus.len(), 1);
+        assert_eq!(menus[0].name.as_ref(), "Rustduck");
+        assert_eq!(menus[0].items.len(), 1);
+
+        let main_src = include_str!("../main.rs");
+        assert!(
+            main_src.contains("preferred_app_quit_mode()")
+                && main_src.contains("configure_app_lifecycle(")
+                && main_src.contains("register_main_window_close_quit("),
+            "main.rs must configure LastWindowClosed quit mode, app lifecycle menus/shortcuts, and main window close quit guard"
+        );
     }
 }

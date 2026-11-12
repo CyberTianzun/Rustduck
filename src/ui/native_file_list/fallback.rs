@@ -16,6 +16,10 @@ impl PlatformHost {
 
     pub fn hide_all(&self) {}
 
+    pub fn teardown(&self) {
+        self.events.lock().unwrap().close();
+    }
+
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
         self.events.lock().unwrap().drain()
     }

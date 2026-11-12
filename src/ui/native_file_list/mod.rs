@@ -4,18 +4,18 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-use crate::models::{format_bytes, FileEntry, FileKind};
-use crate::ui::file_pane::{format_modified_time, join_local_or_remote, SortColumn};
-use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use crate::models::{FileEntry, FileKind, format_bytes};
+use crate::ui::file_pane::{SortColumn, format_modified_time, join_local_or_remote};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+use fallback::PlatformHost;
 #[cfg(target_os = "macos")]
 use macos::PlatformHost;
 #[cfg(target_os = "windows")]
 use windows::PlatformHost;
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-use fallback::PlatformHost;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeContextMenuAction {
@@ -220,11 +220,7 @@ where
     let mut cur = first_index;
     let mut steps = 0usize;
     let max_steps = rows.len();
-    while cur < rows.len()
-        && cur != MACOS_NS_NOT_FOUND
-        && cur != usize::MAX
-        && steps < max_steps
-    {
+    while cur < rows.len() && cur != MACOS_NS_NOT_FOUND && cur != usize::MAX && steps < max_steps {
         if let Some(r) = rows.get(cur) {
             if !r.is_parent_row {
                 out.push(r.path.clone());
@@ -351,6 +347,11 @@ impl NativeEventSink {
         self.wakeup_senders.push(tx);
         rx
     }
+
+    pub(crate) fn close(&mut self) {
+        self.events.clear();
+        self.wakeup_senders.clear();
+    }
 }
 
 #[derive(Default)]
@@ -371,6 +372,10 @@ impl NativeFileListHost {
 
     pub fn hide_all(&self) {
         self.inner.hide_all();
+    }
+
+    pub fn teardown(&self) {
+        self.inner.teardown();
     }
 
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
@@ -423,7 +428,10 @@ mod tests {
 
         assert_eq!(map_row_index_to_entry(0, true, &entries), Some(Err(())));
         assert_eq!(
-            map_row_index_to_entry(1, true, &entries).unwrap().unwrap().name,
+            map_row_index_to_entry(1, true, &entries)
+                .unwrap()
+                .unwrap()
+                .name,
             "docs"
         );
         assert_eq!(map_row_index_to_entry(99, true, &entries), None);
@@ -666,6 +674,27 @@ mod tests {
         assert_eq!(
             sanitize_pane_bounds_px(0.0, 80.0, 0.0, 650.0, 1280.0, 800.0, 2.0),
             None
+        );
+    }
+
+    #[test]
+    fn test_native_file_list_host_teardown_closes_wakeup_stream_idempotently() {
+        let host = NativeFileListHost::new();
+        let mut rx = host.subscribe_wakeup();
+        host.push_event(NativePaneEvent::NavigateUp { is_local: true });
+
+        host.teardown();
+        host.teardown();
+
+        assert!(host.drain_events().is_empty());
+        // After teardown drops wakeup senders, draining any buffered wakeup reaches Disconnected EOF
+        while rx.try_recv().is_ok() {}
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(futures::channel::mpsc::TryRecvError::Closed)
+            ),
+            "teardown must close wakeup channels so background watcher exits immediately"
         );
     }
 }

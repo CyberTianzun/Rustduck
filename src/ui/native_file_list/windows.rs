@@ -1,7 +1,7 @@
 use super::{
-    map_row_index_to_entry, resolve_drop_destination_dir, resolve_inline_rename_entry,
-    should_commit_inline_rename, NativeContextMenuAction, NativeEventSink, NativePaneEvent,
-    NativePaneSnapshot, NativeRowViewModel,
+    NativeContextMenuAction, NativeEventSink, NativePaneEvent, NativePaneSnapshot,
+    NativeRowViewModel, map_row_index_to_entry, resolve_drop_destination_dir,
+    resolve_inline_rename_entry, should_commit_inline_rename,
 };
 use crate::i18n::i18n;
 use crate::models::FileEntry;
@@ -16,32 +16,31 @@ use std::ptr::null;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateFontIndirectW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect,
-    InvalidateRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS,
-    DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, TRANSPARENT,
+    ClientToScreen, CreateFontIndirectW, CreateSolidBrush, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, HFONT, HGDIOBJ,
+    InvalidateRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize, RevokeDragDrop};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, SetWindowTheme, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT,
-    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, CDRF_SKIPDEFAULT, HDITEMW, HDF_LEFT, HDF_RIGHT,
-    HDF_SORTDOWN, HDF_SORTUP, HDF_STRING, HDI_FORMAT, HDM_GETITEMW, HDM_SETITEMW,
-    HEADER_CONTROL_FORMAT_FLAGS, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCFMT_LEFT,
-    LVCFMT_RIGHT, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_IMAGE,
-    LVIF_STATE, LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_EDITLABELW, LVM_ENSUREVISIBLE,
-    LVM_GETHEADER, LVM_GETNEXTITEM, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS,
-    LVM_SETBKCOLOR, LVM_SETCOLUMNW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
-    LVNI_FOCUSED, LVNI_SELECTED, LVN_BEGINDRAG, LVN_BEGINLABELEDITW, LVN_COLUMNCLICK,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT,
+    CDRF_SKIPDEFAULT, HDF_LEFT, HDF_RIGHT, HDF_SORTDOWN, HDF_SORTUP, HDF_STRING, HDI_FORMAT,
+    HDITEMW, HDM_GETITEMW, HDM_SETITEMW, HEADER_CONTROL_FORMAT_FLAGS, ICC_LISTVIEW_CLASSES,
+    INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT,
+    LVCFMT_RIGHT, LVCOLUMNW, LVHITTESTINFO, LVIF_IMAGE, LVIF_STATE, LVIF_TEXT, LVIS_SELECTED,
+    LVITEMW, LVM_EDITLABELW, LVM_ENSUREVISIBLE, LVM_GETHEADER, LVM_GETNEXTITEM, LVM_HITTEST,
+    LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETBKCOLOR, LVM_SETCOLUMNW, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
+    LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVN_BEGINDRAG, LVN_BEGINLABELEDITW, LVN_COLUMNCLICK,
     LVN_ENDLABELEDITW, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVN_ODSTATECHANGED,
-    LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, LVSIL_SMALL, LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_HEADERDRAGDROP, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS,
-    LVS_SHOWSELALWAYS, NMCUSTOMDRAW, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW,
-    NMLVKEYDOWN, NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, WC_LISTVIEWW,
+    LVNI_FOCUSED, LVNI_SELECTED, LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_HEADERDRAGDROP, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS,
+    LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, LVSIL_SMALL, NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK,
+    NMCUSTOMDRAW, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN, SetWindowTheme,
+    WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_F2,
@@ -49,28 +48,29 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 #[cfg(test)]
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP,
+    RemoveWindowSubclass, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
+    SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SetWindowSubclass,
+};
 #[cfg(test)]
 use windows::Win32::UI::Shell::{
     ILFindLastID, ILFree, IShellFolder, SHBindToObject, SHBindToParent, SHParseDisplayName,
 };
-use windows::Win32::UI::Shell::{
-    DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint,
-    RemoveWindowSubclass, SHGetFileInfoW, SetWindowSubclass, HDROP, SHFILEINFOW, SHGFI_SMALLICON,
-    SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
-};
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::WS_POPUP;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetClientRect,
-    GetCursorPos, GetWindowLongW, LoadCursorW, PostMessageW, SendMessageW, SetCursor,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GWL_STYLE,
+    GetClientRect, GetCursorPos, GetWindowLongW, HMENU, IDC_ARROW, IDC_HAND, LoadCursorW,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW, PostMessageW, SPI_GETNONCLIENTMETRICS,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor,
     SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    TrackPopupMenuEx, GWL_STYLE, HMENU, IDC_ARROW, IDC_HAND, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DROPFILES, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NOTIFY, WM_NULL, WM_RBUTTONDOWN, WM_SETFONT,
-    WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_APP, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NOTIFY, WM_NULL, WM_RBUTTONDOWN, WM_SETFONT, WS_CHILD,
+    WS_CLIPCHILDREN, WS_TABSTOP,
 };
+use windows::core::{PCWSTR, PWSTR, w};
 
 const PARENT_SUBCLASS_ID: usize = 0x5244_0001;
 const CHILD_SUBCLASS_ID: usize = 0x5244_0002;
@@ -88,9 +88,9 @@ const CMD_REFRESH: u32 = 30_007;
 const CMD_REVEAL_IN_SHELL: u32 = 30_008;
 
 #[inline]
-unsafe fn send_msg(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT { unsafe {
-    SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(LPARAM(lparam)))
-}}
+unsafe fn send_msg(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
+    unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(LPARAM(lparam))) }
+}
 
 pub fn can_use_shell_context_menu(current_path: &str, selected_paths: &[String]) -> bool {
     let trimmed = current_path.trim();
@@ -527,6 +527,29 @@ impl PlatformHost {
         }
     }
 
+    pub fn teardown(&self) {
+        let (left_hwnd, right_hwnd, parent_hwnd, subclass_ctx_ptr) = {
+            let mut guard = self.state.lock().unwrap();
+            let tup = (
+                guard.left.hwnd,
+                guard.right.hwnd,
+                guard.parent_hwnd,
+                guard.subclass_ctx_ptr,
+            );
+            guard.left.hwnd = 0;
+            guard.right.hwnd = 0;
+            guard.left.visible = false;
+            guard.right.visible = false;
+            guard.parent_hwnd = 0;
+            guard.subclass_ctx_ptr = 0;
+            guard.events.close();
+            tup
+        };
+        unsafe {
+            teardown_win32_controls(left_hwnd, right_hwnd, parent_hwnd, subclass_ctx_ptr);
+        }
+    }
+
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
         let mut guard = self.state.lock().unwrap();
         guard.events.drain()
@@ -545,9 +568,7 @@ impl PlatformHost {
     fn ensure_controls_created(&self, parent_hwnd_val: isize) {
         let (old_left, old_right, old_parent, old_ctx, font_val) = {
             let mut guard = self.state.lock().unwrap();
-            if guard.parent_hwnd == parent_hwnd_val
-                && guard.left.hwnd != 0
-                && guard.right.hwnd != 0
+            if guard.parent_hwnd == parent_hwnd_val && guard.left.hwnd != 0 && guard.right.hwnd != 0
             {
                 return;
             }
@@ -612,22 +633,24 @@ unsafe fn teardown_win32_controls(
     right_hwnd_val: isize,
     parent_hwnd_val: isize,
     subclass_ctx_ptr: usize,
-) { unsafe {
-    for child_val in [left_hwnd_val, right_hwnd_val] {
-        if child_val != 0 {
-            let child = HWND(child_val as *mut c_void);
-            let _ = RemoveWindowSubclass(child, Some(child_subclass_proc), CHILD_SUBCLASS_ID);
-            let _ = DestroyWindow(child);
+) {
+    unsafe {
+        for child_val in [left_hwnd_val, right_hwnd_val] {
+            if child_val != 0 {
+                let child = HWND(child_val as *mut c_void);
+                let _ = RemoveWindowSubclass(child, Some(child_subclass_proc), CHILD_SUBCLASS_ID);
+                let _ = DestroyWindow(child);
+            }
+        }
+        if parent_hwnd_val != 0 {
+            let parent = HWND(parent_hwnd_val as *mut c_void);
+            let _ = RemoveWindowSubclass(parent, Some(parent_subclass_proc), PARENT_SUBCLASS_ID);
+        }
+        if subclass_ctx_ptr != 0 {
+            let _ = Box::from_raw(subclass_ctx_ptr as *mut SubclassContext);
         }
     }
-    if parent_hwnd_val != 0 {
-        let parent = HWND(parent_hwnd_val as *mut c_void);
-        let _ = RemoveWindowSubclass(parent, Some(parent_subclass_proc), PARENT_SUBCLASS_ID);
-    }
-    if subclass_ctx_ptr != 0 {
-        let _ = Box::from_raw(subclass_ctx_ptr as *mut SubclassContext);
-    }
-}}
+}
 
 impl Drop for HostInner {
     fn drop(&mut self) {
@@ -777,39 +800,48 @@ fn resize_columns_to_width(hwnd: HWND, total_width: i32) {
     }
 }
 
-unsafe fn apply_uxtheme_dark_mode(hwnd: HWND, header_hwnd: HWND, is_dark: bool) { unsafe {
-    let hmod = GetModuleHandleW(w!("uxtheme.dll"))
-        .or_else(|_| LoadLibraryW(w!("uxtheme.dll")))
-        .unwrap_or_default();
-    if hmod.is_invalid() {
-        return;
-    }
+unsafe fn apply_uxtheme_dark_mode(hwnd: HWND, header_hwnd: HWND, is_dark: bool) {
+    unsafe {
+        let hmod = GetModuleHandleW(w!("uxtheme.dll"))
+            .or_else(|_| LoadLibraryW(w!("uxtheme.dll")))
+            .unwrap_or_default();
+        if hmod.is_invalid() {
+            return;
+        }
 
-    // Ordinal 135: SetPreferredAppMode(mode: i32) -> i32 (2 = ForceDark, 3 = ForceLight)
-    if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(135usize as *const u8)) {
-        let set_app_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(proc);
-        let _ = set_app_mode(if is_dark { 2 } else { 3 });
-    }
-    // Ordinal 133: AllowDarkModeForWindow(hwnd: HWND, allow: bool) -> bool
-    if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(133usize as *const u8)) {
-        let allow_dark: unsafe extern "system" fn(HWND, bool) -> bool = std::mem::transmute(proc);
-        let _ = allow_dark(hwnd, is_dark);
-        if !header_hwnd.0.is_null() {
-            let _ = allow_dark(header_hwnd, is_dark);
+        // Ordinal 135: SetPreferredAppMode(mode: i32) -> i32 (2 = ForceDark, 3 = ForceLight)
+        if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(135usize as *const u8)) {
+            let set_app_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(proc);
+            let _ = set_app_mode(if is_dark { 2 } else { 3 });
+        }
+        // Ordinal 133: AllowDarkModeForWindow(hwnd: HWND, allow: bool) -> bool
+        if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(133usize as *const u8)) {
+            let allow_dark: unsafe extern "system" fn(HWND, bool) -> bool =
+                std::mem::transmute(proc);
+            let _ = allow_dark(hwnd, is_dark);
+            if !header_hwnd.0.is_null() {
+                let _ = allow_dark(header_hwnd, is_dark);
+            }
+        }
+        // Ordinal 136: FlushMenuThemes()
+        if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(136usize as *const u8)) {
+            let flush_menus: unsafe extern "system" fn() = std::mem::transmute(proc);
+            flush_menus();
         }
     }
-    // Ordinal 136: FlushMenuThemes()
-    if let Some(proc) = GetProcAddress(hmod, windows::core::PCSTR(136usize as *const u8)) {
-        let flush_menus: unsafe extern "system" fn() = std::mem::transmute(proc);
-        flush_menus();
-    }
-}}
+}
 
 fn apply_listview_theme(hwnd: HWND, is_dark: bool) {
     let (bg, fg) = if is_dark {
-        (rgb_colorref(0x11, 0x13, 0x18), rgb_colorref(0xf1, 0xf5, 0xf9))
+        (
+            rgb_colorref(0x11, 0x13, 0x18),
+            rgb_colorref(0xf1, 0xf5, 0xf9),
+        )
     } else {
-        (rgb_colorref(0xf8, 0xfa, 0xfc), rgb_colorref(0x0f, 0x17, 0x2a))
+        (
+            rgb_colorref(0xf8, 0xfa, 0xfc),
+            rgb_colorref(0x0f, 0x17, 0x2a),
+        )
     };
 
     unsafe {
@@ -952,39 +984,46 @@ unsafe extern "system" fn parent_subclass_proc(
     lparam: LPARAM,
     _uidsubclass: usize,
     dwrefdata: usize,
-) -> LRESULT { unsafe {
-    if matches!(umsg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
-        let _ = SetFocus(Some(hwnd));
-    }
-    if umsg == WM_NOTIFY && lparam.0 != 0 && dwrefdata != 0 {
-        let ctx = &*(dwrefdata as *const SubclassContext);
-        if let Some(state) = ctx.state.upgrade() {
-            let hdr = &*(lparam.0 as *const NMHDR);
-            let from_val = hdr.hwndFrom.0 as isize;
+) -> LRESULT {
+    unsafe {
+        if matches!(umsg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+            let _ = SetFocus(Some(hwnd));
+        }
+        if umsg == WM_NOTIFY && lparam.0 != 0 && dwrefdata != 0 {
+            let ctx = &*(dwrefdata as *const SubclassContext);
+            if let Some(state) = ctx.state.upgrade() {
+                let hdr = &*(lparam.0 as *const NMHDR);
+                let from_val = hdr.hwndFrom.0 as isize;
 
-            let pane_side = {
-                let guard = state.lock().unwrap();
-                if from_val != 0 && from_val == guard.left.hwnd {
-                    Some(true)
-                } else if from_val != 0 && from_val == guard.right.hwnd {
-                    Some(false)
-                } else {
-                    None
-                }
-            };
+                let pane_side = {
+                    let guard = state.lock().unwrap();
+                    if from_val != 0 && from_val == guard.left.hwnd {
+                        Some(true)
+                    } else if from_val != 0 && from_val == guard.right.hwnd {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                };
 
-            if let Some(is_local) = pane_side {
-                if let Some(res) =
-                    handle_listview_notify(ctx, &state, hdr.hwndFrom, is_local, hdr.code, lparam)
-                {
-                    return res;
+                if let Some(is_local) = pane_side {
+                    if let Some(res) = handle_listview_notify(
+                        ctx,
+                        &state,
+                        hdr.hwndFrom,
+                        is_local,
+                        hdr.code,
+                        lparam,
+                    ) {
+                        return res;
+                    }
                 }
             }
         }
-    }
 
-    DefSubclassProc(hwnd, umsg, wparam, lparam)
-}}
+        DefSubclassProc(hwnd, umsg, wparam, lparam)
+    }
+}
 
 unsafe fn handle_listview_notify(
     ctx: &SubclassContext,
@@ -993,236 +1032,101 @@ unsafe fn handle_listview_notify(
     is_local: bool,
     code: u32,
     lparam: LPARAM,
-) -> Option<LRESULT> { unsafe {
-    match code {
-        LVN_GETDISPINFOW => {
-            let di = &mut *(lparam.0 as *mut NMLVDISPINFOW);
-            let row_idx = di.item.iItem as usize;
-            let sub_item = di.item.iSubItem;
+) -> Option<LRESULT> {
+    unsafe {
+        match code {
+            LVN_GETDISPINFOW => {
+                let di = &mut *(lparam.0 as *mut NMLVDISPINFOW);
+                let row_idx = di.item.iItem as usize;
+                let sub_item = di.item.iSubItem;
 
-            let mut guard = state.lock().unwrap();
-            let row_opt = if is_local {
-                guard.left.rows.get(row_idx).cloned()
-            } else {
-                guard.right.rows.get(row_idx).cloned()
-            };
+                let mut guard = state.lock().unwrap();
+                let row_opt = if is_local {
+                    guard.left.rows.get(row_idx).cloned()
+                } else {
+                    guard.right.rows.get(row_idx).cloned()
+                };
 
-            if let Some(row) = row_opt {
-                if (di.item.mask & LVIF_TEXT) != Default::default()
-                    && !di.item.pszText.is_null()
-                    && di.item.cchTextMax > 0
-                {
-                    let text = match sub_item {
-                        0 => row.name.as_str(),
-                        1 => row.modified_text.as_str(),
-                        2 => row.size_text.as_str(),
-                        _ => "",
-                    };
-                    let max_chars = (di.item.cchTextMax as usize).saturating_sub(1);
-                    let mut count = 0usize;
-                    let dst = di.item.pszText.0;
-                    for unit in text.encode_utf16().take(max_chars) {
-                        *dst.add(count) = unit;
-                        count += 1;
+                if let Some(row) = row_opt {
+                    if (di.item.mask & LVIF_TEXT) != Default::default()
+                        && !di.item.pszText.is_null()
+                        && di.item.cchTextMax > 0
+                    {
+                        let text = match sub_item {
+                            0 => row.name.as_str(),
+                            1 => row.modified_text.as_str(),
+                            2 => row.size_text.as_str(),
+                            _ => "",
+                        };
+                        let max_chars = (di.item.cchTextMax as usize).saturating_sub(1);
+                        let mut count = 0usize;
+                        let dst = di.item.pszText.0;
+                        for unit in text.encode_utf16().take(max_chars) {
+                            *dst.add(count) = unit;
+                            count += 1;
+                        }
+                        *dst.add(count) = 0;
                     }
-                    *dst.add(count) = 0;
-                }
 
-                if sub_item == 0 && (di.item.mask & LVIF_IMAGE) != Default::default() {
-                    let is_drive_or_bucket =
-                        row.is_bucket || (row.is_dir && row.name.ends_with(':'));
-                    di.item.iImage = guard.icon_cache.icon_index_for(
-                        row.is_dir,
-                        is_drive_or_bucket,
-                        row.is_parent_row,
-                        &row.extension,
-                    );
+                    if sub_item == 0 && (di.item.mask & LVIF_IMAGE) != Default::default() {
+                        let is_drive_or_bucket =
+                            row.is_bucket || (row.is_dir && row.name.ends_with(':'));
+                        di.item.iImage = guard.icon_cache.icon_index_for(
+                            row.is_dir,
+                            is_drive_or_bucket,
+                            row.is_parent_row,
+                            &row.extension,
+                        );
+                    }
                 }
+                Some(LRESULT(0))
             }
-            Some(LRESULT(0))
-        }
 
-        LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
-            if ctx.suppress_selection.load(Ordering::SeqCst) {
-                return Some(LRESULT(0));
-            }
-            if code == LVN_ITEMCHANGED {
-                let nmlv = &*(lparam.0 as *const NMLISTVIEW);
-                if (nmlv.uChanged & LVIF_STATE) == Default::default() {
+            LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
+                if ctx.suppress_selection.load(Ordering::SeqCst) {
                     return Some(LRESULT(0));
                 }
-            }
-            let rows = {
-                let guard = state.lock().unwrap();
-                if is_local {
-                    Arc::clone(&guard.left.rows)
-                } else {
-                    Arc::clone(&guard.right.rows)
-                }
-            };
-            let selected = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
-            let mut guard = state.lock().unwrap();
-            let pane = if is_local {
-                &mut guard.left
-            } else {
-                &mut guard.right
-            };
-            if pane.selected_paths != selected {
-                pane.selected_paths = selected.clone();
-                guard.events.push(NativePaneEvent::SelectionChanged {
-                    is_local,
-                    selected_paths: selected,
-                });
-            }
-            Some(LRESULT(0))
-        }
-
-        NM_DBLCLK => {
-            let nmia = &*(lparam.0 as *const NMITEMACTIVATE);
-            if nmia.iItem >= 0 {
-                let mut guard = state.lock().unwrap();
-                let (has_parent, entries) = if is_local {
-                    (guard.left.has_parent, Arc::clone(&guard.left.entries))
-                } else {
-                    (guard.right.has_parent, Arc::clone(&guard.right.entries))
-                };
-                match map_row_index_to_entry(nmia.iItem as usize, has_parent, &entries) {
-                    Some(Err(())) => guard.events.push(NativePaneEvent::NavigateUp { is_local }),
-                    Some(Ok(entry)) => guard.events.push(NativePaneEvent::ActivateEntry {
-                        is_local,
-                        entry: entry.clone(),
-                    }),
-                    None => {}
-                }
-            }
-            Some(LRESULT(0))
-        }
-
-        LVN_COLUMNCLICK => {
-            let nmlv = &*(lparam.0 as *const NMLISTVIEW);
-            let col = match nmlv.iSubItem {
-                0 => Some(SortColumn::Name),
-                1 => Some(SortColumn::Modified),
-                2 => Some(SortColumn::Size),
-                _ => None,
-            };
-            if let Some(column) = col {
-                let mut guard = state.lock().unwrap();
-                guard
-                    .events
-                    .push(NativePaneEvent::SortChanged { is_local, column });
-            }
-            Some(LRESULT(0))
-        }
-
-        LVN_BEGINLABELEDITW => {
-            let di = &*(lparam.0 as *const NMLVDISPINFOW);
-            if di.item.iItem < 0 {
-                return Some(LRESULT(1));
-            }
-            let mut guard = state.lock().unwrap();
-            let pane = if is_local {
-                &mut guard.left
-            } else {
-                &mut guard.right
-            };
-            match map_row_index_to_entry(di.item.iItem as usize, pane.has_parent, &pane.entries) {
-                Some(Ok(entry)) if !matches!(entry.kind, crate::models::FileKind::Bucket) => {
-                    pane.editing_original_path = Some(entry.path.clone());
-                    Some(LRESULT(0))
-                }
-                _ => {
-                    pane.editing_original_path = None;
-                    Some(LRESULT(1))
-                }
-            }
-        }
-
-        LVN_ENDLABELEDITW => {
-            let di = &*(lparam.0 as *const NMLVDISPINFOW);
-            let mut guard = state.lock().unwrap();
-            let (tracked_path, has_parent, entries) = if is_local {
-                (
-                    guard.left.editing_original_path.take(),
-                    guard.left.has_parent,
-                    Arc::clone(&guard.left.entries),
-                )
-            } else {
-                (
-                    guard.right.editing_original_path.take(),
-                    guard.right.has_parent,
-                    Arc::clone(&guard.right.entries),
-                )
-            };
-            if !di.item.pszText.is_null() {
-                let edited = di.item.pszText.to_string().unwrap_or_default();
-                let fallback_row = (di.item.iItem >= 0).then_some(di.item.iItem as usize);
-                if let Some(entry) = resolve_inline_rename_entry(
-                    tracked_path.as_deref(),
-                    fallback_row,
-                    has_parent,
-                    &entries,
-                ) {
-                    if let Some(new_name) = should_commit_inline_rename(&entry.name, &edited) {
-                        guard.events.push(NativePaneEvent::InlineRenameCommitted {
-                            is_local,
-                            original_path: entry.path.clone(),
-                            new_name,
-                        });
-                        return Some(LRESULT(1));
+                if code == LVN_ITEMCHANGED {
+                    let nmlv = &*(lparam.0 as *const NMLISTVIEW);
+                    if (nmlv.uChanged & LVIF_STATE) == Default::default() {
+                        return Some(LRESULT(0));
                     }
                 }
-            }
-            Some(LRESULT(0))
-        }
-
-        LVN_KEYDOWN => {
-            let kd = &*(lparam.0 as *const NMLVKEYDOWN);
-            let vk = kd.wVKey;
-            let ctrl_down = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
-
-            if ctrl_down && vk == VK_A.0 {
-                let lvi = LVITEMW {
-                    stateMask: LVIS_SELECTED,
-                    state: LVIS_SELECTED,
-                    ..Default::default()
+                let rows = {
+                    let guard = state.lock().unwrap();
+                    if is_local {
+                        Arc::clone(&guard.left.rows)
+                    } else {
+                        Arc::clone(&guard.right.rows)
+                    }
                 };
-                send_msg(
-                    lv_hwnd,
-                    LVM_SETITEMSTATE,
-                    usize::MAX,
-                    &lvi as *const _ as isize,
-                );
-                return Some(LRESULT(0));
+                let selected = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
+                let mut guard = state.lock().unwrap();
+                let pane = if is_local {
+                    &mut guard.left
+                } else {
+                    &mut guard.right
+                };
+                if pane.selected_paths != selected {
+                    pane.selected_paths = selected.clone();
+                    guard.events.push(NativePaneEvent::SelectionChanged {
+                        is_local,
+                        selected_paths: selected,
+                    });
+                }
+                Some(LRESULT(0))
             }
 
-            if vk == VK_F2.0 {
-                let focused =
-                    send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize).0;
-                if focused >= 0 {
-                    let _ = SetFocus(Some(lv_hwnd));
-                    send_msg(lv_hwnd, LVM_EDITLABELW, focused as usize, 0);
-                }
-            } else if vk == VK_BACK.0 {
-                let mut guard = state.lock().unwrap();
-                guard.events.push(NativePaneEvent::NavigateUp { is_local });
-            } else if vk == VK_DELETE.0 {
-                let mut guard = state.lock().unwrap();
-                guard.events.push(NativePaneEvent::ContextMenuCommand {
-                    is_local,
-                    action: NativeContextMenuAction::DeleteSelected,
-                });
-            } else if vk == VK_RETURN.0 {
-                let focused =
-                    send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize).0;
-                if focused >= 0 {
+            NM_DBLCLK => {
+                let nmia = &*(lparam.0 as *const NMITEMACTIVATE);
+                if nmia.iItem >= 0 {
                     let mut guard = state.lock().unwrap();
                     let (has_parent, entries) = if is_local {
                         (guard.left.has_parent, Arc::clone(&guard.left.entries))
                     } else {
                         (guard.right.has_parent, Arc::clone(&guard.right.entries))
                     };
-                    match map_row_index_to_entry(focused as usize, has_parent, &entries) {
+                    match map_row_index_to_entry(nmia.iItem as usize, has_parent, &entries) {
                         Some(Err(())) => {
                             guard.events.push(NativePaneEvent::NavigateUp { is_local })
                         }
@@ -1233,33 +1137,173 @@ unsafe fn handle_listview_notify(
                         None => {}
                     }
                 }
+                Some(LRESULT(0))
             }
-            Some(LRESULT(0))
-        }
 
-        NM_RCLICK => {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let packed_pt =
-                ((pt.y as i16 as u16 as usize) << 16) | (pt.x as i16 as u16 as usize);
-            let _ = PostMessageW(
-                Some(lv_hwnd),
-                WM_APP_SHOW_CONTEXT_MENU,
-                WPARAM(usize::from(is_local)),
-                LPARAM(packed_pt as isize),
-            );
-            Some(LRESULT(1))
-        }
+            LVN_COLUMNCLICK => {
+                let nmlv = &*(lparam.0 as *const NMLISTVIEW);
+                let col = match nmlv.iSubItem {
+                    0 => Some(SortColumn::Name),
+                    1 => Some(SortColumn::Modified),
+                    2 => Some(SortColumn::Size),
+                    _ => None,
+                };
+                if let Some(column) = col {
+                    let mut guard = state.lock().unwrap();
+                    guard
+                        .events
+                        .push(NativePaneEvent::SortChanged { is_local, column });
+                }
+                Some(LRESULT(0))
+            }
 
-        LVN_BEGINDRAG => {
-            let nmlv = &*(lparam.0 as *const NMLISTVIEW);
-            start_pane_drag(ctx, lv_hwnd, is_local, nmlv.iItem);
-            Some(LRESULT(0))
-        }
+            LVN_BEGINLABELEDITW => {
+                let di = &*(lparam.0 as *const NMLVDISPINFOW);
+                if di.item.iItem < 0 {
+                    return Some(LRESULT(1));
+                }
+                let mut guard = state.lock().unwrap();
+                let pane = if is_local {
+                    &mut guard.left
+                } else {
+                    &mut guard.right
+                };
+                match map_row_index_to_entry(di.item.iItem as usize, pane.has_parent, &pane.entries)
+                {
+                    Some(Ok(entry)) if !matches!(entry.kind, crate::models::FileKind::Bucket) => {
+                        pane.editing_original_path = Some(entry.path.clone());
+                        Some(LRESULT(0))
+                    }
+                    _ => {
+                        pane.editing_original_path = None;
+                        Some(LRESULT(1))
+                    }
+                }
+            }
 
-        _ => None,
+            LVN_ENDLABELEDITW => {
+                let di = &*(lparam.0 as *const NMLVDISPINFOW);
+                let mut guard = state.lock().unwrap();
+                let (tracked_path, has_parent, entries) = if is_local {
+                    (
+                        guard.left.editing_original_path.take(),
+                        guard.left.has_parent,
+                        Arc::clone(&guard.left.entries),
+                    )
+                } else {
+                    (
+                        guard.right.editing_original_path.take(),
+                        guard.right.has_parent,
+                        Arc::clone(&guard.right.entries),
+                    )
+                };
+                if !di.item.pszText.is_null() {
+                    let edited = di.item.pszText.to_string().unwrap_or_default();
+                    let fallback_row = (di.item.iItem >= 0).then_some(di.item.iItem as usize);
+                    if let Some(entry) = resolve_inline_rename_entry(
+                        tracked_path.as_deref(),
+                        fallback_row,
+                        has_parent,
+                        &entries,
+                    ) {
+                        if let Some(new_name) = should_commit_inline_rename(&entry.name, &edited) {
+                            guard.events.push(NativePaneEvent::InlineRenameCommitted {
+                                is_local,
+                                original_path: entry.path.clone(),
+                                new_name,
+                            });
+                            return Some(LRESULT(1));
+                        }
+                    }
+                }
+                Some(LRESULT(0))
+            }
+
+            LVN_KEYDOWN => {
+                let kd = &*(lparam.0 as *const NMLVKEYDOWN);
+                let vk = kd.wVKey;
+                let ctrl_down = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+
+                if ctrl_down && vk == VK_A.0 {
+                    let lvi = LVITEMW {
+                        stateMask: LVIS_SELECTED,
+                        state: LVIS_SELECTED,
+                        ..Default::default()
+                    };
+                    send_msg(
+                        lv_hwnd,
+                        LVM_SETITEMSTATE,
+                        usize::MAX,
+                        &lvi as *const _ as isize,
+                    );
+                    return Some(LRESULT(0));
+                }
+
+                if vk == VK_F2.0 {
+                    let focused =
+                        send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize).0;
+                    if focused >= 0 {
+                        let _ = SetFocus(Some(lv_hwnd));
+                        send_msg(lv_hwnd, LVM_EDITLABELW, focused as usize, 0);
+                    }
+                } else if vk == VK_BACK.0 {
+                    let mut guard = state.lock().unwrap();
+                    guard.events.push(NativePaneEvent::NavigateUp { is_local });
+                } else if vk == VK_DELETE.0 {
+                    let mut guard = state.lock().unwrap();
+                    guard.events.push(NativePaneEvent::ContextMenuCommand {
+                        is_local,
+                        action: NativeContextMenuAction::DeleteSelected,
+                    });
+                } else if vk == VK_RETURN.0 {
+                    let focused =
+                        send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize).0;
+                    if focused >= 0 {
+                        let mut guard = state.lock().unwrap();
+                        let (has_parent, entries) = if is_local {
+                            (guard.left.has_parent, Arc::clone(&guard.left.entries))
+                        } else {
+                            (guard.right.has_parent, Arc::clone(&guard.right.entries))
+                        };
+                        match map_row_index_to_entry(focused as usize, has_parent, &entries) {
+                            Some(Err(())) => {
+                                guard.events.push(NativePaneEvent::NavigateUp { is_local })
+                            }
+                            Some(Ok(entry)) => guard.events.push(NativePaneEvent::ActivateEntry {
+                                is_local,
+                                entry: entry.clone(),
+                            }),
+                            None => {}
+                        }
+                    }
+                }
+                Some(LRESULT(0))
+            }
+
+            NM_RCLICK => {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let packed_pt =
+                    ((pt.y as i16 as u16 as usize) << 16) | (pt.x as i16 as u16 as usize);
+                let _ = PostMessageW(
+                    Some(lv_hwnd),
+                    WM_APP_SHOW_CONTEXT_MENU,
+                    WPARAM(usize::from(is_local)),
+                    LPARAM(packed_pt as isize),
+                );
+                Some(LRESULT(1))
+            }
+
+            LVN_BEGINDRAG => {
+                let nmlv = &*(lparam.0 as *const NMLISTVIEW);
+                start_pane_drag(ctx, lv_hwnd, is_local, nmlv.iItem);
+                Some(LRESULT(0))
+            }
+
+            _ => None,
+        }
     }
-}}
+}
 
 unsafe extern "system" fn child_subclass_proc(
     hwnd: HWND,
@@ -1268,328 +1312,349 @@ unsafe extern "system" fn child_subclass_proc(
     lparam: LPARAM,
     _uidsubclass: usize,
     dwrefdata: usize,
-) -> LRESULT { unsafe {
-    if dwrefdata != 0 {
-        let ctx = &*(dwrefdata as *const SubclassContext);
-        if let Some(state) = ctx.state.upgrade() {
-            let is_local = {
-                let guard = state.lock().unwrap();
-                hwnd.0 as isize == guard.left.hwnd
-            };
+) -> LRESULT {
+    unsafe {
+        if dwrefdata != 0 {
+            let ctx = &*(dwrefdata as *const SubclassContext);
+            if let Some(state) = ctx.state.upgrade() {
+                let is_local = {
+                    let guard = state.lock().unwrap();
+                    hwnd.0 as isize == guard.left.hwnd
+                };
 
-            match umsg {
-                WM_NOTIFY if lparam.0 != 0 => {
-                    let hdr = &*(lparam.0 as *const NMHDR);
-                    if hdr.code == NM_CUSTOMDRAW {
-                        let header_hwnd =
-                            HWND(send_msg(hwnd, LVM_GETHEADER, 0, 0).0 as *mut c_void);
-                        if !header_hwnd.0.is_null() && hdr.hwndFrom == header_hwnd {
-                            return handle_header_custom_draw(&state, is_local, header_hwnd, lparam);
+                match umsg {
+                    WM_NOTIFY if lparam.0 != 0 => {
+                        let hdr = &*(lparam.0 as *const NMHDR);
+                        if hdr.code == NM_CUSTOMDRAW {
+                            let header_hwnd =
+                                HWND(send_msg(hwnd, LVM_GETHEADER, 0, 0).0 as *mut c_void);
+                            if !header_hwnd.0.is_null() && hdr.hwndFrom == header_hwnd {
+                                return handle_header_custom_draw(
+                                    &state,
+                                    is_local,
+                                    header_hwnd,
+                                    lparam,
+                                );
+                            }
                         }
                     }
-                }
-                WM_DROPFILES => {
-                    let hdrop = HDROP(wparam.0 as *mut c_void);
-                    handle_wm_dropfiles(&state, hwnd, is_local, hdrop);
-                    return LRESULT(0);
-                }
-                WM_CONTEXTMENU => {
-                    let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                    if x == -1 && y == -1 {
-                        let mut pt = POINT::default();
-                        let _ = GetCursorPos(&mut pt);
-                        let packed_pt =
-                            ((pt.y as i16 as u16 as usize) << 16) | (pt.x as i16 as u16 as usize);
-                        let _ = PostMessageW(
-                            Some(hwnd),
-                            WM_APP_SHOW_CONTEXT_MENU,
-                            WPARAM(usize::from(is_local)),
-                            LPARAM(packed_pt as isize),
-                        );
+                    WM_DROPFILES => {
+                        let hdrop = HDROP(wparam.0 as *mut c_void);
+                        handle_wm_dropfiles(&state, hwnd, is_local, hdrop);
                         return LRESULT(0);
                     }
-                }
-                WM_APP_SHOW_CONTEXT_MENU => {
-                    if ctx.in_context_menu.swap(true, Ordering::SeqCst) {
-                        return LRESULT(0);
-                    }
-                    let _ = ReleaseCapture();
-                    let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                    let menu_is_local = wparam.0 != 0;
-                    show_pane_context_menu(ctx, hwnd, menu_is_local, POINT { x, y });
-                    ctx.in_context_menu.store(false, Ordering::SeqCst);
-                    return LRESULT(0);
-                }
-                WM_MOUSEMOVE => {
-                    let has_drag = state.lock().unwrap().active_pane_drag.is_some();
-                    if has_drag {
-                        if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
-                            SetCursor(Some(cursor));
+                    WM_CONTEXTMENU => {
+                        let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                        if x == -1 && y == -1 {
+                            let mut pt = POINT::default();
+                            let _ = GetCursorPos(&mut pt);
+                            let packed_pt = ((pt.y as i16 as u16 as usize) << 16)
+                                | (pt.x as i16 as u16 as usize);
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                WM_APP_SHOW_CONTEXT_MENU,
+                                WPARAM(usize::from(is_local)),
+                                LPARAM(packed_pt as isize),
+                            );
+                            return LRESULT(0);
                         }
-                        return LRESULT(0);
                     }
-                }
-                WM_LBUTTONUP => {
-                    let drag_opt = state.lock().unwrap().active_pane_drag.take();
-                    if let Some(drag) = drag_opt {
+                    WM_APP_SHOW_CONTEXT_MENU => {
+                        if ctx.in_context_menu.swap(true, Ordering::SeqCst) {
+                            return LRESULT(0);
+                        }
                         let _ = ReleaseCapture();
-                        if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
-                            SetCursor(Some(cursor));
-                        }
-                        let mut drop_screen_pt = POINT {
-                            x: (lparam.0 & 0xFFFF) as i16 as i32,
-                            y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
-                        };
-                        let _ = ClientToScreen(hwnd, &mut drop_screen_pt);
-                        finish_pane_drag(
-                            &state,
-                            drag.from_local,
-                            drag.source_paths,
-                            drop_screen_pt,
-                        );
+                        let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                        let menu_is_local = wparam.0 != 0;
+                        show_pane_context_menu(ctx, hwnd, menu_is_local, POINT { x, y });
+                        ctx.in_context_menu.store(false, Ordering::SeqCst);
                         return LRESULT(0);
                     }
+                    WM_MOUSEMOVE => {
+                        let has_drag = state.lock().unwrap().active_pane_drag.is_some();
+                        if has_drag {
+                            if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+                                SetCursor(Some(cursor));
+                            }
+                            return LRESULT(0);
+                        }
+                    }
+                    WM_LBUTTONUP => {
+                        let drag_opt = state.lock().unwrap().active_pane_drag.take();
+                        if let Some(drag) = drag_opt {
+                            let _ = ReleaseCapture();
+                            if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
+                                SetCursor(Some(cursor));
+                            }
+                            let mut drop_screen_pt = POINT {
+                                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                            };
+                            let _ = ClientToScreen(hwnd, &mut drop_screen_pt);
+                            finish_pane_drag(
+                                &state,
+                                drag.from_local,
+                                drag.source_paths,
+                                drop_screen_pt,
+                            );
+                            return LRESULT(0);
+                        }
+                    }
+                    WM_CAPTURECHANGED => {
+                        state.lock().unwrap().active_pane_drag = None;
+                    }
+                    _ => {}
                 }
-                WM_CAPTURECHANGED => {
-                    state.lock().unwrap().active_pane_drag = None;
-                }
-                _ => {}
             }
         }
-    }
 
-    DefSubclassProc(hwnd, umsg, wparam, lparam)
-}}
+        DefSubclassProc(hwnd, umsg, wparam, lparam)
+    }
+}
 
 unsafe fn handle_header_custom_draw(
     state: &Arc<Mutex<HostInner>>,
     is_local: bool,
     header_hwnd: HWND,
     lparam: LPARAM,
-) -> LRESULT { unsafe {
-    let nmcd = &mut *(lparam.0 as *mut NMCUSTOMDRAW);
-    let stage = nmcd.dwDrawStage;
+) -> LRESULT {
+    unsafe {
+        let nmcd = &mut *(lparam.0 as *mut NMCUSTOMDRAW);
+        let stage = nmcd.dwDrawStage;
 
-    let (ui_font, is_dark, labels, sort_col, sort_asc) = {
-        let guard = state.lock().unwrap();
-        let pane = if is_local { &guard.left } else { &guard.right };
-        (
-            guard.ui_font,
-            pane.is_dark.unwrap_or(true),
-            pane.header_labels.clone(),
-            pane.sort_col,
-            pane.sort_ascending,
-        )
-    };
+        let (ui_font, is_dark, labels, sort_col, sort_asc) = {
+            let guard = state.lock().unwrap();
+            let pane = if is_local { &guard.left } else { &guard.right };
+            (
+                guard.ui_font,
+                pane.is_dark.unwrap_or(true),
+                pane.header_labels.clone(),
+                pane.sort_col,
+                pane.sort_ascending,
+            )
+        };
 
-    let (bg_color, border_color) = if is_dark {
-        (rgb_colorref(0x16, 0x19, 0x22), rgb_colorref(0x26, 0x2b, 0x38))
-    } else {
-        (rgb_colorref(0xf1, 0xf5, 0xf9), rgb_colorref(0xe2, 0xe8, 0xf0))
-    };
+        let (bg_color, border_color) = if is_dark {
+            (
+                rgb_colorref(0x16, 0x19, 0x22),
+                rgb_colorref(0x26, 0x2b, 0x38),
+            )
+        } else {
+            (
+                rgb_colorref(0xf1, 0xf5, 0xf9),
+                rgb_colorref(0xe2, 0xe8, 0xf0),
+            )
+        };
 
-    if stage == CDDS_PREPAINT {
-        let mut client_rc = RECT::default();
-        if GetClientRect(header_hwnd, &mut client_rc).is_ok() {
+        if stage == CDDS_PREPAINT {
+            let mut client_rc = RECT::default();
+            if GetClientRect(header_hwnd, &mut client_rc).is_ok() {
+                let bg_brush = CreateSolidBrush(bg_color);
+                let _ = FillRect(nmcd.hdc, &client_rc, bg_brush);
+                let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+
+                let border_rc = RECT {
+                    left: client_rc.left,
+                    top: (client_rc.bottom - 1).max(client_rc.top),
+                    right: client_rc.right,
+                    bottom: client_rc.bottom,
+                };
+                let border_brush = CreateSolidBrush(border_color);
+                let _ = FillRect(nmcd.hdc, &border_rc, border_brush);
+                let _ = DeleteObject(HGDIOBJ(border_brush.0));
+            }
+            return LRESULT((CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT) as isize);
+        }
+
+        if stage == CDDS_ITEMPREPAINT {
+            let col_idx = nmcd.dwItemSpec;
+            let rc = nmcd.rc;
+
             let bg_brush = CreateSolidBrush(bg_color);
-            let _ = FillRect(nmcd.hdc, &client_rc, bg_brush);
+            let _ = FillRect(nmcd.hdc, &rc, bg_brush);
             let _ = DeleteObject(HGDIOBJ(bg_brush.0));
 
-            let border_rc = RECT {
-                left: client_rc.left,
-                top: (client_rc.bottom - 1).max(client_rc.top),
-                right: client_rc.right,
-                bottom: client_rc.bottom,
-            };
             let border_brush = CreateSolidBrush(border_color);
-            let _ = FillRect(nmcd.hdc, &border_rc, border_brush);
+            let bottom_rc = RECT {
+                left: rc.left,
+                top: (rc.bottom - 1).max(rc.top),
+                right: rc.right,
+                bottom: rc.bottom,
+            };
+            let _ = FillRect(nmcd.hdc, &bottom_rc, border_brush);
+
+            let right_sep_rc = RECT {
+                left: (rc.right - 1).max(rc.left),
+                top: rc.top + 4,
+                right: rc.right,
+                bottom: (rc.bottom - 4).max(rc.top + 4),
+            };
+            let _ = FillRect(nmcd.hdc, &right_sep_rc, border_brush);
             let _ = DeleteObject(HGDIOBJ(border_brush.0));
-        }
-        return LRESULT((CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT) as isize);
-    }
 
-    if stage == CDDS_ITEMPREPAINT {
-        let col_idx = nmcd.dwItemSpec;
-        let rc = nmcd.rc;
-
-        let bg_brush = CreateSolidBrush(bg_color);
-        let _ = FillRect(nmcd.hdc, &rc, bg_brush);
-        let _ = DeleteObject(HGDIOBJ(bg_brush.0));
-
-        let border_brush = CreateSolidBrush(border_color);
-        let bottom_rc = RECT {
-            left: rc.left,
-            top: (rc.bottom - 1).max(rc.top),
-            right: rc.right,
-            bottom: rc.bottom,
-        };
-        let _ = FillRect(nmcd.hdc, &bottom_rc, border_brush);
-
-        let right_sep_rc = RECT {
-            left: (rc.right - 1).max(rc.left),
-            top: rc.top + 4,
-            right: rc.right,
-            bottom: (rc.bottom - 4).max(rc.top + 4),
-        };
-        let _ = FillRect(nmcd.hdc, &right_sep_rc, border_brush);
-        let _ = DeleteObject(HGDIOBJ(border_brush.0));
-
-        let active_idx = match sort_col {
-            SortColumn::Name => 0,
-            SortColumn::Modified => 1,
-            SortColumn::Size => 2,
-        };
-        let base_label = match col_idx {
-            0 => labels.0.as_str(),
-            1 => labels.1.as_str(),
-            2 => labels.2.as_str(),
-            _ => "",
-        };
-        let full_text = if col_idx == active_idx {
-            let arrow = if sort_asc { " ▲" } else { " ▼" };
-            format!("{base_label}{arrow}")
-        } else {
-            base_label.to_string()
-        };
-
-        let fg_color = if is_dark {
-            if col_idx == active_idx {
-                rgb_colorref(0xf8, 0xfa, 0xfc)
+            let active_idx = match sort_col {
+                SortColumn::Name => 0,
+                SortColumn::Modified => 1,
+                SortColumn::Size => 2,
+            };
+            let base_label = match col_idx {
+                0 => labels.0.as_str(),
+                1 => labels.1.as_str(),
+                2 => labels.2.as_str(),
+                _ => "",
+            };
+            let full_text = if col_idx == active_idx {
+                let arrow = if sort_asc { " ▲" } else { " ▼" };
+                format!("{base_label}{arrow}")
             } else {
-                rgb_colorref(0xe2, 0xe8, 0xf0)
+                base_label.to_string()
+            };
+
+            let fg_color = if is_dark {
+                if col_idx == active_idx {
+                    rgb_colorref(0xf8, 0xfa, 0xfc)
+                } else {
+                    rgb_colorref(0xe2, 0xe8, 0xf0)
+                }
+            } else if col_idx == active_idx {
+                rgb_colorref(0x0f, 0x17, 0x2a)
+            } else {
+                rgb_colorref(0x33, 0x41, 0x55)
+            };
+
+            let prev_font = if ui_font != 0 {
+                Some(SelectObject(nmcd.hdc, HGDIOBJ(ui_font as *mut c_void)))
+            } else {
+                None
+            };
+            let _ = SetBkMode(nmcd.hdc, TRANSPARENT);
+            let _ = SetTextColor(nmcd.hdc, fg_color);
+
+            let mut wide: Vec<u16> = full_text.encode_utf16().collect();
+            let mut text_rc = RECT {
+                left: rc.left + 8,
+                top: rc.top,
+                right: (rc.right - 8).max(rc.left + 8),
+                bottom: (rc.bottom - 1).max(rc.top),
+            };
+            let align = if col_idx == 2 { DT_RIGHT } else { DT_LEFT };
+            let _ = DrawTextW(
+                nmcd.hdc,
+                &mut wide,
+                &mut text_rc,
+                align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+
+            if let Some(old) = prev_font {
+                let _ = SelectObject(nmcd.hdc, old);
             }
-        } else if col_idx == active_idx {
-            rgb_colorref(0x0f, 0x17, 0x2a)
-        } else {
-            rgb_colorref(0x33, 0x41, 0x55)
-        };
 
-        let prev_font = if ui_font != 0 {
-            Some(SelectObject(nmcd.hdc, HGDIOBJ(ui_font as *mut c_void)))
-        } else {
-            None
-        };
-        let _ = SetBkMode(nmcd.hdc, TRANSPARENT);
-        let _ = SetTextColor(nmcd.hdc, fg_color);
-
-        let mut wide: Vec<u16> = full_text.encode_utf16().collect();
-        let mut text_rc = RECT {
-            left: rc.left + 8,
-            top: rc.top,
-            right: (rc.right - 8).max(rc.left + 8),
-            bottom: (rc.bottom - 1).max(rc.top),
-        };
-        let align = if col_idx == 2 { DT_RIGHT } else { DT_LEFT };
-        let _ = DrawTextW(
-            nmcd.hdc,
-            &mut wide,
-            &mut text_rc,
-            align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-
-        if let Some(old) = prev_font {
-            let _ = SelectObject(nmcd.hdc, old);
+            return LRESULT(CDRF_SKIPDEFAULT as isize);
         }
 
-        return LRESULT(CDRF_SKIPDEFAULT as isize);
+        LRESULT(CDRF_DODEFAULT as isize)
     }
-
-    LRESULT(CDRF_DODEFAULT as isize)
-}}
+}
 
 unsafe fn handle_wm_dropfiles(
     state: &Arc<Mutex<HostInner>>,
     lv_hwnd: HWND,
     target_is_local: bool,
     hdrop: HDROP,
-) { unsafe {
-    let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
-    let mut dropped_paths = Vec::new();
-    for i in 0..count {
-        let len = DragQueryFileW(hdrop, i, None) as usize;
-        if len > 0 {
-            let mut buf = vec![0u16; len + 1];
-            let written = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
-            let path = String::from_utf16_lossy(&buf[..written]);
-            if !path.is_empty() {
-                dropped_paths.push(path);
+) {
+    unsafe {
+        let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+        let mut dropped_paths = Vec::new();
+        for i in 0..count {
+            let len = DragQueryFileW(hdrop, i, None) as usize;
+            if len > 0 {
+                let mut buf = vec![0u16; len + 1];
+                let written = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
+                let path = String::from_utf16_lossy(&buf[..written]);
+                if !path.is_empty() {
+                    dropped_paths.push(path);
+                }
             }
         }
-    }
 
-    let mut pt = POINT::default();
-    let _ = DragQueryPoint(hdrop, &mut pt);
-    DragFinish(hdrop);
+        let mut pt = POINT::default();
+        let _ = DragQueryPoint(hdrop, &mut pt);
+        DragFinish(hdrop);
 
-    if dropped_paths.is_empty() {
-        return;
-    }
-
-    let mut hti = LVHITTESTINFO {
-        pt,
-        ..Default::default()
-    };
-    let hit_row = send_msg(lv_hwnd, LVM_HITTEST, 0, &mut hti as *mut _ as isize).0;
-
-    let mut guard = state.lock().unwrap();
-    let pane = if target_is_local {
-        &guard.left
-    } else {
-        &guard.right
-    };
-    let hovered_entry = if hit_row >= 0 {
-        match map_row_index_to_entry(hit_row as usize, pane.has_parent, &pane.entries) {
-            Some(Ok(e)) => Some(e),
-            _ => None,
+        if dropped_paths.is_empty() {
+            return;
         }
-    } else {
-        None
-    };
-    let dest_dir = resolve_drop_destination_dir(&pane.current_path, hovered_entry, target_is_local);
 
-    guard.events.push(NativePaneEvent::FilesDropped {
-        target_is_local,
-        source_paths: dropped_paths,
-        target_dir_override: Some(dest_dir),
-    });
-}}
+        let mut hti = LVHITTESTINFO {
+            pt,
+            ..Default::default()
+        };
+        let hit_row = send_msg(lv_hwnd, LVM_HITTEST, 0, &mut hti as *mut _ as isize).0;
 
-unsafe fn start_pane_drag(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, dragged_row: i32) { unsafe {
-    let Some(state) = ctx.state.upgrade() else {
-        return;
-    };
-    let (current_path, rows, has_parent, entries) = {
-        let guard = state.lock().unwrap();
-        let pane = if is_local { &guard.left } else { &guard.right };
-        (
-            pane.current_path.clone(),
-            Arc::clone(&pane.rows),
-            pane.has_parent,
-            Arc::clone(&pane.entries),
-        )
-    };
+        let mut guard = state.lock().unwrap();
+        let pane = if target_is_local {
+            &guard.left
+        } else {
+            &guard.right
+        };
+        let hovered_entry = if hit_row >= 0 {
+            match map_row_index_to_entry(hit_row as usize, pane.has_parent, &pane.entries) {
+                Some(Ok(e)) => Some(e),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let dest_dir =
+            resolve_drop_destination_dir(&pane.current_path, hovered_entry, target_is_local);
 
-    if is_local && current_path.trim() == "/" {
-        return;
+        guard.events.push(NativePaneEvent::FilesDropped {
+            target_is_local,
+            source_paths: dropped_paths,
+            target_dir_override: Some(dest_dir),
+        });
     }
+}
 
-    let selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
-    let source_paths = resolve_drag_source_paths(&selected_paths, dragged_row, has_parent, &entries);
-    if source_paths.is_empty() {
-        return;
-    }
+unsafe fn start_pane_drag(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, dragged_row: i32) {
+    unsafe {
+        let Some(state) = ctx.state.upgrade() else {
+            return;
+        };
+        let (current_path, rows, has_parent, entries) = {
+            let guard = state.lock().unwrap();
+            let pane = if is_local { &guard.left } else { &guard.right };
+            (
+                pane.current_path.clone(),
+                Arc::clone(&pane.rows),
+                pane.has_parent,
+                Arc::clone(&pane.entries),
+            )
+        };
 
-    state.lock().unwrap().active_pane_drag = Some(ActivePaneDrag {
-        from_local: is_local,
-        source_paths,
-    });
-    SetCapture(lv_hwnd);
-    if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
-        SetCursor(Some(cursor));
+        if is_local && current_path.trim() == "/" {
+            return;
+        }
+
+        let selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
+        let source_paths =
+            resolve_drag_source_paths(&selected_paths, dragged_row, has_parent, &entries);
+        if source_paths.is_empty() {
+            return;
+        }
+
+        state.lock().unwrap().active_pane_drag = Some(ActivePaneDrag {
+            from_local: is_local,
+            source_paths,
+        });
+        SetCapture(lv_hwnd);
+        if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+            SetCursor(Some(cursor));
+        }
     }
-}}
+}
 
 #[cfg(test)]
 struct PidlListGuard(Vec<*mut ITEMIDLIST>);
@@ -1625,160 +1690,166 @@ unsafe fn finish_pane_drag(
     from_local: bool,
     source_paths: Vec<String>,
     screen_pt: POINT,
-) { unsafe {
-    let target_is_local = !from_local;
-    let (target_hwnd, target_visible) = {
-        let guard = state.lock().unwrap();
+) {
+    unsafe {
+        let target_is_local = !from_local;
+        let (target_hwnd, target_visible) = {
+            let guard = state.lock().unwrap();
+            let pane = if target_is_local {
+                &guard.left
+            } else {
+                &guard.right
+            };
+            (HWND(pane.hwnd as *mut c_void), pane.visible)
+        };
+        if target_hwnd.0.is_null() || !target_visible {
+            return;
+        }
+
+        let mut client_pt = screen_pt;
+        let _ = ScreenToClient(target_hwnd, &mut client_pt);
+        let mut client_rc = RECT::default();
+        if GetClientRect(target_hwnd, &mut client_rc).is_err() {
+            return;
+        }
+        if client_pt.x < client_rc.left
+            || client_pt.x >= client_rc.right
+            || client_pt.y < client_rc.top
+            || client_pt.y >= client_rc.bottom
+        {
+            return;
+        }
+
+        let mut hti = LVHITTESTINFO {
+            pt: client_pt,
+            ..Default::default()
+        };
+        let hit_row = send_msg(target_hwnd, LVM_HITTEST, 0, &mut hti as *mut _ as isize).0;
+
+        let mut guard = state.lock().unwrap();
         let pane = if target_is_local {
             &guard.left
         } else {
             &guard.right
         };
-        (HWND(pane.hwnd as *mut c_void), pane.visible)
-    };
-    if target_hwnd.0.is_null() || !target_visible {
-        return;
-    }
-
-    let mut client_pt = screen_pt;
-    let _ = ScreenToClient(target_hwnd, &mut client_pt);
-    let mut client_rc = RECT::default();
-    if GetClientRect(target_hwnd, &mut client_rc).is_err() {
-        return;
-    }
-    if client_pt.x < client_rc.left
-        || client_pt.x >= client_rc.right
-        || client_pt.y < client_rc.top
-        || client_pt.y >= client_rc.bottom
-    {
-        return;
-    }
-
-    let mut hti = LVHITTESTINFO {
-        pt: client_pt,
-        ..Default::default()
-    };
-    let hit_row = send_msg(target_hwnd, LVM_HITTEST, 0, &mut hti as *mut _ as isize).0;
-
-    let mut guard = state.lock().unwrap();
-    let pane = if target_is_local {
-        &guard.left
-    } else {
-        &guard.right
-    };
-    let hovered_entry = if hit_row >= 0 {
-        match map_row_index_to_entry(hit_row as usize, pane.has_parent, &pane.entries) {
-            Some(Ok(e)) => Some(e),
-            _ => None,
+        let hovered_entry = if hit_row >= 0 {
+            match map_row_index_to_entry(hit_row as usize, pane.has_parent, &pane.entries) {
+                Some(Ok(e)) => Some(e),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let dest_dir =
+            resolve_drop_destination_dir(&pane.current_path, hovered_entry, target_is_local);
+        if target_is_local && dest_dir.trim() == "/" {
+            return;
         }
-    } else {
-        None
-    };
-    let dest_dir =
-        resolve_drop_destination_dir(&pane.current_path, hovered_entry, target_is_local);
-    if target_is_local && dest_dir.trim() == "/" {
-        return;
-    }
 
-    guard.events.push(NativePaneEvent::FilesDropped {
-        target_is_local,
-        source_paths,
-        target_dir_override: Some(dest_dir),
-    });
-}}
+        guard.events.push(NativePaneEvent::FilesDropped {
+            target_is_local,
+            source_paths,
+            target_dir_override: Some(dest_dir),
+        });
+    }
+}
 
 unsafe fn show_pane_context_menu(
     ctx: &SubclassContext,
     lv_hwnd: HWND,
     is_local: bool,
     screen_pt: POINT,
-) { unsafe {
-    let Some(state) = ctx.state.upgrade() else {
-        return;
-    };
-    let (parent_hwnd_val, current_path, rows, entries) = {
-        let guard = state.lock().unwrap();
-        let pane = if is_local { &guard.left } else { &guard.right };
-        (
-            guard.parent_hwnd,
-            pane.current_path.clone(),
-            Arc::clone(&pane.rows),
-            Arc::clone(&pane.entries),
-        )
-    };
-    let selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
-    let single_is_bucket = selected_paths.len() == 1
-        && entries.iter().any(|e| {
-            e.path == selected_paths[0] && matches!(e.kind, crate::models::FileKind::Bucket)
-        });
-    let can_reveal = is_local && can_use_shell_context_menu(&current_path, &selected_paths);
-    let owner_hwnd = if parent_hwnd_val != 0 {
-        HWND(parent_hwnd_val as *mut c_void)
-    } else {
-        lv_hwnd
-    };
+) {
+    unsafe {
+        let Some(state) = ctx.state.upgrade() else {
+            return;
+        };
+        let (parent_hwnd_val, current_path, rows, entries) = {
+            let guard = state.lock().unwrap();
+            let pane = if is_local { &guard.left } else { &guard.right };
+            (
+                guard.parent_hwnd,
+                pane.current_path.clone(),
+                Arc::clone(&pane.rows),
+                Arc::clone(&pane.entries),
+            )
+        };
+        let selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
+        let single_is_bucket = selected_paths.len() == 1
+            && entries.iter().any(|e| {
+                e.path == selected_paths[0] && matches!(e.kind, crate::models::FileKind::Bucket)
+            });
+        let can_reveal = is_local && can_use_shell_context_menu(&current_path, &selected_paths);
+        let owner_hwnd = if parent_hwnd_val != 0 {
+            HWND(parent_hwnd_val as *mut c_void)
+        } else {
+            lv_hwnd
+        };
 
-    show_standard_native_hmenu(
-        ctx,
-        lv_hwnd,
-        owner_hwnd,
-        is_local,
-        !selected_paths.is_empty(),
-        selected_paths.len() == 1 && !single_is_bucket,
-        !single_is_bucket,
-        can_reveal,
-        screen_pt,
-    );
-}}
+        show_standard_native_hmenu(
+            ctx,
+            lv_hwnd,
+            owner_hwnd,
+            is_local,
+            !selected_paths.is_empty(),
+            selected_paths.len() == 1 && !single_is_bucket,
+            !single_is_bucket,
+            can_reveal,
+            screen_pt,
+        );
+    }
+}
 
 #[cfg(test)]
 unsafe fn resolve_shell_menu_pidls(
     parent_dir: &str,
     selected_paths: &[String],
-) -> anyhow::Result<(IShellFolder, Vec<*const ITEMIDLIST>, PidlListGuard)> { unsafe {
-    if selected_paths.is_empty() {
-        return Err(anyhow::anyhow!("empty selected_paths"));
-    }
+) -> anyhow::Result<(IShellFolder, Vec<*const ITEMIDLIST>, PidlListGuard)> {
+    unsafe {
+        if selected_paths.is_empty() {
+            return Err(anyhow::anyhow!("empty selected_paths"));
+        }
 
-    let mut pidl_guard = PidlListGuard::new();
-    let mut child_pidls: Vec<*const ITEMIDLIST> = Vec::new();
+        let mut pidl_guard = PidlListGuard::new();
+        let mut child_pidls: Vec<*const ITEMIDLIST> = Vec::new();
 
-    if selected_paths.len() == 1 {
-        let wpath: Vec<u16> = selected_paths[0]
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut pidl: *mut ITEMIDLIST = null_mut();
-        SHParseDisplayName(PCWSTR(wpath.as_ptr()), None, &mut pidl, 0, None)?;
-        pidl_guard.push(pidl);
-
-        let mut child_last: *mut ITEMIDLIST = null_mut();
-        let folder: IShellFolder = SHBindToParent(pidl, Some(&mut child_last))?;
-        child_pidls.push(child_last as *const ITEMIDLIST);
-        Ok((folder, child_pidls, pidl_guard))
-    } else {
-        let wparent: Vec<u16> = parent_dir
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut parent_pidl: *mut ITEMIDLIST = null_mut();
-        SHParseDisplayName(PCWSTR(wparent.as_ptr()), None, &mut parent_pidl, 0, None)?;
-        pidl_guard.push(parent_pidl);
-
-        let folder: IShellFolder = SHBindToObject(None, parent_pidl, None)?;
-        for path in selected_paths {
-            let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        if selected_paths.len() == 1 {
+            let wpath: Vec<u16> = selected_paths[0]
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let mut pidl: *mut ITEMIDLIST = null_mut();
             SHParseDisplayName(PCWSTR(wpath.as_ptr()), None, &mut pidl, 0, None)?;
-            if pidl.is_null() {
-                return Err(anyhow::anyhow!("null pidl for {path}"));
-            }
             pidl_guard.push(pidl);
-            child_pidls.push(ILFindLastID(pidl) as *const ITEMIDLIST);
+
+            let mut child_last: *mut ITEMIDLIST = null_mut();
+            let folder: IShellFolder = SHBindToParent(pidl, Some(&mut child_last))?;
+            child_pidls.push(child_last as *const ITEMIDLIST);
+            Ok((folder, child_pidls, pidl_guard))
+        } else {
+            let wparent: Vec<u16> = parent_dir
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut parent_pidl: *mut ITEMIDLIST = null_mut();
+            SHParseDisplayName(PCWSTR(wparent.as_ptr()), None, &mut parent_pidl, 0, None)?;
+            pidl_guard.push(parent_pidl);
+
+            let folder: IShellFolder = SHBindToObject(None, parent_pidl, None)?;
+            for path in selected_paths {
+                let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut pidl: *mut ITEMIDLIST = null_mut();
+                SHParseDisplayName(PCWSTR(wpath.as_ptr()), None, &mut pidl, 0, None)?;
+                if pidl.is_null() {
+                    return Err(anyhow::anyhow!("null pidl for {path}"));
+                }
+                pidl_guard.push(pidl);
+                child_pidls.push(ILFindLastID(pidl) as *const ITEMIDLIST);
+            }
+            Ok((folder, child_pidls, pidl_guard))
         }
-        Ok((folder, child_pidls, pidl_guard))
     }
-}}
+}
 
 unsafe fn show_standard_native_hmenu(
     ctx: &SubclassContext,
@@ -1790,100 +1861,106 @@ unsafe fn show_standard_native_hmenu(
     can_transfer: bool,
     can_reveal: bool,
     screen_pt: POINT,
-) { unsafe {
-    let Ok(hmenu) = CreatePopupMenu() else {
-        return;
-    };
-    let t = i18n();
-    let transfer_label = if is_local {
-        t.ctx_upload_to_remote()
-    } else {
-        t.ctx_download_to_local()
-    };
-
-    append_menu_str(
-        hmenu,
-        CMD_TRANSFER,
-        transfer_label,
-        has_selection && can_transfer,
-    );
-    append_menu_str(hmenu, CMD_OPEN, t.ctx_open_or_enter(), has_selection);
-    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
-    append_menu_str(hmenu, CMD_NEW_FOLDER, t.ctx_new_folder(), true);
-    append_menu_str(hmenu, CMD_RENAME, t.ctx_rename(), can_rename);
-    append_menu_str(hmenu, CMD_DELETE, t.ctx_delete(), has_selection);
-    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
-    append_menu_str(hmenu, CMD_COPY_PATH, t.ctx_copy_path(), has_selection);
-    if is_local {
-        append_menu_str(hmenu, CMD_REVEAL_IN_SHELL, t.ctx_reveal_in_shell(), can_reveal);
-    }
-    append_menu_str(hmenu, CMD_REFRESH, t.ctx_refresh(), true);
-
-    let _ = SetForegroundWindow(owner_hwnd);
-    let cmd = TrackPopupMenuEx(
-        hmenu,
-        (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN).0,
-        screen_pt.x,
-        screen_pt.y,
-        owner_hwnd,
-        None,
-    )
-    .0 as u32;
-    let _ = PostMessageW(Some(owner_hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-
-    let _ = DestroyMenu(hmenu);
-    if cmd != 0 {
-        dispatch_custom_menu_cmd(ctx, lv_hwnd, is_local, cmd);
-    }
-}}
-
-unsafe fn append_menu_str(hmenu: HMENU, id: u32, label: &str, enabled: bool) { unsafe {
-    let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-    let flags = if enabled {
-        MF_STRING
-    } else {
-        MF_STRING | MF_GRAYED
-    };
-    let _ = AppendMenuW(hmenu, flags, id as usize, PCWSTR(wide.as_ptr()));
-}}
-
-unsafe fn dispatch_custom_menu_cmd(
-    ctx: &SubclassContext,
-    lv_hwnd: HWND,
-    is_local: bool,
-    cmd: u32,
-) { unsafe {
-    if cmd == CMD_RENAME {
-        let sel = send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize).0;
-        if sel >= 0 {
-            let _ = SetFocus(Some(lv_hwnd));
-            send_msg(lv_hwnd, LVM_EDITLABELW, sel as usize, 0);
+) {
+    unsafe {
+        let Ok(hmenu) = CreatePopupMenu() else {
             return;
+        };
+        let t = i18n();
+        let transfer_label = if is_local {
+            t.ctx_upload_to_remote()
+        } else {
+            t.ctx_download_to_local()
+        };
+
+        append_menu_str(
+            hmenu,
+            CMD_TRANSFER,
+            transfer_label,
+            has_selection && can_transfer,
+        );
+        append_menu_str(hmenu, CMD_OPEN, t.ctx_open_or_enter(), has_selection);
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
+        append_menu_str(hmenu, CMD_NEW_FOLDER, t.ctx_new_folder(), true);
+        append_menu_str(hmenu, CMD_RENAME, t.ctx_rename(), can_rename);
+        append_menu_str(hmenu, CMD_DELETE, t.ctx_delete(), has_selection);
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
+        append_menu_str(hmenu, CMD_COPY_PATH, t.ctx_copy_path(), has_selection);
+        if is_local {
+            append_menu_str(
+                hmenu,
+                CMD_REVEAL_IN_SHELL,
+                t.ctx_reveal_in_shell(),
+                can_reveal,
+            );
+        }
+        append_menu_str(hmenu, CMD_REFRESH, t.ctx_refresh(), true);
+
+        let _ = SetForegroundWindow(owner_hwnd);
+        let cmd = TrackPopupMenuEx(
+            hmenu,
+            (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN).0,
+            screen_pt.x,
+            screen_pt.y,
+            owner_hwnd,
+            None,
+        )
+        .0 as u32;
+        let _ = PostMessageW(Some(owner_hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+
+        let _ = DestroyMenu(hmenu);
+        if cmd != 0 {
+            dispatch_custom_menu_cmd(ctx, lv_hwnd, is_local, cmd);
         }
     }
+}
 
-    let action = match cmd {
-        CMD_TRANSFER => Some(NativeContextMenuAction::TransferSelected),
-        CMD_OPEN => Some(NativeContextMenuAction::OpenSelected),
-        CMD_NEW_FOLDER => Some(NativeContextMenuAction::NewFolder),
-        CMD_DELETE => Some(NativeContextMenuAction::DeleteSelected),
-        CMD_COPY_PATH => Some(NativeContextMenuAction::CopySelectedPath),
-        CMD_REVEAL_IN_SHELL => Some(NativeContextMenuAction::RevealInShell),
-        CMD_REFRESH => Some(NativeContextMenuAction::Refresh),
-        _ => None,
-    };
-
-    if let (Some(act), Some(state)) = (action, ctx.state.upgrade()) {
-        state
-            .lock()
-            .unwrap()
-            .events
-            .push(NativePaneEvent::ContextMenuCommand {
-                is_local,
-                action: act,
-            });
+unsafe fn append_menu_str(hmenu: HMENU, id: u32, label: &str, enabled: bool) {
+    unsafe {
+        let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+        let flags = if enabled {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
+        let _ = AppendMenuW(hmenu, flags, id as usize, PCWSTR(wide.as_ptr()));
     }
-}}
+}
+
+unsafe fn dispatch_custom_menu_cmd(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, cmd: u32) {
+    unsafe {
+        if cmd == CMD_RENAME {
+            let sel = send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize).0;
+            if sel >= 0 {
+                let _ = SetFocus(Some(lv_hwnd));
+                send_msg(lv_hwnd, LVM_EDITLABELW, sel as usize, 0);
+                return;
+            }
+        }
+
+        let action = match cmd {
+            CMD_TRANSFER => Some(NativeContextMenuAction::TransferSelected),
+            CMD_OPEN => Some(NativeContextMenuAction::OpenSelected),
+            CMD_NEW_FOLDER => Some(NativeContextMenuAction::NewFolder),
+            CMD_DELETE => Some(NativeContextMenuAction::DeleteSelected),
+            CMD_COPY_PATH => Some(NativeContextMenuAction::CopySelectedPath),
+            CMD_REVEAL_IN_SHELL => Some(NativeContextMenuAction::RevealInShell),
+            CMD_REFRESH => Some(NativeContextMenuAction::Refresh),
+            _ => None,
+        };
+
+        if let (Some(act), Some(state)) = (action, ctx.state.upgrade()) {
+            state
+                .lock()
+                .unwrap()
+                .events
+                .push(NativePaneEvent::ContextMenuCommand {
+                    is_local,
+                    action: act,
+                });
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1981,12 +2058,8 @@ mod tests {
         let invalid_path = r"Z:\__rustduck_nonexistent_drive_and_file_99999__".to_string();
 
         let _host = PlatformHost::new();
-        let res = unsafe {
-            resolve_shell_menu_pidls(
-                &valid_path,
-                &[valid_path.clone(), invalid_path],
-            )
-        };
+        let res =
+            unsafe { resolve_shell_menu_pidls(&valid_path, &[valid_path.clone(), invalid_path]) };
         assert!(res.is_err());
 
         let single_ok =
@@ -1997,10 +2070,10 @@ mod tests {
     #[test]
     fn test_header_custom_draw_renders_light_text_in_dark_mode_on_light_os() {
         use windows::Win32::Graphics::Gdi::{
-            CreateCompatibleDC, CreateDIBSection, DeleteDC, SelectObject, BITMAPINFO,
-            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+            DIB_RGB_COLORS, DeleteDC, SelectObject,
         };
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, ShowWindow};
 
         unsafe {
             let hinstance = GetModuleHandleW(None).unwrap_or_default();
@@ -2127,7 +2200,7 @@ mod tests {
 
     #[test]
     fn test_nm_rclick_defers_context_menu_and_returns_nonzero_without_blocking() {
-        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+        use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
 
         unsafe {
             let hinstance = GetModuleHandleW(None).unwrap_or_default();
@@ -2250,10 +2323,7 @@ mod tests {
 
         // Dragging selected row 1 ("a.txt" when has_parent == true) in a multi-selection -> drags entire selection
         let multi = vec![r"C:\work\a.txt".to_string(), r"C:\work\b.txt".to_string()];
-        assert_eq!(
-            resolve_drag_source_paths(&multi, 1, true, &entries),
-            multi
-        );
+        assert_eq!(resolve_drag_source_paths(&multi, 1, true, &entries), multi);
 
         // Dragging a bucket row (row 3 when has_parent == true) -> must not drag
         assert!(resolve_drag_source_paths(&[], 3, true, &entries).is_empty());
@@ -2263,7 +2333,7 @@ mod tests {
     fn test_left_to_right_drag_and_drop_emits_files_dropped_for_remote_pane() {
         use super::super::build_native_row_models;
         use crate::models::FileKind;
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, ShowWindow};
 
         unsafe {
             let hinstance = GetModuleHandleW(None).unwrap_or_default();
@@ -2364,8 +2434,7 @@ mod tests {
             // Release mouse button at x=500, y=200 (relative to left_hwnd at x=0, y=0 -> hits right_hwnd at x=100, y=200)
             let drop_x: i16 = 500;
             let drop_y: i16 = 200;
-            let packed_lparam =
-                ((drop_y as u16 as usize) << 16) | (drop_x as u16 as usize);
+            let packed_lparam = ((drop_y as u16 as usize) << 16) | (drop_x as u16 as usize);
             let _ = send_msg(left_hwnd, WM_LBUTTONUP, 0, packed_lparam as isize);
 
             let events = host.drain_events();
