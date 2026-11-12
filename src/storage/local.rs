@@ -17,7 +17,7 @@ impl LocalFileSystem {
     pub fn initial_local_dir() -> String {
         dirs::home_dir()
             .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("C:\\"))
+            .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }))
             .to_string_lossy()
             .to_string()
     }

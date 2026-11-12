@@ -4,7 +4,8 @@ use crate::ui::file_pane::{
     parent_local_or_remote, split_breadcrumb_segments, SortColumn,
 };
 use crate::ui::native_file_list::{
-    compute_pane_visibility, NativeFileListHost, NativePaneSnapshot, NativeRowViewModel,
+    compute_pane_visibility, sanitize_pane_bounds_px, NativeFileListHost, NativePaneSnapshot,
+    NativeRowViewModel,
 };
 use crate::ui::{
     accent_blue, bg_canvas, bg_elevated, bg_panel, border_subtle, is_dark_theme,
@@ -20,6 +21,9 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::{h_flex, v_flex, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use std::sync::Arc;
+
+const DUAL_PANE_MIN_WIDTH_PX: f32 = 180.0;
+const DUAL_PANE_MAX_WIDTH_PX: f32 = 16_384.0;
 
 pub fn render_dual_pane_view(
     tab_idx: usize,
@@ -38,11 +42,21 @@ pub fn render_dual_pane_view(
             div()
                 .flex_1()
                 .w_full()
+                .h_full()
+                .min_h_0()
                 .overflow_hidden()
                 .child(
                     h_resizable(("transmit-dual-pane-split", tab_idx))
-                        .child(resizable_panel().child(left_pane))
-                        .child(resizable_panel().child(right_pane)),
+                        .child(
+                            resizable_panel()
+                                .size_range(px(DUAL_PANE_MIN_WIDTH_PX)..px(DUAL_PANE_MAX_WIDTH_PX))
+                                .child(left_pane),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size_range(px(DUAL_PANE_MIN_WIDTH_PX)..px(DUAL_PANE_MAX_WIDTH_PX))
+                                .child(right_pane),
+                        ),
                 ),
         )
         .into_any_element()
@@ -622,12 +636,20 @@ impl Element for NativeFileListElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let scale = window.scale_factor().max(0.5);
-        let x = (f32::from(bounds.origin.x) * scale).round() as i32;
-        let y = (f32::from(bounds.origin.y) * scale).round() as i32;
-        let w = (f32::from(bounds.size.width) * scale).round() as i32;
-        let h = (f32::from(bounds.size.height) * scale).round() as i32;
-        let visible = compute_pane_visibility(self.is_connected, self.settings_open, w, h);
+        let scale = window.scale_factor().clamp(0.5, 8.0);
+        let viewport = window.viewport_size();
+        let sanitized = sanitize_pane_bounds_px(
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+            scale,
+        );
+        let (x, y, w, h) = sanitized.unwrap_or((0, 0, 0, 0));
+        let visible = sanitized.is_some()
+            && compute_pane_visibility(self.is_connected, self.settings_open, w, h);
 
         let snapshot = NativePaneSnapshot {
             tab_idx: self.tab_idx,
@@ -695,6 +717,7 @@ fn render_pane_file_table(
     div()
         .flex_1()
         .w_full()
+        .min_h_0()
         .overflow_hidden()
         .child(element)
         .into_any_element()

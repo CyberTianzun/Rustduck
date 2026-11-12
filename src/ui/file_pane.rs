@@ -80,8 +80,11 @@ pub fn filter_and_sort_entries(
 pub fn parent_local_or_remote(path: &str, is_local: bool) -> Option<String> {
     if is_local {
         let trimmed = path.trim();
-        if trimmed.is_empty() || trimmed == "/" {
+        if trimmed.is_empty() || trimmed == "/" || trimmed == "\\" {
             return None;
+        }
+        if trimmed.starts_with('/') && !trimmed.contains(':') {
+            return crate::models::parent_remote_path(trimmed);
         }
         let p = std::path::Path::new(trimmed);
         match p.parent() {
@@ -102,11 +105,23 @@ pub fn parent_local_or_remote(path: &str, is_local: bool) -> Option<String> {
 
 pub fn join_local_or_remote(base: &str, name: &str, is_local: bool) -> String {
     if is_local {
-        if base == "/" {
-            name.to_string()
+        let trimmed_base = base.trim();
+        let trimmed_name = name.trim();
+        if trimmed_base.is_empty() || trimmed_base == "/" {
+            if trimmed_name.contains(':') {
+                trimmed_name.to_string()
+            } else {
+                format!("/{}", trimmed_name.trim_start_matches('/'))
+            }
+        } else if trimmed_base.starts_with('/') && !trimmed_base.contains(':') {
+            format!(
+                "{}/{}",
+                trimmed_base.trim_end_matches('/'),
+                trimmed_name.trim_start_matches('/')
+            )
         } else {
-            std::path::Path::new(base)
-                .join(name)
+            std::path::Path::new(trimmed_base)
+                .join(trimmed_name)
                 .to_string_lossy()
                 .to_string()
         }
@@ -155,6 +170,14 @@ pub fn split_breadcrumb_segments_with_i18n(
     if is_local {
         let mut crumbs = vec![(t.breadcrumb_local_drives_root().to_string(), "/".to_string())];
         if trimmed.is_empty() || trimmed == "/" || trimmed == "\\" {
+            return crumbs;
+        }
+        if trimmed.starts_with('/') && !trimmed.contains(':') {
+            let mut accum = String::new();
+            for part in trimmed.split('/').filter(|s| !s.is_empty()) {
+                accum = format!("{accum}/{part}");
+                crumbs.push((part.to_string(), accum.clone()));
+            }
             return crumbs;
         }
         let normalized = trimmed.replace('/', r"\");
@@ -346,5 +369,50 @@ mod tests {
     fn test_format_modified_time_and_directory_summary() {
         assert_eq!(format_modified_time(None), "--");
         assert_eq!(format_modified_time(Some(1762336800)), "2025-11-05 10:00");
+    }
+
+    #[test]
+    fn test_posix_local_paths_preserve_leading_slash_and_forward_slashes() {
+        let zh = I18n::new(crate::services::preferences::AppLanguage::ZhCn);
+        let en = I18n::new(crate::services::preferences::AppLanguage::EnUs);
+
+        assert_eq!(join_local_or_remote("/", "Users", true), "/Users");
+        assert_eq!(
+            join_local_or_remote("/Users/alice", "Downloads", true),
+            "/Users/alice/Downloads"
+        );
+        assert_eq!(join_local_or_remote("/", r"C:\", true), r"C:\");
+        assert_eq!(
+            parent_local_or_remote("/Users/alice", true),
+            Some("/Users".to_string())
+        );
+        assert_eq!(
+            parent_local_or_remote("/Users", true),
+            Some("/".to_string())
+        );
+
+        let mac_crumbs_zh =
+            split_breadcrumb_segments_with_i18n("/Users/alice/Downloads", true, zh);
+        assert_eq!(
+            mac_crumbs_zh,
+            vec![
+                ("磁盘".to_string(), "/".to_string()),
+                ("Users".to_string(), "/Users".to_string()),
+                ("alice".to_string(), "/Users/alice".to_string()),
+                ("Downloads".to_string(), "/Users/alice/Downloads".to_string()),
+            ]
+        );
+
+        let mac_crumbs_en =
+            split_breadcrumb_segments_with_i18n("/Users/alice/Downloads", true, en);
+        assert_eq!(
+            mac_crumbs_en,
+            vec![
+                ("Drives".to_string(), "/".to_string()),
+                ("Users".to_string(), "/Users".to_string()),
+                ("alice".to_string(), "/Users/alice".to_string()),
+                ("Downloads".to_string(), "/Users/alice/Downloads".to_string()),
+            ]
+        );
     }
 }

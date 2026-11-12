@@ -75,7 +75,7 @@ Connection metadata and bookmarks live in clean JSON so you can back them up or 
 ## Getting Started
 
 ### Prerequisites
-- **Rust** `1.85+` (`edition = "2021"`)
+- **Rust** `1.85+` (`edition = "2024"`)
 - **Windows 10 / 11** or **macOS 12+**
 
 ### Build & Run

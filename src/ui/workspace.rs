@@ -1094,6 +1094,7 @@ pub struct RustduckWorkspace {
     pub settings_custom_local_dir_input: Entity<InputState>,
     pub update_state: UpdateCheckState,
     pub seen_completed_transfers: HashSet<Uuid>,
+    last_window_title: String,
 }
 
 impl RustduckWorkspace {
@@ -1150,6 +1151,7 @@ impl RustduckWorkspace {
             settings_custom_local_dir_input,
             update_state: UpdateCheckState::Idle,
             seen_completed_transfers: HashSet::new(),
+            last_window_title: String::new(),
         };
         ws.refresh_local_pane(0, window, cx);
         ws.start_transfer_watcher(cx);
@@ -3084,8 +3086,11 @@ impl Render for RustduckWorkspace {
         } else {
             self.tabs[active_idx].sync_visible_caches_if_needed(cx);
         }
-        let active_title = &self.tabs[active_idx].title;
-        window.set_window_title(&format!("Rustduck — {active_title}"));
+        let desired_title = format!("Rustduck — {}", self.tabs[active_idx].title);
+        if self.last_window_title != desired_title {
+            window.set_window_title(&desired_title);
+            self.last_window_title = desired_title;
+        }
 
         let transfer_tasks = self.transfer_manager.snapshot();
         let active_transfer_count = transfer_tasks

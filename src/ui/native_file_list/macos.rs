@@ -1,30 +1,53 @@
 use super::{
-    compute_appkit_frame, map_row_index_to_entry, resolve_drop_destination_dir,
-    resolve_inline_rename_entry, should_commit_inline_rename, NativeContextMenuAction,
-    NativeEventSink, NativePaneEvent, NativePaneSnapshot, NativeRowViewModel,
+    MAX_SAFE_PANE_POINTS, NativeContextMenuAction, NativeEventSink, NativePaneEvent,
+    NativePaneSnapshot, NativeRowViewModel, collect_paths_from_index_set, compute_appkit_frame,
+    map_row_index_to_entry, resolve_drop_destination_dir, resolve_inline_rename_entry,
+    should_commit_inline_rename,
 };
 use crate::i18n::i18n;
 use crate::models::FileEntry;
 use crate::ui::file_pane::SortColumn;
 use futures::channel::mpsc::UnboundedReceiver;
+use objc2::rc::autoreleasepool;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{class, msg_send, sel};
-use objc2_app_kit::NSDragOperation;
-use objc2_foundation::{NSInteger, NSPoint, NSRect, NSSize, NSString, NSUInteger, NSURL};
+use objc2_app_kit::{
+    NSDragOperation, NSFocusRingType, NSTableViewColumnAutoresizingStyle, NSTableViewStyle,
+    NSWindowOrderingMode,
+};
+use objc2_foundation::{
+    NSArray, NSInteger, NSNotFound, NSPoint, NSRect, NSSize, NSString, NSUInteger, NSURL,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::collections::HashSet;
-use std::ffi::{c_void, CStr};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, c_void};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, Weak};
 
 const DELEGATE_IVAR: &CStr = c"rustduckDelegateCtx";
 const RUSTDUCK_LOCAL_PB_TYPE: &str = "app.rustduck.local-paths";
 const RUSTDUCK_REMOTE_PB_TYPE: &str = "app.rustduck.remote-paths";
+const NS_VIEW_WIDTH_SIZABLE_MASK: NSUInteger = 2;
 
 static REGISTER_CLASSES: Once = Once::new();
-static mut DELEGATE_CLASS: *const AnyClass = null();
-static mut TABLE_VIEW_CLASS: *const AnyClass = null();
+static DELEGATE_CLASS: AtomicUsize = AtomicUsize::new(0);
+static TABLE_VIEW_CLASS: AtomicUsize = AtomicUsize::new(0);
+
+struct SelectionSuppressGuard<'a>(&'a AtomicBool);
+
+impl<'a> SelectionSuppressGuard<'a> {
+    fn enter(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for SelectionSuppressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 struct MacPaneState {
     scroll_view: usize,
@@ -32,6 +55,7 @@ struct MacPaneState {
     delegate_obj: usize,
     visible: bool,
     bounds_px: (i32, i32, i32, i32),
+    last_frame_quantized: (i64, i64, i64, i64),
     scale_factor: f32,
     is_dark: Option<bool>,
     tab_idx: usize,
@@ -55,6 +79,7 @@ impl MacPaneState {
             delegate_obj: 0,
             visible: false,
             bounds_px: (0, 0, 0, 0),
+            last_frame_quantized: (0, 0, 0, 0),
             scale_factor: 1.0,
             is_dark: None,
             tab_idx: usize::MAX,
@@ -83,8 +108,10 @@ impl MacPaneState {
 
 struct HostInner {
     root_ns_view: usize,
+    host_ns_view: usize,
     left: MacPaneState,
     right: MacPaneState,
+    icon_cache: HashMap<String, usize>,
     events: NativeEventSink,
 }
 
@@ -111,8 +138,10 @@ impl PlatformHost {
         Self {
             state: Arc::new(Mutex::new(HostInner {
                 root_ns_view: 0,
+                host_ns_view: 0,
                 left: MacPaneState::new(),
                 right: MacPaneState::new(),
+                icon_cache: HashMap::new(),
                 events: NativeEventSink::default(),
             })),
             suppress_selection: Arc::new(AtomicBool::new(false)),
@@ -131,121 +160,159 @@ impl PlatformHost {
             return;
         }
 
-        self.ensure_views_created(root_view_ptr);
+        autoreleasepool(|_| {
+            self.ensure_views_created(root_view_ptr);
 
-        let mut guard = self.state.lock().unwrap();
-        let pane = if snapshot.is_local {
-            &mut guard.left
-        } else {
-            &mut guard.right
-        };
-        if pane.scroll_view == 0 || pane.table_view == 0 {
-            return;
-        }
+            let mut guard = self.state.lock().unwrap();
+            let host_view_ptr = if guard.host_ns_view != 0 {
+                guard.host_ns_view
+            } else {
+                root_view_ptr
+            };
+            let pane = if snapshot.is_local {
+                &mut guard.left
+            } else {
+                &mut guard.right
+            };
+            if pane.scroll_view == 0 || pane.table_view == 0 {
+                return;
+            }
 
-        let sv = pane.scroll_view as *mut AnyObject;
-        let tv = pane.table_view as *mut AnyObject;
-        let root_view = root_view_ptr as *mut AnyObject;
+            let sv = pane.scroll_view as *mut AnyObject;
+            let tv = pane.table_view as *mut AnyObject;
+            let root_view = root_view_ptr as *mut AnyObject;
+            let host_view = host_view_ptr as *mut AnyObject;
 
-        let vis_changed = pane.visible != snapshot.visible;
-        let bounds_changed = pane.bounds_px != snapshot.bounds_px
-            || (pane.scale_factor - snapshot.scale_factor).abs() > f32::EPSILON;
-        pane.visible = snapshot.visible;
-        pane.bounds_px = snapshot.bounds_px;
-        pane.scale_factor = snapshot.scale_factor;
+            let vis_changed = pane.visible != snapshot.visible;
+            let bounds_changed = pane.bounds_px != snapshot.bounds_px
+                || (pane.scale_factor - snapshot.scale_factor).abs() > f32::EPSILON;
+            pane.visible = snapshot.visible;
+            pane.bounds_px = snapshot.bounds_px;
+            pane.scale_factor = snapshot.scale_factor;
 
-        if !snapshot.visible {
+            if !snapshot.visible {
+                drop(guard);
+                if vis_changed {
+                    unsafe {
+                        let _: () = msg_send![sv, setHidden: Bool::YES];
+                        restore_focus_if_inside_scroll_view(root_view, sv);
+                    }
+                }
+                return;
+            }
+
+            let need_appearance = if pane.is_dark != Some(snapshot.is_dark) {
+                pane.is_dark = Some(snapshot.is_dark);
+                Some(snapshot.is_dark)
+            } else {
+                None
+            };
+
+            let t = i18n();
+            let desired_labels = (
+                t.col_name().to_string(),
+                t.col_modified().to_string(),
+                t.col_size().to_string(),
+            );
+            let sort_changed = pane.sort_col != snapshot.sort_col
+                || pane.sort_ascending != snapshot.sort_ascending;
+            let need_headers = if pane.header_labels != desired_labels || sort_changed {
+                pane.header_labels = desired_labels.clone();
+                pane.sort_col = snapshot.sort_col;
+                pane.sort_ascending = snapshot.sort_ascending;
+                Some((desired_labels, snapshot.sort_col, snapshot.sort_ascending))
+            } else {
+                None
+            };
+
+            let data_changed = pane.tab_idx != snapshot.tab_idx
+                || pane.entries_revision != snapshot.entries_revision
+                || pane.rows.len() != snapshot.rows.len();
+            pane.tab_idx = snapshot.tab_idx;
+            pane.entries_revision = snapshot.entries_revision;
+            pane.current_path = snapshot.current_path.clone();
+            pane.has_parent = snapshot.has_parent;
+            pane.rows = Arc::clone(&snapshot.rows);
+            pane.entries = Arc::clone(&snapshot.entries);
+
+            let need_sel_sync = data_changed || pane.selected_paths != snapshot.selected_paths;
+            if need_sel_sync {
+                pane.selected_paths = snapshot.selected_paths.clone();
+            }
+            let prev_quantized = pane.last_frame_quantized;
+            let rows_clone = Arc::clone(&pane.rows);
+            let selected_clone = pane.selected_paths.clone();
+            let bounds_px = snapshot.bounds_px;
+            let scale_factor = snapshot.scale_factor;
             drop(guard);
-            if vis_changed {
-                unsafe {
-                    let _: () = msg_send![sv, setHidden: Bool::YES];
-                    let win: *mut AnyObject = msg_send![root_view, window];
-                    if !win.is_null() {
-                        let _: Bool = msg_send![win, makeFirstResponder: root_view];
+
+            unsafe {
+                if bounds_changed || vis_changed {
+                    let host_bounds: NSRect = msg_send![host_view, bounds];
+                    let is_flipped: Bool = msg_send![host_view, isFlipped];
+                    let max_pts = MAX_SAFE_PANE_POINTS as f64;
+                    let safe_host_w =
+                        if host_bounds.size.width.is_finite() && host_bounds.size.width > 0.0 {
+                            host_bounds.size.width.min(max_pts)
+                        } else {
+                            max_pts
+                        };
+                    let safe_host_h =
+                        if host_bounds.size.height.is_finite() && host_bounds.size.height > 0.0 {
+                            host_bounds.size.height.min(max_pts)
+                        } else {
+                            max_pts
+                        };
+
+                    let (raw_x, raw_y, raw_w, raw_h) = compute_appkit_frame(
+                        bounds_px,
+                        scale_factor,
+                        safe_host_h,
+                        is_flipped.as_bool(),
+                    );
+                    let x = raw_x.clamp(0.0, (safe_host_w - 1.0).max(0.0));
+                    let y = raw_y.clamp(0.0, (safe_host_h - 1.0).max(0.0));
+                    let w = raw_w.clamp(1.0, (safe_host_w - x).max(1.0));
+                    let h = raw_h.clamp(1.0, (safe_host_h - y).max(1.0));
+                    let quantized = (
+                        (x * 8.0).round() as i64,
+                        (y * 8.0).round() as i64,
+                        (w * 8.0).round() as i64,
+                        (h * 8.0).round() as i64,
+                    );
+                    if quantized != prev_quantized {
+                        let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+                        let _: () = msg_send![sv, setFrame: frame];
+                        resize_mac_columns(tv, w);
+                        let mut guard = self.state.lock().unwrap();
+                        let pane = if snapshot.is_local {
+                            &mut guard.left
+                        } else {
+                            &mut guard.right
+                        };
+                        pane.last_frame_quantized = quantized;
+                    }
+                }
+                if vis_changed {
+                    let _: () = msg_send![sv, setHidden: Bool::NO];
+                }
+                if let Some(is_dark) = need_appearance {
+                    apply_mac_appearance(sv, is_dark);
+                }
+                if let Some((labels, sort_col, sort_asc)) = need_headers {
+                    update_mac_column_headers(tv, &labels, sort_col, sort_asc);
+                }
+                if data_changed || need_sel_sync {
+                    let _suppress = SelectionSuppressGuard::enter(&self.suppress_selection);
+                    if data_changed {
+                        let _: () = msg_send![tv, reloadData];
+                    }
+                    if need_sel_sync {
+                        sync_mac_table_selection(tv, &rows_clone, &selected_clone);
                     }
                 }
             }
-            return;
-        }
-
-        let need_appearance = if pane.is_dark != Some(snapshot.is_dark) {
-            pane.is_dark = Some(snapshot.is_dark);
-            Some(snapshot.is_dark)
-        } else {
-            None
-        };
-
-        let t = i18n();
-        let desired_labels = (
-            t.col_name().to_string(),
-            t.col_modified().to_string(),
-            t.col_size().to_string(),
-        );
-        let sort_changed =
-            pane.sort_col != snapshot.sort_col || pane.sort_ascending != snapshot.sort_ascending;
-        let need_headers = if pane.header_labels != desired_labels || sort_changed {
-            pane.header_labels = desired_labels.clone();
-            pane.sort_col = snapshot.sort_col;
-            pane.sort_ascending = snapshot.sort_ascending;
-            Some((desired_labels, snapshot.sort_col, snapshot.sort_ascending))
-        } else {
-            None
-        };
-
-        let data_changed = pane.tab_idx != snapshot.tab_idx
-            || pane.entries_revision != snapshot.entries_revision
-            || pane.rows.len() != snapshot.rows.len();
-        pane.tab_idx = snapshot.tab_idx;
-        pane.entries_revision = snapshot.entries_revision;
-        pane.current_path = snapshot.current_path.clone();
-        pane.has_parent = snapshot.has_parent;
-        pane.rows = Arc::clone(&snapshot.rows);
-        pane.entries = Arc::clone(&snapshot.entries);
-
-        let need_sel_sync = data_changed || pane.selected_paths != snapshot.selected_paths;
-        if need_sel_sync {
-            pane.selected_paths = snapshot.selected_paths.clone();
-        }
-        let rows_clone = Arc::clone(&pane.rows);
-        let selected_clone = pane.selected_paths.clone();
-        let bounds_px = snapshot.bounds_px;
-        let scale_factor = snapshot.scale_factor;
-        drop(guard);
-
-        unsafe {
-            if bounds_changed {
-                let root_bounds: NSRect = msg_send![root_view, bounds];
-                let is_flipped: Bool = msg_send![root_view, isFlipped];
-                let (x, y, w, h) = compute_appkit_frame(
-                    bounds_px,
-                    scale_factor,
-                    root_bounds.size.height,
-                    is_flipped.as_bool(),
-                );
-                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-                let _: () = msg_send![sv, setFrame: frame];
-                resize_mac_columns(tv, w);
-            }
-            if vis_changed {
-                let _: () = msg_send![sv, setHidden: Bool::NO];
-            }
-            if let Some(is_dark) = need_appearance {
-                apply_mac_appearance(sv, is_dark);
-            }
-            if let Some((labels, sort_col, sort_asc)) = need_headers {
-                update_mac_column_headers(tv, &labels, sort_col, sort_asc);
-            }
-            if data_changed {
-                self.suppress_selection.store(true, Ordering::SeqCst);
-                let _: () = msg_send![tv, reloadData];
-                self.suppress_selection.store(false, Ordering::SeqCst);
-            }
-            if need_sel_sync {
-                self.suppress_selection.store(true, Ordering::SeqCst);
-                sync_mac_table_selection(tv, &rows_clone, &selected_clone);
-                self.suppress_selection.store(false, Ordering::SeqCst);
-            }
-        }
+        });
     }
 
     pub fn hide_all(&self) {
@@ -257,20 +324,19 @@ impl PlatformHost {
                 guard.root_ns_view,
             )
         };
-        let any_hidden = left_sv.is_some() || right_sv.is_some();
-        unsafe {
+        if left_sv.is_none() && right_sv.is_none() {
+            return;
+        }
+        autoreleasepool(|_| unsafe {
+            let root_view = root_view_ptr as *mut AnyObject;
             for sv_ptr in [left_sv, right_sv].into_iter().flatten() {
                 let sv = sv_ptr as *mut AnyObject;
                 let _: () = msg_send![sv, setHidden: Bool::YES];
-            }
-            if any_hidden && root_view_ptr != 0 {
-                let root_view = root_view_ptr as *mut AnyObject;
-                let win: *mut AnyObject = msg_send![root_view, window];
-                if !win.is_null() {
-                    let _: Bool = msg_send![win, makeFirstResponder: root_view];
+                if !root_view.is_null() {
+                    restore_focus_if_inside_scroll_view(root_view, sv);
                 }
             }
-        }
+        });
     }
 
     pub fn drain_events(&self) -> Vec<NativePaneEvent> {
@@ -302,13 +368,19 @@ impl PlatformHost {
         let root_view = root_view_ptr as *mut AnyObject;
         let weak_state = Arc::downgrade(&self.state);
         unsafe {
+            let host_view = resolve_host_container_view(root_view);
+            if host_view.is_null() {
+                return;
+            }
             let (l_sv, l_tv, l_del) = create_single_mac_table(
+                host_view,
                 root_view,
                 true,
                 weak_state.clone(),
                 Arc::clone(&self.suppress_selection),
             );
             let (r_sv, r_tv, r_del) = create_single_mac_table(
+                host_view,
                 root_view,
                 false,
                 weak_state,
@@ -316,6 +388,7 @@ impl PlatformHost {
             );
             let mut guard = self.state.lock().unwrap();
             guard.root_ns_view = root_view_ptr;
+            guard.host_ns_view = host_view as usize;
             guard.left.scroll_view = l_sv as usize;
             guard.left.table_view = l_tv as usize;
             guard.left.delegate_obj = l_del as usize;
@@ -349,6 +422,50 @@ impl Drop for HostInner {
                     pane.delegate_obj = 0;
                 }
             }
+            for (_, icon_ptr) in self.icon_cache.drain() {
+                if icon_ptr != 0 {
+                    let icon = icon_ptr as *mut AnyObject;
+                    let _: () = msg_send![icon, release];
+                }
+            }
+        }
+    }
+}
+
+unsafe fn resolve_host_container_view(root_view: *mut AnyObject) -> *mut AnyObject {
+    if root_view.is_null() {
+        return null_mut();
+    }
+    // `root_view` is GPUIView (backed directly by a raw CAMetalLayer). Adding AppKit subviews to
+    // NSWindow.contentView ([root_view superview]) ordered above GPUIView avoids mutating
+    // GPUIView's CAMetalLayer subtree and prevents FullSizeContentView hit-test conflicts.
+    let superview: *mut AnyObject = unsafe { msg_send![root_view, superview] };
+    if !superview.is_null() {
+        superview
+    } else {
+        root_view
+    }
+}
+
+unsafe fn restore_focus_if_inside_scroll_view(root_view: *mut AnyObject, sv: *mut AnyObject) {
+    if root_view.is_null() || sv.is_null() {
+        return;
+    }
+    unsafe {
+        let win: *mut AnyObject = msg_send![root_view, window];
+        if win.is_null() {
+            return;
+        }
+        let first_resp: *mut AnyObject = msg_send![win, firstResponder];
+        if first_resp.is_null() {
+            return;
+        }
+        let is_view: Bool = msg_send![first_resp, isKindOfClass: class!(NSView)];
+        if is_view.as_bool() {
+            let inside: Bool = msg_send![first_resp, isDescendantOf: sv];
+            if inside.as_bool() {
+                let _: Bool = msg_send![win, makeFirstResponder: root_view];
+            }
         }
     }
 }
@@ -366,7 +483,13 @@ fn ensure_objc_classes() {
         del_decl.add_method(
             sel!(tableView:viewForTableColumn:row:),
             view_for_table_column
-                as extern "C" fn(_, Sel, *mut AnyObject, *mut AnyObject, NSInteger) -> *mut AnyObject,
+                as extern "C" fn(
+                    _,
+                    Sel,
+                    *mut AnyObject,
+                    *mut AnyObject,
+                    NSInteger,
+                ) -> *mut AnyObject,
         );
         del_decl.add_method(
             sel!(tableViewSelectionDidChange:),
@@ -425,7 +548,10 @@ fn ensure_objc_classes() {
                     NSUInteger,
                 ) -> Bool,
         );
-        DELEGATE_CLASS = del_decl.register();
+        DELEGATE_CLASS.store(
+            del_decl.register() as *const AnyClass as usize,
+            Ordering::Release,
+        );
 
         let mut tv_decl =
             ClassBuilder::new(c"RustduckFinderTableView", class!(NSTableView)).expect("tv class");
@@ -433,106 +559,147 @@ fn ensure_objc_classes() {
             sel!(keyDown:),
             table_key_down as extern "C" fn(_, Sel, *mut AnyObject),
         );
-        TABLE_VIEW_CLASS = tv_decl.register();
+        tv_decl.add_method(
+            sel!(mouseDownCanMoveWindow),
+            table_mouse_down_can_move_window as extern "C" fn(_, Sel) -> Bool,
+        );
+        tv_decl.add_method(
+            sel!(acceptsFirstMouse:),
+            table_accepts_first_mouse as extern "C" fn(_, Sel, *mut AnyObject) -> Bool,
+        );
+        TABLE_VIEW_CLASS.store(
+            tv_decl.register() as *const AnyClass as usize,
+            Ordering::Release,
+        );
     });
 }
 
 unsafe fn create_single_mac_table(
+    host_view: *mut AnyObject,
     root_view: *mut AnyObject,
     is_local: bool,
     state: Weak<Mutex<HostInner>>,
     suppress_selection: Arc<AtomicBool>,
 ) -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
-    let ctx_ptr = Box::into_raw(Box::new(DelegateContext {
-        is_local,
-        state,
-        suppress_selection,
-    })) as *mut c_void;
+    unsafe {
+        let ctx_ptr = Box::into_raw(Box::new(DelegateContext {
+            is_local,
+            state,
+            suppress_selection,
+        })) as *mut c_void;
 
-    let del: *mut AnyObject = msg_send![DELEGATE_CLASS, new];
-    set_delegate_ctx_ptr(del, ctx_ptr);
+        let del_cls = DELEGATE_CLASS.load(Ordering::Acquire) as *const AnyClass;
+        let tv_cls = TABLE_VIEW_CLASS.load(Ordering::Acquire) as *const AnyClass;
 
-    let init_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, 200.0));
-    let sv: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
-    let sv: *mut AnyObject = msg_send![sv, initWithFrame: init_rect];
-    let _: () = msg_send![sv, setHasVerticalScroller: Bool::YES];
-    let _: () = msg_send![sv, setAutohidesScrollers: Bool::YES];
-    let _: () = msg_send![sv, setDrawsBackground: Bool::YES];
-    let _: () = msg_send![sv, setHidden: Bool::YES];
+        let del: *mut AnyObject = msg_send![del_cls, new];
+        set_delegate_ctx_ptr(del, ctx_ptr);
 
-    let tv: *mut AnyObject = msg_send![TABLE_VIEW_CLASS, alloc];
-    let tv: *mut AnyObject = msg_send![tv, initWithFrame: init_rect];
+        let init_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, 200.0));
+        let sv: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+        let sv: *mut AnyObject = msg_send![sv, initWithFrame: init_rect];
+        let _: () = msg_send![sv, setWantsLayer: Bool::YES];
+        let _: () = msg_send![sv, setHasVerticalScroller: Bool::YES];
+        let _: () = msg_send![sv, setAutohidesScrollers: Bool::YES];
+        let _: () = msg_send![sv, setDrawsBackground: Bool::YES];
+        let _: () = msg_send![sv, setHidden: Bool::YES];
 
-    let _: () = msg_send![tv, setUsesAlternatingRowBackgroundColors: Bool::YES];
-    let _: () = msg_send![tv, setAllowsMultipleSelection: Bool::YES];
-    let _: () = msg_send![tv, setAllowsColumnReordering: Bool::NO];
-    let _: () = msg_send![tv, setAllowsColumnResizing: Bool::YES];
-    let _: () = msg_send![tv, setRowHeight: 24.0f64];
+        let tv: *mut AnyObject = msg_send![tv_cls, alloc];
+        let tv: *mut AnyObject = msg_send![tv, initWithFrame: init_rect];
 
-    add_mac_column(tv, "name", "Name", 240.0);
-    add_mac_column(tv, "modified", "Date Modified", 170.0);
-    add_mac_column(tv, "size", "Size", 95.0);
+        let has_set_style: Bool = msg_send![tv, respondsToSelector: sel!(setStyle:)];
+        if has_set_style.as_bool() {
+            let _: () = msg_send![tv, setStyle: NSTableViewStyle::Plain];
+        }
+        let _: () = msg_send![
+            tv,
+            setColumnAutoresizingStyle: NSTableViewColumnAutoresizingStyle::NoColumnAutoresizing
+        ];
+        let _: () = msg_send![tv, setFocusRingType: NSFocusRingType::None];
+        let _: () = msg_send![tv, setUsesAlternatingRowBackgroundColors: Bool::YES];
+        let _: () = msg_send![tv, setAllowsMultipleSelection: Bool::YES];
+        let _: () = msg_send![tv, setAllowsColumnReordering: Bool::NO];
+        let _: () = msg_send![tv, setAllowsColumnResizing: Bool::YES];
+        let _: () = msg_send![tv, setRowHeight: 24.0f64];
 
-    let _: () = msg_send![tv, setDataSource: del];
-    let _: () = msg_send![tv, setDelegate: del];
-    let _: () = msg_send![tv, setTarget: del];
-    let _: () = msg_send![tv, setDoubleAction: sel!(onDoubleClick:)];
+        add_mac_column(tv, "name", "Name", 240.0);
+        add_mac_column(tv, "modified", "Date Modified", 170.0);
+        add_mac_column(tv, "size", "Size", 95.0);
 
-    // Context menu
-    let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
-    let _: () = msg_send![menu, setDelegate: del];
-    let _: () = msg_send![tv, setMenu: menu];
-    let _: *mut AnyObject = msg_send![menu, autorelease];
+        let _: () = msg_send![tv, setDataSource: del];
+        let _: () = msg_send![tv, setDelegate: del];
+        let _: () = msg_send![tv, setTarget: del];
+        let _: () = msg_send![tv, setDoubleAction: sel!(onDoubleClick:)];
 
-    // Drag & Drop registration (Finder file URLs + cross-pane local/remote paths)
-    let file_url_type = NSString::from_str("public.file-url");
-    let local_pb_type = NSString::from_str(RUSTDUCK_LOCAL_PB_TYPE);
-    let remote_pb_type = NSString::from_str(RUSTDUCK_REMOTE_PB_TYPE);
-    let types: *mut AnyObject = msg_send![
-        class!(NSArray),
-        arrayWithObjects: [
-            &*file_url_type as *const NSString,
-            &*local_pb_type as *const NSString,
-            &*remote_pb_type as *const NSString
-        ].as_ptr(),
-        count: 3usize
-    ];
-    let _: () = msg_send![tv, registerForDraggedTypes: types];
+        // Context menu
+        let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
+        let _: () = msg_send![menu, setDelegate: del];
+        let _: () = msg_send![tv, setMenu: menu];
+        let _: *mut AnyObject = msg_send![menu, autorelease];
 
-    let _: () = msg_send![sv, setDocumentView: tv];
-    let _: *mut AnyObject = msg_send![tv, autorelease];
-    let _: () = msg_send![root_view, addSubview: sv];
+        // Drag & Drop registration (Finder file URLs + cross-pane local/remote paths)
+        let file_url_type = NSString::from_str("public.file-url");
+        let local_pb_type = NSString::from_str(RUSTDUCK_LOCAL_PB_TYPE);
+        let remote_pb_type = NSString::from_str(RUSTDUCK_REMOTE_PB_TYPE);
+        let drag_types =
+            NSArray::from_retained_slice(&[file_url_type, local_pb_type, remote_pb_type]);
+        let _: () = msg_send![tv, registerForDraggedTypes: &*drag_types];
 
-    (sv, tv, del)
+        let _: () = msg_send![sv, setDocumentView: tv];
+        let _: *mut AnyObject = msg_send![tv, autorelease];
+
+        if host_view != root_view && !root_view.is_null() {
+            let _: () = msg_send![
+                host_view,
+                addSubview: sv,
+                positioned: NSWindowOrderingMode::Above,
+                relativeTo: root_view
+            ];
+        } else {
+            let _: () = msg_send![host_view, addSubview: sv];
+        }
+
+        (sv, tv, del)
+    }
 }
 
 unsafe fn add_mac_column(tv: *mut AnyObject, id: &str, title: &str, width: f64) {
-    let ns_id = NSString::from_str(id);
-    let ns_title = NSString::from_str(title);
-    let col: *mut AnyObject = msg_send![class!(NSTableColumn), alloc];
-    let col: *mut AnyObject = msg_send![col, initWithIdentifier: &*ns_id];
-    let _: () = msg_send![col, setTitle: &*ns_title];
-    let _: () = msg_send![col, setWidth: width];
-    let _: () = msg_send![col, setMinWidth: 64.0f64];
-    let _: () = msg_send![tv, addTableColumn: col];
-    let _: *mut AnyObject = msg_send![col, autorelease];
+    unsafe {
+        let ns_id = NSString::from_str(id);
+        let ns_title = NSString::from_str(title);
+        let col: *mut AnyObject = msg_send![class!(NSTableColumn), alloc];
+        let col: *mut AnyObject = msg_send![col, initWithIdentifier: &*ns_id];
+        let _: () = msg_send![col, setTitle: &*ns_title];
+        let _: () = msg_send![col, setWidth: width];
+        let _: () = msg_send![col, setMinWidth: 64.0f64];
+        let _: () = msg_send![tv, addTableColumn: col];
+        let _: *mut AnyObject = msg_send![col, autorelease];
+    }
 }
 
 unsafe fn resize_mac_columns(tv: *mut AnyObject, total_width: f64) {
-    let cols: *mut AnyObject = msg_send![tv, tableColumns];
-    let count: NSUInteger = msg_send![cols, count];
-    if count < 3 {
+    if !total_width.is_finite() || total_width <= 0.0 {
         return;
     }
-    let mod_w = 170.0f64;
-    let size_w = 95.0f64;
-    let name_w = (total_width - mod_w - size_w - 24.0).max(120.0);
-    let c0: *mut AnyObject = msg_send![cols, objectAtIndex: 0usize];
-    let c1: *mut AnyObject = msg_send![cols, objectAtIndex: 1usize];
-    let c2: *mut AnyObject = msg_send![cols, objectAtIndex: 2usize];
-    let _: () = msg_send![c0, setWidth: name_w];
-    let _: () = msg_send![c1, setWidth: mod_w];
-    let _: () = msg_send![c2, setWidth: size_w];
+    unsafe {
+        let cols: *mut AnyObject = msg_send![tv, tableColumns];
+        if cols.is_null() {
+            return;
+        }
+        let count: NSUInteger = msg_send![cols, count];
+        if count < 3 {
+            return;
+        }
+        let clamped_total = total_width.min(MAX_SAFE_PANE_POINTS as f64);
+        let mod_w = 170.0f64;
+        let size_w = 95.0f64;
+        let name_w = (clamped_total - mod_w - size_w - 24.0).max(120.0);
+        let c0: *mut AnyObject = msg_send![cols, objectAtIndex: 0usize];
+        let c1: *mut AnyObject = msg_send![cols, objectAtIndex: 1usize];
+        let c2: *mut AnyObject = msg_send![cols, objectAtIndex: 2usize];
+        let _: () = msg_send![c0, setWidth: name_w];
+        let _: () = msg_send![c1, setWidth: mod_w];
+        let _: () = msg_send![c2, setWidth: size_w];
+    }
 }
 
 unsafe fn apply_mac_appearance(sv: *mut AnyObject, is_dark: bool) {
@@ -541,9 +708,11 @@ unsafe fn apply_mac_appearance(sv: *mut AnyObject, is_dark: bool) {
     } else {
         NSString::from_str("NSAppearanceNameAqua")
     };
-    let appearance: *mut AnyObject = msg_send![class!(NSAppearance), appearanceNamed: &*name];
-    if !appearance.is_null() {
-        let _: () = msg_send![sv, setAppearance: appearance];
+    unsafe {
+        let appearance: *mut AnyObject = msg_send![class!(NSAppearance), appearanceNamed: &*name];
+        if !appearance.is_null() {
+            let _: () = msg_send![sv, setAppearance: appearance];
+        }
     }
 }
 
@@ -553,34 +722,39 @@ unsafe fn update_mac_column_headers(
     sort_col: SortColumn,
     ascending: bool,
 ) {
-    let cols: *mut AnyObject = msg_send![tv, tableColumns];
-    let count: NSUInteger = msg_send![cols, count];
-    if count < 3 {
-        return;
-    }
-    let arrow = if ascending { " ↑" } else { " ↓" };
-    let titles = [
-        if sort_col == SortColumn::Name {
-            format!("{}{arrow}", labels.0)
-        } else {
-            labels.0.clone()
-        },
-        if sort_col == SortColumn::Modified {
-            format!("{}{arrow}", labels.1)
-        } else {
-            labels.1.clone()
-        },
-        if sort_col == SortColumn::Size {
-            format!("{}{arrow}", labels.2)
-        } else {
-            labels.2.clone()
-        },
-    ];
+    unsafe {
+        let cols: *mut AnyObject = msg_send![tv, tableColumns];
+        if cols.is_null() {
+            return;
+        }
+        let count: NSUInteger = msg_send![cols, count];
+        if count < 3 {
+            return;
+        }
+        let arrow = if ascending { " ↑" } else { " ↓" };
+        let titles = [
+            if sort_col == SortColumn::Name {
+                format!("{}{arrow}", labels.0)
+            } else {
+                labels.0.clone()
+            },
+            if sort_col == SortColumn::Modified {
+                format!("{}{arrow}", labels.1)
+            } else {
+                labels.1.clone()
+            },
+            if sort_col == SortColumn::Size {
+                format!("{}{arrow}", labels.2)
+            } else {
+                labels.2.clone()
+            },
+        ];
 
-    for (idx, text) in titles.iter().enumerate() {
-        let col: *mut AnyObject = msg_send![cols, objectAtIndex: idx];
-        let ns_t = NSString::from_str(text);
-        let _: () = msg_send![col, setTitle: &*ns_t];
+        for (idx, text) in titles.iter().enumerate() {
+            let col: *mut AnyObject = msg_send![cols, objectAtIndex: idx];
+            let ns_t = NSString::from_str(text);
+            let _: () = msg_send![col, setTitle: &*ns_t];
+        }
     }
 }
 
@@ -590,43 +764,120 @@ unsafe fn sync_mac_table_selection(
     selected_paths: &[String],
 ) {
     let set: HashSet<&str> = selected_paths.iter().map(|s| s.as_str()).collect();
-    let idx_set: *mut AnyObject = msg_send![class!(NSMutableIndexSet), indexSet];
-    for (idx, row) in rows.iter().enumerate() {
-        if !row.is_parent_row && set.contains(row.path.as_str()) {
-            let _: () = msg_send![idx_set, addIndex: idx as NSUInteger];
+    unsafe {
+        let idx_set: *mut AnyObject = msg_send![class!(NSMutableIndexSet), indexSet];
+        for (idx, row) in rows.iter().enumerate() {
+            if !row.is_parent_row && set.contains(row.path.as_str()) {
+                let _: () = msg_send![idx_set, addIndex: idx as NSUInteger];
+            }
+        }
+        let _: () = msg_send![tv, selectRowIndexes: idx_set, byExtendingSelection: Bool::NO];
+    }
+}
+
+unsafe fn resolve_or_cache_mac_icon(
+    state: &Mutex<HostInner>,
+    is_dir: bool,
+    extension: &str,
+) -> *mut AnyObject {
+    let cache_key = if is_dir {
+        "__dir__"
+    } else if extension.is_empty() {
+        "__file__"
+    } else {
+        extension
+    };
+    {
+        let guard = state.lock().unwrap();
+        if let Some(&ptr) = guard.icon_cache.get(cache_key) {
+            if ptr != 0 {
+                return ptr as *mut AnyObject;
+            }
         }
     }
-    let _: () = msg_send![tv, selectRowIndexes: idx_set, byExtendingSelection: Bool::NO];
+
+    unsafe {
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if ws.is_null() {
+            return null_mut();
+        }
+        let ft = if is_dir {
+            NSString::from_str("public.folder")
+        } else if extension.is_empty() {
+            NSString::from_str("public.data")
+        } else {
+            NSString::from_str(extension)
+        };
+        let shared_icon: *mut AnyObject = msg_send![ws, iconForFileType: &*ft];
+        if shared_icon.is_null() {
+            return null_mut();
+        }
+        let owned_icon: *mut AnyObject = msg_send![shared_icon, copy];
+        if owned_icon.is_null() {
+            return null_mut();
+        }
+        let _: () = msg_send![owned_icon, setSize: NSSize::new(16.0, 16.0)];
+
+        let mut guard = state.lock().unwrap();
+        if let Some(&existing_ptr) = guard.icon_cache.get(cache_key) {
+            if existing_ptr != 0 {
+                let _: () = msg_send![owned_icon, release];
+                return existing_ptr as *mut AnyObject;
+            }
+        }
+        guard
+            .icon_cache
+            .insert(cache_key.to_string(), owned_icon as usize);
+        owned_icon
+    }
 }
 
 unsafe fn set_delegate_ctx_ptr(obj: *mut AnyObject, ctx_ptr: *mut c_void) {
-    let cls = DELEGATE_CLASS;
+    let cls = DELEGATE_CLASS.load(Ordering::Acquire) as *const AnyClass;
     if obj.is_null() || cls.is_null() {
         return;
     }
-    if let Some(ivar) = (*cls).instance_variable(DELEGATE_IVAR) {
-        *ivar.load_mut::<*mut c_void>(&mut *obj) = ctx_ptr;
+    unsafe {
+        if let Some(ivar) = (*cls).instance_variable(DELEGATE_IVAR) {
+            *ivar.load_mut::<*mut c_void>(&mut *obj) = ctx_ptr;
+        }
     }
 }
 
 unsafe fn get_delegate_ctx_ptr(obj: *mut AnyObject) -> *mut c_void {
-    let cls = DELEGATE_CLASS;
+    let cls = DELEGATE_CLASS.load(Ordering::Acquire) as *const AnyClass;
     if obj.is_null() || cls.is_null() {
         return null_mut();
     }
-    match (*cls).instance_variable(DELEGATE_IVAR) {
-        Some(ivar) => *ivar.load::<*mut c_void>(&*obj),
-        None => null_mut(),
+    unsafe {
+        match (*cls).instance_variable(DELEGATE_IVAR) {
+            Some(ivar) => *ivar.load::<*mut c_void>(&*obj),
+            None => null_mut(),
+        }
     }
 }
 
 unsafe fn get_delegate_ctx<'a>(obj: *mut AnyObject) -> Option<&'a DelegateContext> {
-    let ptr = get_delegate_ctx_ptr(obj);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(&*(ptr as *const DelegateContext))
+    unsafe {
+        let ptr = get_delegate_ctx_ptr(obj);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(&*(ptr as *const DelegateContext))
+        }
     }
+}
+
+extern "C" fn table_mouse_down_can_move_window(_this: *mut AnyObject, _cmd: Sel) -> Bool {
+    Bool::NO
+}
+
+extern "C" fn table_accepts_first_mouse(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _event: *mut AnyObject,
+) -> Bool {
+    Bool::YES
 }
 
 extern "C" fn delegate_dealloc(this: *mut AnyObject, _cmd: Sel) {
@@ -661,7 +912,7 @@ extern "C" fn number_of_rows(this: *mut AnyObject, _cmd: Sel, _tv: *mut AnyObjec
 extern "C" fn view_for_table_column(
     this: *mut AnyObject,
     _cmd: Sel,
-    _tv: *mut AnyObject,
+    tv: *mut AnyObject,
     col: *mut AnyObject,
     row: NSInteger,
 ) -> *mut AnyObject {
@@ -672,7 +923,7 @@ extern "C" fn view_for_table_column(
         let Some(state) = ctx.state.upgrade() else {
             return null_mut();
         };
-        if row < 0 || col.is_null() {
+        if row < 0 || tv.is_null() || col.is_null() {
             return null_mut();
         }
         let row_opt = {
@@ -689,6 +940,9 @@ extern "C" fn view_for_table_column(
         };
 
         let col_id_obj: *mut AnyObject = msg_send![col, identifier];
+        if col_id_obj.is_null() {
+            return null_mut();
+        }
         let utf8_ptr: *const i8 = msg_send![col_id_obj, UTF8String];
         let col_id = if utf8_ptr.is_null() {
             ""
@@ -696,81 +950,106 @@ extern "C" fn view_for_table_column(
             CStr::from_ptr(utf8_ptr).to_str().unwrap_or("")
         };
 
-        let cell_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, 24.0));
-        let cell: *mut AnyObject = msg_send![class!(NSTableCellView), alloc];
-        let cell: *mut AnyObject = msg_send![cell, initWithFrame: cell_frame];
-
-        let tf_x = if col_id == "name" { 24.0 } else { 4.0 };
-        let tf_frame = NSRect::new(NSPoint::new(tf_x, 2.0), NSSize::new(260.0, 20.0));
-        let tf: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let tf: *mut AnyObject = msg_send![tf, initWithFrame: tf_frame];
-        let _: () = msg_send![tf, setDrawsBackground: Bool::NO];
-        let _: () = msg_send![tf, setBordered: Bool::NO];
-        let _: () = msg_send![tf, setEditable: Bool::new(col_id == "name" && !row_vm.is_parent_row && !row_vm.is_bucket)];
-        let _: () = msg_send![tf, setDelegate: this];
-
-        let text = match col_id {
-            "name" => row_vm.name.as_str(),
-            "modified" => row_vm.modified_text.as_str(),
-            "size" => row_vm.size_text.as_str(),
-            _ => "",
+        let col_width: f64 = msg_send![col, width];
+        let safe_col_w = if col_width.is_finite() && col_width > 40.0 {
+            col_width.min(MAX_SAFE_PANE_POINTS as f64)
+        } else {
+            200.0
         };
-        let ns_val = NSString::from_str(text);
-        let _: () = msg_send![tf, setStringValue: &*ns_val];
 
-        if col_id == "name" {
-            let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let icon: *mut AnyObject = if ctx.is_local && !row_vm.is_parent_row {
-                let p = NSString::from_str(&row_vm.path);
-                msg_send![ws, iconForFile: &*p]
-            } else if row_vm.is_dir {
-                let ft = NSString::from_str("public.folder");
-                msg_send![ws, iconForFileType: &*ft]
-            } else {
-                let ft = NSString::from_str(&row_vm.extension);
-                msg_send![ws, iconForFileType: &*ft]
-            };
-            if !icon.is_null() {
-                let _: () = msg_send![icon, setSize: NSSize::new(16.0, 16.0)];
+        let mut cell: *mut AnyObject =
+            msg_send![tv, makeViewWithIdentifier: col_id_obj, owner: null::<AnyObject>()];
+        if cell.is_null() {
+            let cell_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(safe_col_w, 24.0));
+            let alloc_cell: *mut AnyObject = msg_send![class!(NSTableCellView), alloc];
+            cell = msg_send![alloc_cell, initWithFrame: cell_frame];
+            let _: () = msg_send![cell, setIdentifier: col_id_obj];
+
+            let tf_x = if col_id == "name" { 24.0 } else { 4.0 };
+            let tf_w = (safe_col_w - tf_x - 4.0).max(24.0);
+            let tf_frame = NSRect::new(NSPoint::new(tf_x, 2.0), NSSize::new(tf_w, 20.0));
+            let tf: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+            let tf: *mut AnyObject = msg_send![tf, initWithFrame: tf_frame];
+            let _: () = msg_send![tf, setDrawsBackground: Bool::NO];
+            let _: () = msg_send![tf, setBordered: Bool::NO];
+            let _: () = msg_send![tf, setBezeled: Bool::NO];
+            let _: () = msg_send![tf, setUsesSingleLineMode: Bool::YES];
+            let _: () = msg_send![tf, setAutoresizingMask: NS_VIEW_WIDTH_SIZABLE_MASK];
+            let _: () = msg_send![tf, setDelegate: this];
+
+            if col_id == "name" {
                 let iv_frame = NSRect::new(NSPoint::new(4.0, 4.0), NSSize::new(16.0, 16.0));
                 let iv: *mut AnyObject = msg_send![class!(NSImageView), alloc];
                 let iv: *mut AnyObject = msg_send![iv, initWithFrame: iv_frame];
-                let _: () = msg_send![iv, setImage: icon];
                 let _: () = msg_send![cell, addSubview: iv];
                 let _: *mut AnyObject = msg_send![iv, autorelease];
                 let _: () = msg_send![cell, setImageView: iv];
             }
+
+            let _: () = msg_send![cell, addSubview: tf];
+            let _: *mut AnyObject = msg_send![tf, autorelease];
+            let _: () = msg_send![cell, setTextField: tf];
+            let _: *mut AnyObject = msg_send![cell, autorelease];
         }
 
-        let _: () = msg_send![cell, addSubview: tf];
-        let _: *mut AnyObject = msg_send![tf, autorelease];
-        let _: () = msg_send![cell, setTextField: tf];
-        let _: *mut AnyObject = msg_send![cell, autorelease];
+        let tf: *mut AnyObject = msg_send![cell, textField];
+        if !tf.is_null() {
+            let editable = col_id == "name" && !row_vm.is_parent_row && !row_vm.is_bucket;
+            let _: () = msg_send![tf, setEditable: Bool::new(editable)];
+            let text = match col_id {
+                "name" => row_vm.name.as_str(),
+                "modified" => row_vm.modified_text.as_str(),
+                "size" => row_vm.size_text.as_str(),
+                _ => "",
+            };
+            let ns_val = NSString::from_str(text);
+            let _: () = msg_send![tf, setStringValue: &*ns_val];
+        }
+
+        if col_id == "name" {
+            let iv: *mut AnyObject = msg_send![cell, imageView];
+            if !iv.is_null() {
+                let icon = resolve_or_cache_mac_icon(&state, row_vm.is_dir, &row_vm.extension);
+                if !icon.is_null() {
+                    let _: () = msg_send![iv, setImage: icon];
+                }
+            }
+        }
+
         cell
     }
 }
 
-unsafe fn collect_mac_selected_paths(tv: *mut AnyObject, rows: &[NativeRowViewModel]) -> Vec<String> {
-    let idx_set: *mut AnyObject = msg_send![tv, selectedRowIndexes];
-    if idx_set.is_null() {
+unsafe fn collect_mac_selected_paths(
+    tv: *mut AnyObject,
+    rows: &[NativeRowViewModel],
+) -> Vec<String> {
+    unsafe {
+        let idx_set: *mut AnyObject = msg_send![tv, selectedRowIndexes];
+        collect_mac_paths_from_ns_index_set(idx_set, rows)
+    }
+}
+
+unsafe fn collect_mac_paths_from_ns_index_set(
+    idx_set: *mut AnyObject,
+    rows: &[NativeRowViewModel],
+) -> Vec<String> {
+    if idx_set.is_null() || rows.is_empty() {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    let not_found = NSUInteger::MAX;
-    let mut cur: NSUInteger = msg_send![idx_set, firstIndex];
-    while cur != not_found {
-        if let Some(r) = rows.get(cur) {
-            if !r.is_parent_row {
-                out.push(r.path.clone());
-            }
-        }
-        cur = msg_send![idx_set, indexGreaterThanIndex: cur];
+    let not_found = NSNotFound as NSUInteger;
+    let first: NSUInteger = unsafe { msg_send![idx_set, firstIndex] };
+    if first == not_found {
+        return Vec::new();
     }
-    out
+    collect_paths_from_index_set(rows, first, |cur| {
+        let next: NSUInteger = unsafe { msg_send![idx_set, indexGreaterThanIndex: cur] };
+        if next == not_found { usize::MAX } else { next }
+    })
 }
 
 extern "C" fn selection_did_change(this: *mut AnyObject, _cmd: Sel, _notif: *mut AnyObject) {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
@@ -783,9 +1062,15 @@ extern "C" fn selection_did_change(this: *mut AnyObject, _cmd: Sel, _notif: *mut
         let (tv, rows) = {
             let guard = state.lock().unwrap();
             if ctx.is_local {
-                (guard.left.table_view as *mut AnyObject, Arc::clone(&guard.left.rows))
+                (
+                    guard.left.table_view as *mut AnyObject,
+                    Arc::clone(&guard.left.rows),
+                )
             } else {
-                (guard.right.table_view as *mut AnyObject, Arc::clone(&guard.right.rows))
+                (
+                    guard.right.table_view as *mut AnyObject,
+                    Arc::clone(&guard.right.rows),
+                )
             }
         };
         if tv.is_null() {
@@ -805,7 +1090,7 @@ extern "C" fn selection_did_change(this: *mut AnyObject, _cmd: Sel, _notif: *mut
                 selected_paths: sel,
             });
         }
-    }
+    });
 }
 
 extern "C" fn did_click_table_column(
@@ -814,7 +1099,7 @@ extern "C" fn did_click_table_column(
     _tv: *mut AnyObject,
     col: *mut AnyObject,
 ) {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
@@ -825,6 +1110,9 @@ extern "C" fn did_click_table_column(
             return;
         }
         let col_id_obj: *mut AnyObject = msg_send![col, identifier];
+        if col_id_obj.is_null() {
+            return;
+        }
         let utf8_ptr: *const i8 = msg_send![col_id_obj, UTF8String];
         let col_id = if utf8_ptr.is_null() {
             ""
@@ -847,11 +1135,11 @@ extern "C" fn did_click_table_column(
                     column,
                 });
         }
-    }
+    });
 }
 
 extern "C" fn on_double_click(this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
@@ -881,11 +1169,11 @@ extern "C" fn on_double_click(this: *mut AnyObject, _cmd: Sel, sender: *mut AnyO
             }),
             None => {}
         }
-    }
+    });
 }
 
 extern "C" fn text_did_begin_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut AnyObject) {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
@@ -925,11 +1213,11 @@ extern "C" fn text_did_begin_editing(this: *mut AnyObject, _cmd: Sel, notif: *mu
                 Some(Ok(entry)) => Some(entry.path.clone()),
                 _ => None,
             };
-    }
+    });
 }
 
 extern "C" fn text_did_end_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut AnyObject) {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
@@ -959,11 +1247,15 @@ extern "C" fn text_did_end_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut 
         };
 
         let ns_str: *mut AnyObject = msg_send![tf, stringValue];
-        let utf8: *const i8 = msg_send![ns_str, UTF8String];
-        let edited = if utf8.is_null() {
+        let edited = if ns_str.is_null() {
             String::new()
         } else {
-            CStr::from_ptr(utf8).to_string_lossy().to_string()
+            let utf8: *const i8 = msg_send![ns_str, UTF8String];
+            if utf8.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(utf8).to_string_lossy().to_string()
+            }
         };
 
         let mut guard = state.lock().unwrap();
@@ -991,11 +1283,11 @@ extern "C" fn text_did_end_editing(this: *mut AnyObject, _cmd: Sel, notif: *mut 
                 });
             }
         }
-    }
+    });
 }
 
 extern "C" fn menu_needs_update(this: *mut AnyObject, _cmd: Sel, menu: *mut AnyObject) {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
@@ -1037,7 +1329,7 @@ extern "C" fn menu_needs_update(this: *mut AnyObject, _cmd: Sel, menu: *mut AnyO
         let _: () = msg_send![menu, addItem: sep2];
         add_nsmenu_item(menu, this, t.ctx_copy_path(), 6, has_sel);
         add_nsmenu_item(menu, this, t.ctx_refresh(), 7, true);
-    }
+    });
 }
 
 unsafe fn add_nsmenu_item(
@@ -1049,22 +1341,24 @@ unsafe fn add_nsmenu_item(
 ) {
     let ns_title = NSString::from_str(title);
     let empty_key = NSString::from_str("");
-    let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
-    let item: *mut AnyObject = msg_send![
-        item,
-        initWithTitle: &*ns_title,
-        action: if enabled { Some(sel!(onContextMenuItem:)) } else { None },
-        keyEquivalent: &*empty_key
-    ];
-    let _: () = msg_send![item, setTarget: target];
-    let _: () = msg_send![item, setTag: tag];
-    let _: () = msg_send![item, setEnabled: Bool::new(enabled)];
-    let _: () = msg_send![menu, addItem: item];
-    let _: *mut AnyObject = msg_send![item, autorelease];
+    unsafe {
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
+            item,
+            initWithTitle: &*ns_title,
+            action: if enabled { Some(sel!(onContextMenuItem:)) } else { None },
+            keyEquivalent: &*empty_key
+        ];
+        let _: () = msg_send![item, setTarget: target];
+        let _: () = msg_send![item, setTag: tag];
+        let _: () = msg_send![item, setEnabled: Bool::new(enabled)];
+        let _: () = msg_send![menu, addItem: item];
+        let _: *mut AnyObject = msg_send![item, autorelease];
+    }
 }
 
 extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return;
         };
@@ -1086,14 +1380,11 @@ extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut
                 })
                 .collect();
             if !urls.is_empty() {
-                let raw_ptrs: Vec<*const NSURL> = urls.iter().map(|u| &**u as *const NSURL).collect();
-                let arr: *mut AnyObject = msg_send![
-                    class!(NSArray),
-                    arrayWithObjects: raw_ptrs.as_ptr(),
-                    count: raw_ptrs.len()
-                ];
+                let arr = NSArray::from_retained_slice(&urls);
                 let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-                let _: () = msg_send![ws, activateFileViewerSelectingURLs: arr];
+                if !ws.is_null() {
+                    let _: () = msg_send![ws, activateFileViewerSelectingURLs: &*arr];
+                }
             }
             return;
         }
@@ -1118,11 +1409,11 @@ extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut
                     action: act,
                 });
         }
-    }
+    });
 }
 
 extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let del: *mut AnyObject = msg_send![this, delegate];
         let Some(ctx) = get_delegate_ctx(del) else {
             let _: () = msg_send![super(this, class!(NSTableView)), keyDown: event];
@@ -1192,9 +1483,14 @@ extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObj
                         } else {
                             &mut guard.right
                         };
-                        match map_row_index_to_entry(sel_row as usize, pane.has_parent, &pane.entries)
-                        {
-                            Some(Ok(entry)) if !matches!(entry.kind, crate::models::FileKind::Bucket) => {
+                        match map_row_index_to_entry(
+                            sel_row as usize,
+                            pane.has_parent,
+                            &pane.entries,
+                        ) {
+                            Some(Ok(entry))
+                                if !matches!(entry.kind, crate::models::FileKind::Bucket) =>
+                            {
                                 pane.editing_original_path = Some(entry.path.clone());
                                 true
                             }
@@ -1215,7 +1511,7 @@ extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObj
             }
         }
         let _: () = msg_send![super(this, class!(NSTableView)), keyDown: event];
-    }
+    });
 }
 
 extern "C" fn write_rows_to_pasteboard(
@@ -1225,7 +1521,7 @@ extern "C" fn write_rows_to_pasteboard(
     row_indexes: *mut AnyObject,
     pboard: *mut AnyObject,
 ) -> Bool {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return Bool::NO;
         };
@@ -1244,17 +1540,7 @@ extern "C" fn write_rows_to_pasteboard(
             }
         };
 
-        let mut dragged = Vec::new();
-        let not_found = NSUInteger::MAX;
-        let mut cur: NSUInteger = msg_send![row_indexes, firstIndex];
-        while cur != not_found {
-            if let Some(r) = rows.get(cur) {
-                if !r.is_parent_row {
-                    dragged.push(r.path.clone());
-                }
-            }
-            cur = msg_send![row_indexes, indexGreaterThanIndex: cur];
-        }
+        let dragged = collect_mac_paths_from_ns_index_set(row_indexes, &rows);
         if dragged.is_empty() {
             return Bool::NO;
         }
@@ -1267,13 +1553,8 @@ extern "C" fn write_rows_to_pasteboard(
                 .iter()
                 .map(|p| NSURL::fileURLWithPath(&NSString::from_str(p)))
                 .collect();
-            let ptrs: Vec<*const NSURL> = urls.iter().map(|u| &**u as *const NSURL).collect();
-            let arr: *mut AnyObject = msg_send![
-                class!(NSArray),
-                arrayWithObjects: ptrs.as_ptr(),
-                count: ptrs.len()
-            ];
-            let _: Bool = msg_send![pboard, writeObjects: arr];
+            let arr = NSArray::from_retained_slice(&urls);
+            let _: Bool = msg_send![pboard, writeObjects: &*arr];
             let pb_type = NSString::from_str(RUSTDUCK_LOCAL_PB_TYPE);
             let _: Bool = msg_send![pboard, setString: &*ns_payload, forType: &*pb_type];
         } else {
@@ -1281,7 +1562,7 @@ extern "C" fn write_rows_to_pasteboard(
             let _: Bool = msg_send![pboard, setString: &*ns_payload, forType: &*pb_type];
         }
         Bool::YES
-    }
+    })
 }
 
 extern "C" fn validate_drop(
@@ -1303,7 +1584,7 @@ extern "C" fn accept_drop(
     row: NSInteger,
     _op: NSUInteger,
 ) -> Bool {
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let Some(ctx) = get_delegate_ctx(this) else {
             return Bool::NO;
         };
@@ -1354,13 +1635,15 @@ extern "C" fn accept_drop(
                     let count: NSUInteger = msg_send![urls, count];
                     for i in 0..count {
                         let url: *mut AnyObject = msg_send![urls, objectAtIndex: i];
-                        let path_ns: *mut AnyObject = msg_send![url, path];
-                        if !path_ns.is_null() {
-                            let utf8: *const i8 = msg_send![path_ns, UTF8String];
-                            if !utf8.is_null() {
-                                let p = CStr::from_ptr(utf8).to_string_lossy().to_string();
-                                if !p.is_empty() {
-                                    source_paths.push(p);
+                        if !url.is_null() {
+                            let path_ns: *mut AnyObject = msg_send![url, path];
+                            if !path_ns.is_null() {
+                                let utf8: *const i8 = msg_send![path_ns, UTF8String];
+                                if !utf8.is_null() {
+                                    let p = CStr::from_ptr(utf8).to_string_lossy().to_string();
+                                    if !p.is_empty() {
+                                        source_paths.push(p);
+                                    }
                                 }
                             }
                         }
@@ -1395,5 +1678,5 @@ extern "C" fn accept_drop(
             target_dir_override: Some(dest),
         });
         Bool::YES
-    }
+    })
 }

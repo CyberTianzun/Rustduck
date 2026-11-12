@@ -204,13 +204,98 @@ pub fn resolve_inline_rename_entry<'a>(
     }
 }
 
+pub const MACOS_NS_NOT_FOUND: usize = isize::MAX as usize;
+pub const MAX_SAFE_PANE_POINTS: f32 = 16_384.0;
+pub const MAX_SAFE_PANE_DEVICE_PX: i32 = 65_536;
+
+pub fn collect_paths_from_index_set<F>(
+    rows: &[NativeRowViewModel],
+    first_index: usize,
+    mut next_index: F,
+) -> Vec<String>
+where
+    F: FnMut(usize) -> usize,
+{
+    let mut out = Vec::new();
+    let mut cur = first_index;
+    let mut steps = 0usize;
+    let max_steps = rows.len();
+    while cur < rows.len()
+        && cur != MACOS_NS_NOT_FOUND
+        && cur != usize::MAX
+        && steps < max_steps
+    {
+        if let Some(r) = rows.get(cur) {
+            if !r.is_parent_row {
+                out.push(r.path.clone());
+            }
+        }
+        let next = next_index(cur);
+        if next <= cur {
+            break;
+        }
+        cur = next;
+        steps += 1;
+    }
+    out
+}
+
+pub fn sanitize_pane_bounds_px(
+    origin_x: f32,
+    origin_y: f32,
+    width: f32,
+    height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    scale_factor: f32,
+) -> Option<(i32, i32, i32, i32)> {
+    if !origin_x.is_finite()
+        || !origin_y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || !viewport_width.is_finite()
+        || !viewport_height.is_finite()
+        || !scale_factor.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || viewport_width <= 0.0
+        || viewport_height <= 0.0
+    {
+        return None;
+    }
+
+    let scale = scale_factor.clamp(0.5, 8.0);
+    let max_vp_w = viewport_width.min(MAX_SAFE_PANE_POINTS);
+    let max_vp_h = viewport_height.min(MAX_SAFE_PANE_POINTS);
+
+    let left = origin_x.clamp(0.0, max_vp_w);
+    let top = origin_y.clamp(0.0, max_vp_h);
+    let right = (origin_x + width).clamp(left, max_vp_w);
+    let bottom = (origin_y + height).clamp(top, max_vp_h);
+
+    let clamped_w = right - left;
+    let clamped_h = bottom - top;
+    if clamped_w < 1.0 || clamped_h < 1.0 {
+        return None;
+    }
+
+    let x_px = (left * scale).round() as i32;
+    let y_px = (top * scale).round() as i32;
+    let w_px = ((clamped_w * scale).round() as i32).clamp(1, MAX_SAFE_PANE_DEVICE_PX);
+    let h_px = ((clamped_h * scale).round() as i32).clamp(1, MAX_SAFE_PANE_DEVICE_PX);
+    Some((x_px, y_px, w_px, h_px))
+}
+
 pub fn compute_pane_visibility(
     is_connected: bool,
     settings_open: bool,
     width: i32,
     height: i32,
 ) -> bool {
-    is_connected && !settings_open && width > 0 && height > 0
+    is_connected
+        && !settings_open
+        && (1..=MAX_SAFE_PANE_DEVICE_PX).contains(&width)
+        && (1..=MAX_SAFE_PANE_DEVICE_PX).contains(&height)
 }
 
 pub fn compute_appkit_frame(
@@ -219,15 +304,27 @@ pub fn compute_appkit_frame(
     parent_height_pts: f64,
     is_flipped: bool,
 ) -> (f64, f64, f64, f64) {
-    let scale = (scale_factor.max(0.5)) as f64;
-    let x = (bounds_px.0 as f64) / scale;
-    let top_y = (bounds_px.1 as f64) / scale;
-    let w = ((bounds_px.2.max(1)) as f64) / scale;
-    let h = ((bounds_px.3.max(1)) as f64) / scale;
+    let scale = if scale_factor.is_finite() {
+        scale_factor.clamp(0.5, 8.0) as f64
+    } else {
+        1.0
+    };
+    let max_pts = MAX_SAFE_PANE_POINTS as f64;
+    let safe_parent_h = if parent_height_pts.is_finite() && parent_height_pts > 0.0 {
+        parent_height_pts.min(max_pts)
+    } else {
+        max_pts
+    };
+    let x = ((bounds_px.0.max(0) as f64) / scale).clamp(0.0, max_pts);
+    let top_y = ((bounds_px.1.max(0) as f64) / scale).clamp(0.0, safe_parent_h);
+    let raw_w = ((bounds_px.2.clamp(1, MAX_SAFE_PANE_DEVICE_PX)) as f64) / scale;
+    let raw_h = ((bounds_px.3.clamp(1, MAX_SAFE_PANE_DEVICE_PX)) as f64) / scale;
+    let w = raw_w.clamp(1.0, (max_pts - x).max(1.0));
+    let h = raw_h.clamp(1.0, (safe_parent_h - top_y).max(1.0));
     let y = if is_flipped {
         top_y
     } else {
-        (parent_height_pts - (top_y + h)).max(0.0)
+        (safe_parent_h - (top_y + h)).max(0.0)
     };
     (x, y, w, h)
 }
@@ -462,6 +559,113 @@ mod tests {
         assert!(
             macos_src.contains("rowForView:"),
             "macOS inline rename must resolve live row via [tableView rowForView:] instead of stale [tf tag]"
+        );
+    }
+
+    #[test]
+    fn test_compute_pane_visibility_and_appkit_frame_reject_retina_infinity_overflow() {
+        // f32::INFINITY as i32 saturates to i32::MAX on Rust; pane visibility must reject overflowed bounds
+        assert!(
+            !compute_pane_visibility(true, false, i32::MAX, 600),
+            "overflowed i32::MAX width must never be treated as a valid visible pane"
+        );
+        assert!(
+            !compute_pane_visibility(true, false, 800, i32::MAX),
+            "overflowed i32::MAX height must never be treated as a valid visible pane"
+        );
+
+        // Even if huge pixel bounds reach compute_appkit_frame, dimensions must be clamped safely
+        let (_x, _y, w, h) = compute_appkit_frame((0, 0, i32::MAX, i32::MAX), 2.0, 900.0, false);
+        assert!(
+            w <= 16_384.0 && h <= 900.0,
+            "compute_appkit_frame must clamp overflowed dimensions instead of allocating a 1B-pt backing store, got ({w}, {h})"
+        );
+    }
+
+    #[test]
+    fn test_macos_avoids_nsuinteger_max_hang_and_metal_subview_conflict() {
+        let macos_src = include_str!("macos.rs");
+        assert!(
+            !macos_src.contains("NSUInteger::MAX"),
+            "NSIndexSet returns NSNotFound (isize::MAX as usize), never NSUInteger::MAX; comparing != NSUInteger::MAX hangs forever"
+        );
+        assert!(
+            !macos_src.contains("msg_send![root_view, addSubview: sv]"),
+            "NSScrollView must not be added directly inside CAMetalLayer-backed GPUIView"
+        );
+        assert!(
+            macos_src.contains("makeViewWithIdentifier:"),
+            "view_for_table_column must reuse NSTableCellView via makeViewWithIdentifier:owner:"
+        );
+        assert!(
+            !macos_src.contains("iconForFile:"),
+            "view_for_table_column must not call synchronous disk-hitting iconForFile: per row"
+        );
+        assert!(
+            !macos_src.contains("arrayWithObjects:"),
+            "macos.rs should use safe NSArray::from_retained_slice instead of raw arrayWithObjects: pointer arrays"
+        );
+        assert!(
+            macos_src.contains("autoreleasepool"),
+            "macos.rs must drain temporary Objective-C objects via autoreleasepool"
+        );
+        assert!(
+            !macos_src.contains("static mut "),
+            "macos.rs must avoid static mut for Rust edition 2024 compatibility"
+        );
+
+        let dual_pane_src = include_str!("../dual_pane_view.rs");
+        assert!(
+            !dual_pane_src.contains("resizable_panel().child("),
+            "resizable_panel() defaults max_size to Pixels::MAX (f32::MAX), which overflows f32::MAX * 2.0 = INFINITY on Retina macOS"
+        );
+    }
+
+    #[test]
+    fn test_collect_paths_from_index_set_terminates_on_ns_not_found_and_non_monotonic_index() {
+        let entries = sample_entries();
+        let rows = build_native_row_models(&entries, true, "..");
+
+        // Empty NSIndexSet returns NSNotFound = isize::MAX as usize (NOT usize::MAX!)
+        let empty = collect_paths_from_index_set(&rows, MACOS_NS_NOT_FOUND, |_| MACOS_NS_NOT_FOUND);
+        assert!(empty.is_empty());
+
+        // Selecting row 0 (parent "..") and row 2 ("/var/report.pdf") then NSNotFound
+        let selected = collect_paths_from_index_set(&rows, 0, |cur| match cur {
+            0 => 2,
+            _ => MACOS_NS_NOT_FOUND,
+        });
+        assert_eq!(selected, vec!["/var/report.pdf".to_string()]);
+
+        // Defensive guard: even a broken non-monotonic callback (returning same index) must terminate
+        let non_monotonic = collect_paths_from_index_set(&rows, 1, |cur| cur);
+        assert_eq!(non_monotonic, vec!["/var/docs".to_string()]);
+    }
+
+    #[test]
+    fn test_sanitize_pane_bounds_px_clamps_to_viewport_and_rejects_non_finite() {
+        // Retina 2x normal pane inside 1280x800 pt viewport
+        assert_eq!(
+            sanitize_pane_bounds_px(10.0, 80.0, 620.0, 650.0, 1280.0, 800.0, 2.0),
+            Some((20, 160, 1240, 1300))
+        );
+
+        // Overflowed f32::INFINITY / f32::MAX width from unbounded Taffy layout is clamped to viewport (or rejected if non-finite)
+        assert_eq!(
+            sanitize_pane_bounds_px(0.0, 80.0, f32::INFINITY, 650.0, 1280.0, 800.0, 2.0),
+            None
+        );
+        assert_eq!(
+            sanitize_pane_bounds_px(0.0, 80.0, f32::NAN, 650.0, 1280.0, 800.0, 2.0),
+            None
+        );
+        assert_eq!(
+            sanitize_pane_bounds_px(640.0, 80.0, 50_000.0, 650.0, 1280.0, 800.0, 2.0),
+            Some((1280, 160, 1280, 1300))
+        );
+        assert_eq!(
+            sanitize_pane_bounds_px(0.0, 80.0, 0.0, 650.0, 1280.0, 800.0, 2.0),
+            None
         );
     }
 }

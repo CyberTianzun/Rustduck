@@ -88,9 +88,9 @@ const CMD_REFRESH: u32 = 30_007;
 const CMD_REVEAL_IN_SHELL: u32 = 30_008;
 
 #[inline]
-unsafe fn send_msg(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
+unsafe fn send_msg(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT { unsafe {
     SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(LPARAM(lparam)))
-}
+}}
 
 pub fn can_use_shell_context_menu(current_path: &str, selected_paths: &[String]) -> bool {
     let trimmed = current_path.trim();
@@ -612,7 +612,7 @@ unsafe fn teardown_win32_controls(
     right_hwnd_val: isize,
     parent_hwnd_val: isize,
     subclass_ctx_ptr: usize,
-) {
+) { unsafe {
     for child_val in [left_hwnd_val, right_hwnd_val] {
         if child_val != 0 {
             let child = HWND(child_val as *mut c_void);
@@ -627,7 +627,7 @@ unsafe fn teardown_win32_controls(
     if subclass_ctx_ptr != 0 {
         let _ = Box::from_raw(subclass_ctx_ptr as *mut SubclassContext);
     }
-}
+}}
 
 impl Drop for HostInner {
     fn drop(&mut self) {
@@ -777,7 +777,7 @@ fn resize_columns_to_width(hwnd: HWND, total_width: i32) {
     }
 }
 
-unsafe fn apply_uxtheme_dark_mode(hwnd: HWND, header_hwnd: HWND, is_dark: bool) {
+unsafe fn apply_uxtheme_dark_mode(hwnd: HWND, header_hwnd: HWND, is_dark: bool) { unsafe {
     let hmod = GetModuleHandleW(w!("uxtheme.dll"))
         .or_else(|_| LoadLibraryW(w!("uxtheme.dll")))
         .unwrap_or_default();
@@ -803,7 +803,7 @@ unsafe fn apply_uxtheme_dark_mode(hwnd: HWND, header_hwnd: HWND, is_dark: bool) 
         let flush_menus: unsafe extern "system" fn() = std::mem::transmute(proc);
         flush_menus();
     }
-}
+}}
 
 fn apply_listview_theme(hwnd: HWND, is_dark: bool) {
     let (bg, fg) = if is_dark {
@@ -952,7 +952,7 @@ unsafe extern "system" fn parent_subclass_proc(
     lparam: LPARAM,
     _uidsubclass: usize,
     dwrefdata: usize,
-) -> LRESULT {
+) -> LRESULT { unsafe {
     if matches!(umsg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
         let _ = SetFocus(Some(hwnd));
     }
@@ -984,7 +984,7 @@ unsafe extern "system" fn parent_subclass_proc(
     }
 
     DefSubclassProc(hwnd, umsg, wparam, lparam)
-}
+}}
 
 unsafe fn handle_listview_notify(
     ctx: &SubclassContext,
@@ -993,7 +993,7 @@ unsafe fn handle_listview_notify(
     is_local: bool,
     code: u32,
     lparam: LPARAM,
-) -> Option<LRESULT> {
+) -> Option<LRESULT> { unsafe {
     match code {
         LVN_GETDISPINFOW => {
             let di = &mut *(lparam.0 as *mut NMLVDISPINFOW);
@@ -1259,7 +1259,7 @@ unsafe fn handle_listview_notify(
 
         _ => None,
     }
-}
+}}
 
 unsafe extern "system" fn child_subclass_proc(
     hwnd: HWND,
@@ -1268,7 +1268,7 @@ unsafe extern "system" fn child_subclass_proc(
     lparam: LPARAM,
     _uidsubclass: usize,
     dwrefdata: usize,
-) -> LRESULT {
+) -> LRESULT { unsafe {
     if dwrefdata != 0 {
         let ctx = &*(dwrefdata as *const SubclassContext);
         if let Some(state) = ctx.state.upgrade() {
@@ -1361,14 +1361,14 @@ unsafe extern "system" fn child_subclass_proc(
     }
 
     DefSubclassProc(hwnd, umsg, wparam, lparam)
-}
+}}
 
 unsafe fn handle_header_custom_draw(
     state: &Arc<Mutex<HostInner>>,
     is_local: bool,
     header_hwnd: HWND,
     lparam: LPARAM,
-) -> LRESULT {
+) -> LRESULT { unsafe {
     let nmcd = &mut *(lparam.0 as *mut NMCUSTOMDRAW);
     let stage = nmcd.dwDrawStage;
 
@@ -1497,14 +1497,14 @@ unsafe fn handle_header_custom_draw(
     }
 
     LRESULT(CDRF_DODEFAULT as isize)
-}
+}}
 
 unsafe fn handle_wm_dropfiles(
     state: &Arc<Mutex<HostInner>>,
     lv_hwnd: HWND,
     target_is_local: bool,
     hdrop: HDROP,
-) {
+) { unsafe {
     let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
     let mut dropped_paths = Vec::new();
     for i in 0..count {
@@ -1554,9 +1554,9 @@ unsafe fn handle_wm_dropfiles(
         source_paths: dropped_paths,
         target_dir_override: Some(dest_dir),
     });
-}
+}}
 
-unsafe fn start_pane_drag(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, dragged_row: i32) {
+unsafe fn start_pane_drag(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, dragged_row: i32) { unsafe {
     let Some(state) = ctx.state.upgrade() else {
         return;
     };
@@ -1589,7 +1589,7 @@ unsafe fn start_pane_drag(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, 
     if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
         SetCursor(Some(cursor));
     }
-}
+}}
 
 #[cfg(test)]
 struct PidlListGuard(Vec<*mut ITEMIDLIST>);
@@ -1625,7 +1625,7 @@ unsafe fn finish_pane_drag(
     from_local: bool,
     source_paths: Vec<String>,
     screen_pt: POINT,
-) {
+) { unsafe {
     let target_is_local = !from_local;
     let (target_hwnd, target_visible) = {
         let guard = state.lock().unwrap();
@@ -1685,14 +1685,14 @@ unsafe fn finish_pane_drag(
         source_paths,
         target_dir_override: Some(dest_dir),
     });
-}
+}}
 
 unsafe fn show_pane_context_menu(
     ctx: &SubclassContext,
     lv_hwnd: HWND,
     is_local: bool,
     screen_pt: POINT,
-) {
+) { unsafe {
     let Some(state) = ctx.state.upgrade() else {
         return;
     };
@@ -1729,13 +1729,13 @@ unsafe fn show_pane_context_menu(
         can_reveal,
         screen_pt,
     );
-}
+}}
 
 #[cfg(test)]
 unsafe fn resolve_shell_menu_pidls(
     parent_dir: &str,
     selected_paths: &[String],
-) -> anyhow::Result<(IShellFolder, Vec<*const ITEMIDLIST>, PidlListGuard)> {
+) -> anyhow::Result<(IShellFolder, Vec<*const ITEMIDLIST>, PidlListGuard)> { unsafe {
     if selected_paths.is_empty() {
         return Err(anyhow::anyhow!("empty selected_paths"));
     }
@@ -1778,7 +1778,7 @@ unsafe fn resolve_shell_menu_pidls(
         }
         Ok((folder, child_pidls, pidl_guard))
     }
-}
+}}
 
 unsafe fn show_standard_native_hmenu(
     ctx: &SubclassContext,
@@ -1790,7 +1790,7 @@ unsafe fn show_standard_native_hmenu(
     can_transfer: bool,
     can_reveal: bool,
     screen_pt: POINT,
-) {
+) { unsafe {
     let Ok(hmenu) = CreatePopupMenu() else {
         return;
     };
@@ -1835,9 +1835,9 @@ unsafe fn show_standard_native_hmenu(
     if cmd != 0 {
         dispatch_custom_menu_cmd(ctx, lv_hwnd, is_local, cmd);
     }
-}
+}}
 
-unsafe fn append_menu_str(hmenu: HMENU, id: u32, label: &str, enabled: bool) {
+unsafe fn append_menu_str(hmenu: HMENU, id: u32, label: &str, enabled: bool) { unsafe {
     let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
     let flags = if enabled {
         MF_STRING
@@ -1845,14 +1845,14 @@ unsafe fn append_menu_str(hmenu: HMENU, id: u32, label: &str, enabled: bool) {
         MF_STRING | MF_GRAYED
     };
     let _ = AppendMenuW(hmenu, flags, id as usize, PCWSTR(wide.as_ptr()));
-}
+}}
 
 unsafe fn dispatch_custom_menu_cmd(
     ctx: &SubclassContext,
     lv_hwnd: HWND,
     is_local: bool,
     cmd: u32,
-) {
+) { unsafe {
     if cmd == CMD_RENAME {
         let sel = send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize).0;
         if sel >= 0 {
@@ -1883,7 +1883,7 @@ unsafe fn dispatch_custom_menu_cmd(
                 action: act,
             });
     }
-}
+}}
 
 #[cfg(test)]
 mod tests {

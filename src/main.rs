@@ -14,7 +14,10 @@ pub fn configure_native_child_hosting_env() {
     {
         // Disable DirectComposition topmost visual so embedded Win32 child HWNDs
         // (SysListView32) render cleanly inside the GPUI SwapChain window.
-        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+        // SAFETY: Called once at process startup on the main thread before spawning worker threads.
+        unsafe {
+            std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+        }
     }
 }
 
