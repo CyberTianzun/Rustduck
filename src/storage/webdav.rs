@@ -221,10 +221,14 @@ pub struct WebDavBackend {
 impl WebDavBackend {
     pub fn new(config: WebDavConfig, password: String) -> anyhow::Result<Self> {
         let _ = build_webdav_url(&config.endpoint, "/", true)?;
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("Failed to initialize WebDAV HTTP client")?;
         Ok(Self {
             config,
             password,
-            client: Client::new(),
+            client,
         })
     }
 

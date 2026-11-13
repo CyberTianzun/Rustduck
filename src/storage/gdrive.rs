@@ -1,9 +1,11 @@
+use crate::i18n::i18n;
 use crate::models::{
     join_remote_path, normalize_remote_path, parent_remote_path, FileEntry, FileKind,
-    GoogleDriveConfig, DEFAULT_GDRIVE_CLIENT_ID,
+    GoogleDriveConfig,
 };
 use crate::storage::oauth::{
     authorize_via_browser_loopback, build_http_client, refresh_access_token,
+    resolve_oauth_credential,
 };
 use crate::storage::{ProgressCallback, StorageBackend};
 use anyhow::{anyhow, Context};
@@ -40,13 +42,33 @@ struct GDriveFileItem {
     modified_time: Option<String>,
 }
 
-pub fn effective_gdrive_client_id(config: &GoogleDriveConfig) -> &str {
-    let cid = config.client_id.trim();
-    if cid.is_empty() {
-        DEFAULT_GDRIVE_CLIENT_ID
-    } else {
-        cid
-    }
+pub fn effective_gdrive_client_id(config: &GoogleDriveConfig) -> Option<String> {
+    resolve_oauth_credential(
+        Some(&config.client_id),
+        "RUSTDUCK_GDRIVE_CLIENT_ID",
+        option_env!("RUSTDUCK_GDRIVE_CLIENT_ID"),
+    )
+}
+
+pub fn effective_gdrive_client_secret(config: &GoogleDriveConfig) -> Option<String> {
+    resolve_oauth_credential(
+        config.client_secret.as_deref(),
+        "RUSTDUCK_GDRIVE_CLIENT_SECRET",
+        option_env!("RUSTDUCK_GDRIVE_CLIENT_SECRET"),
+    )
+}
+
+pub fn validate_gdrive_oauth_config(config: &GoogleDriveConfig) -> anyhow::Result<(String, String)> {
+    let t = i18n();
+    let client_id = effective_gdrive_client_id(config)
+        .ok_or_else(|| anyhow!("{}", t.err_gdrive_client_id_missing()))?;
+    let client_secret = effective_gdrive_client_secret(config)
+        .ok_or_else(|| anyhow!("{}", t.err_gdrive_client_secret_missing()))?;
+    Ok((client_id, client_secret))
+}
+
+pub fn has_default_gdrive_oauth_credentials() -> bool {
+    validate_gdrive_oauth_config(&GoogleDriveConfig::default()).is_ok()
 }
 
 pub fn escape_gdrive_query_value(val: &str) -> String {
@@ -98,17 +120,21 @@ pub fn parse_gdrive_files_json(
     Ok(out)
 }
 
-pub async fn authorize_google_drive_in_browser(config: &GoogleDriveConfig) -> anyhow::Result<String> {
+pub async fn authorize_google_drive_in_browser(
+    config: &GoogleDriveConfig,
+    cancel: CancellationToken,
+) -> anyhow::Result<String> {
+    let (client_id, client_secret) = validate_gdrive_oauth_config(config)?;
     let client = build_http_client(config.proxy_url.as_deref())?;
-    let client_id = effective_gdrive_client_id(config);
     let token_res = authorize_via_browser_loopback(
         &client,
         GDRIVE_AUTH_URL,
         GDRIVE_TOKEN_URL,
-        client_id,
-        config.client_secret.as_deref(),
+        &client_id,
+        Some(client_secret.as_str()),
         GDRIVE_SCOPE,
         &[("access_type", "offline"), ("prompt", "consent")],
+        cancel,
     )
     .await?;
 
@@ -133,10 +159,13 @@ pub struct GoogleDriveBackend {
 
 impl GoogleDriveBackend {
     pub fn new(config: GoogleDriveConfig, secret: String) -> anyhow::Result<Self> {
+        let initial_rt = secret.trim().to_string();
+        if initial_rt.is_empty() {
+            return Err(anyhow!("{}", i18n().err_oauth_token_empty("Google Drive")));
+        }
         let client = build_http_client(config.proxy_url.as_deref())?;
         let mut cache = HashMap::new();
         cache.insert("/".to_string(), "root".to_string());
-        let initial_rt = secret.trim().to_string();
         Ok(Self {
             config,
             client,
@@ -144,9 +173,7 @@ impl GoogleDriveBackend {
                 access_token: None,
                 refresh_token: initial_rt.clone(),
             }),
-            latest_refresh_token: RwLock::new(
-                (!initial_rt.is_empty()).then_some(initial_rt),
-            ),
+            latest_refresh_token: RwLock::new(Some(initial_rt)),
             path_id_cache: RwLock::new(cache),
         })
     }
@@ -157,42 +184,21 @@ impl GoogleDriveBackend {
             return Ok(tok.clone());
         }
 
-        let client_id = effective_gdrive_client_id(&self.config);
         if guard.refresh_token.trim().is_empty() {
-            let token_res = authorize_via_browser_loopback(
-                &self.client,
-                GDRIVE_AUTH_URL,
-                GDRIVE_TOKEN_URL,
-                client_id,
-                self.config.client_secret.as_deref(),
-                GDRIVE_SCOPE,
-                &[("access_type", "offline"), ("prompt", "consent")],
-            )
-            .await?;
-
-            let access = token_res.access_token.clone();
-            let refresh = token_res
-                .refresh_token
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| access.clone());
-            guard.access_token = Some(access.clone());
-            guard.refresh_token = refresh.clone();
-            if let Ok(mut w) = self.latest_refresh_token.write() {
-                *w = Some(refresh);
-            }
-            return Ok(access);
+            return Err(anyhow!("{}", i18n().err_oauth_token_empty("Google Drive")));
         }
 
-        match refresh_access_token(
-            &self.client,
-            GDRIVE_TOKEN_URL,
-            client_id,
-            self.config.client_secret.as_deref(),
-            &guard.refresh_token,
-        )
-        .await
-        {
-            Ok(refreshed) => {
+        if let Some(client_id) = effective_gdrive_client_id(&self.config) {
+            let client_secret = effective_gdrive_client_secret(&self.config);
+            if let Ok(refreshed) = refresh_access_token(
+                &self.client,
+                GDRIVE_TOKEN_URL,
+                &client_id,
+                client_secret.as_deref(),
+                &guard.refresh_token,
+            )
+            .await
+            {
                 let access = refreshed.access_token;
                 if let Some(new_rt) = refreshed.refresh_token.filter(|s| !s.trim().is_empty()) {
                     guard.refresh_token = new_rt.clone();
@@ -201,15 +207,14 @@ impl GoogleDriveBackend {
                     }
                 }
                 guard.access_token = Some(access.clone());
-                Ok(access)
-            }
-            Err(_) => {
-                // Fallback: user may have pasted a direct access_token in secret field
-                let direct = guard.refresh_token.trim().to_string();
-                guard.access_token = Some(direct.clone());
-                Ok(direct)
+                return Ok(access);
             }
         }
+
+        // Fallback: user may have pasted a direct access_token in secret field
+        let direct = guard.refresh_token.trim().to_string();
+        guard.access_token = Some(direct.clone());
+        Ok(direct)
     }
 
     async fn resolve_file_id(&self, path: &str) -> anyhow::Result<String> {
@@ -618,9 +623,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_gdrive_files_json_and_default_client_id() {
-        let cfg = GoogleDriveConfig::default();
-        assert_eq!(effective_gdrive_client_id(&cfg), DEFAULT_GDRIVE_CLIENT_ID);
+    fn test_parse_gdrive_files_json_and_credential_resolution() {
+        let mut cfg = GoogleDriveConfig::default();
+        if std::env::var("RUSTDUCK_GDRIVE_CLIENT_ID")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            assert_eq!(effective_gdrive_client_id(&cfg), None);
+        }
+        cfg.client_id = "  my-desktop-cid.apps.googleusercontent.com  ".to_string();
+        cfg.client_secret = Some("  GOCSPX-secret  ".to_string());
+        assert_eq!(
+            effective_gdrive_client_id(&cfg).as_deref(),
+            Some("my-desktop-cid.apps.googleusercontent.com")
+        );
+        assert_eq!(
+            effective_gdrive_client_secret(&cfg).as_deref(),
+            Some("GOCSPX-secret")
+        );
 
         let sample_json = r#"{
             "files": [
@@ -650,5 +671,48 @@ mod tests {
         assert_eq!(parsed[1].1.name, "architecture.pdf");
         assert_eq!(parsed[1].1.size, 1048576);
         assert_eq!(parsed[1].1.kind, FileKind::File);
+    }
+
+    #[tokio::test]
+    async fn test_gdrive_oauth_and_backend_validation_rejects_missing_credentials_without_hanging() {
+        if std::env::var("RUSTDUCK_GDRIVE_CLIENT_ID")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            let empty_cfg = GoogleDriveConfig::default();
+            let err = authorize_google_drive_in_browser(&empty_cfg, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("Client ID"),
+                "Expected missing Client ID validation error, got: {err}"
+            );
+        }
+
+        if std::env::var("RUSTDUCK_GDRIVE_CLIENT_SECRET")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            let missing_secret_cfg = GoogleDriveConfig {
+                client_id: "123456-abc.apps.googleusercontent.com".to_string(),
+                client_secret: None,
+                proxy_url: None,
+                initial_path: "/".to_string(),
+            };
+            let err =
+                authorize_google_drive_in_browser(&missing_secret_cfg, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("Client Secret"),
+                "Expected missing Client Secret validation error, got: {err}"
+            );
+        }
+
+        // Empty Refresh Token must fail fast on GoogleDriveBackend::new instead of silently launching browser on Connect
+        let empty_token_res = GoogleDriveBackend::new(GoogleDriveConfig::default(), "   ".to_string());
+        assert!(empty_token_res.is_err());
     }
 }

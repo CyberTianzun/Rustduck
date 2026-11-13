@@ -72,10 +72,14 @@ impl SmbBackend {
         let unc = UncPath::from_str(&root_unc_str)
             .map_err(|e| anyhow!("Invalid SMB UNC path {root_unc_str}: {e}"))?;
         let user = format_smb_auth_username(self.config.domain.as_deref(), &self.config.username);
-        self.client
-            .share_connect(&unc, &user, self.password.clone())
-            .await
-            .with_context(|| format!("Failed to connect to SMB share {root_unc_str}"))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.client
+                .share_connect(&unc, &user, self.password.clone()),
+        )
+        .await
+        .with_context(|| format!("Timed out connecting to SMB share {root_unc_str} (15s)"))?
+        .with_context(|| format!("Failed to connect to SMB share {root_unc_str}"))?;
         Ok(unc)
     }
 

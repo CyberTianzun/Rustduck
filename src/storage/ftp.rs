@@ -6,11 +6,15 @@ use rustls::pki_types::ServerName;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
+
+pub const DEFAULT_FTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const FTP_CMD_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 enum FtpStream {
     Plain(TcpStream),
@@ -73,7 +77,9 @@ async fn read_ftp_response(reader: &mut BufReader<FtpStream>) -> anyhow::Result<
 
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = tokio::time::timeout(FTP_CMD_READ_TIMEOUT, reader.read_line(&mut line))
+            .await
+            .context("Timed out waiting for FTP server response")??;
         if n == 0 {
             return Err(anyhow!("FTP server closed connection unexpectedly"));
         }
@@ -290,22 +296,20 @@ pub struct FtpBackend {
     password: String,
 }
 
-impl FtpBackend {
-    pub fn new(config: FtpConfig, password: String) -> anyhow::Result<Self> {
-        if config.host.trim().is_empty() {
-            return Err(anyhow!("FTP host cannot be empty"));
-        }
-        Ok(Self { config, password })
-    }
+async fn connect_ftp_control_with_timeout(
+    config: &FtpConfig,
+    password: &str,
+    timeout_dur: Duration,
+) -> anyhow::Result<BufReader<FtpStream>> {
+    let host = config.host.trim();
+    let port = config.port;
 
-    async fn connect_control(&self) -> anyhow::Result<BufReader<FtpStream>> {
-        let host = self.config.host.trim();
-        let port = self.config.port;
+    tokio::time::timeout(timeout_dur, async {
         let tcp = TcpStream::connect((host, port))
             .await
             .with_context(|| format!("Failed to connect to FTP server {host}:{port}"))?;
 
-        let mut reader = if self.config.use_tls && port == 990 {
+        let mut reader = if config.use_tls && port == 990 {
             let connector = build_tls_connector()?;
             let server_name = ServerName::try_from(host.to_string())
                 .map_err(|_| anyhow!("Invalid TLS server name: {host}"))?;
@@ -323,7 +327,7 @@ impl FtpBackend {
             return Err(anyhow!("FTP greeting rejected: {}", greeting_txt.trim()));
         }
 
-        if self.config.use_tls && port != 990 {
+        if config.use_tls && port != 990 {
             let (auth_code, auth_txt) = send_ftp_cmd(&mut reader, "AUTH TLS").await?;
             if auth_code != 234 {
                 return Err(anyhow!("FTPS AUTH TLS rejected: {}", auth_txt.trim()));
@@ -342,15 +346,15 @@ impl FtpBackend {
             reader = BufReader::new(FtpStream::Tls(Box::new(tls)));
         }
 
-        let user = if self.config.username.trim().is_empty() {
+        let user = if config.username.trim().is_empty() {
             "anonymous"
         } else {
-            self.config.username.trim()
+            config.username.trim()
         };
         let (user_code, user_txt) = send_ftp_cmd(&mut reader, &format!("USER {user}")).await?;
         if user_code == 331 {
             let (pass_code, pass_txt) =
-                send_ftp_cmd(&mut reader, &format!("PASS {}", self.password)).await?;
+                send_ftp_cmd(&mut reader, &format!("PASS {password}")).await?;
             if pass_code >= 400 {
                 return Err(anyhow!("FTP login failed: {}", pass_txt.trim()));
             }
@@ -358,7 +362,7 @@ impl FtpBackend {
             return Err(anyhow!("FTP USER rejected: {}", user_txt.trim()));
         }
 
-        if self.config.use_tls {
+        if config.use_tls {
             let _ = send_ftp_cmd(&mut reader, "PBSZ 0").await;
             let _ = send_ftp_cmd(&mut reader, "PROT P").await;
         }
@@ -366,6 +370,27 @@ impl FtpBackend {
         let _ = send_ftp_cmd(&mut reader, "TYPE I").await;
 
         Ok(reader)
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "Timed out connecting to FTP server {host}:{port} ({}s)",
+            timeout_dur.as_secs().max(1)
+        )
+    })?
+}
+
+impl FtpBackend {
+    pub fn new(config: FtpConfig, password: String) -> anyhow::Result<Self> {
+        if config.host.trim().is_empty() {
+            return Err(anyhow!("FTP host cannot be empty"));
+        }
+        Ok(Self { config, password })
+    }
+
+    async fn connect_control(&self) -> anyhow::Result<BufReader<FtpStream>> {
+        connect_ftp_control_with_timeout(&self.config, &self.password, DEFAULT_FTP_CONNECT_TIMEOUT)
+            .await
     }
 
     async fn open_passive_data_stream(
@@ -388,9 +413,15 @@ impl FtpBackend {
             }
         };
 
-        let tcp = TcpStream::connect((host, data_port))
-            .await
-            .with_context(|| format!("Failed to connect FTP passive data channel {host}:{data_port}"))?;
+        let tcp = tokio::time::timeout(
+            DEFAULT_FTP_CONNECT_TIMEOUT,
+            TcpStream::connect((host, data_port)),
+        )
+        .await
+        .with_context(|| {
+            format!("Timed out connecting FTP passive data channel {host}:{data_port}")
+        })?
+        .with_context(|| format!("Failed to connect FTP passive data channel {host}:{data_port}"))?;
 
         if self.config.use_tls {
             let connector = build_tls_connector()?;
@@ -682,5 +713,37 @@ mod tests {
             parse_list_line("/", "11-10-26  12:30PM       <DIR>          Documents").unwrap();
         assert_eq!(dos_dir.name, "Documents");
         assert_eq!(dos_dir.kind, FileKind::Directory);
+    }
+
+    #[tokio::test]
+    async fn test_ftp_connect_times_out_on_unresponsive_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _silent_server = tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        let cfg = FtpConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "anonymous".to_string(),
+            use_tls: false,
+            initial_path: "/".to_string(),
+        };
+        let started = std::time::Instant::now();
+        let res = connect_ftp_control_with_timeout(
+            &cfg,
+            "",
+            std::time::Duration::from_millis(60),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FTP silent server must time out promptly, took {:?}",
+            started.elapsed()
+        );
     }
 }

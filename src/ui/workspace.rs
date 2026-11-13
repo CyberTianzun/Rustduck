@@ -11,9 +11,15 @@ use crate::services::preferences::{
 use crate::services::runtime::tokio_runtime;
 use crate::services::transfer_manager::TransferManager;
 use crate::services::update_checker::{UpdateCheckState, check_github_latest_release};
-use crate::storage::gdrive::authorize_google_drive_in_browser;
+use crate::storage::gdrive::{
+    authorize_google_drive_in_browser, has_default_gdrive_oauth_credentials,
+    validate_gdrive_oauth_config,
+};
 use crate::storage::local::LocalFileSystem;
-use crate::storage::onedrive::authorize_onedrive_in_browser;
+use crate::storage::onedrive::{
+    authorize_onedrive_in_browser, has_default_onedrive_oauth_credentials,
+    validate_onedrive_oauth_config,
+};
 use crate::storage::{StorageBackend, create_backend};
 use crate::ui::action_modal::render_pane_action_modal;
 use crate::ui::dual_pane_view::render_dual_pane_view;
@@ -44,7 +50,90 @@ use gpui_component::{Icon, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingConnOp {
+    Connect,
+    Test,
+    OAuth,
+}
+
+struct ActiveConnectAttempt {
+    attempt_id: u64,
+    op: PendingConnOp,
+    cancel: CancellationToken,
+    abort_handle: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Default)]
+pub struct TabConnectAttemptTracker {
+    next_attempt_id: u64,
+    active: Option<ActiveConnectAttempt>,
+}
+
+impl TabConnectAttemptTracker {
+    pub fn begin(&mut self, op: PendingConnOp) -> (u64, CancellationToken) {
+        let _ = self.cancel_current();
+        self.next_attempt_id = self.next_attempt_id.wrapping_add(1);
+        if self.next_attempt_id == 0 {
+            self.next_attempt_id = 1;
+        }
+        let attempt_id = self.next_attempt_id;
+        let cancel = CancellationToken::new();
+        self.active = Some(ActiveConnectAttempt {
+            attempt_id,
+            op,
+            cancel: cancel.clone(),
+            abort_handle: None,
+        });
+        (attempt_id, cancel)
+    }
+
+    pub fn attach_abort_handle(&mut self, attempt_id: u64, handle: tokio::task::AbortHandle) {
+        match self.active.as_mut() {
+            Some(active) if active.attempt_id == attempt_id => {
+                active.abort_handle = Some(handle);
+            }
+            _ => {
+                handle.abort();
+            }
+        }
+    }
+
+    pub fn cancel_current(&mut self) -> Option<PendingConnOp> {
+        let active = self.active.take()?;
+        active.cancel.cancel();
+        if let Some(handle) = active.abort_handle {
+            handle.abort();
+        }
+        Some(active.op)
+    }
+
+    pub fn finish_if_current(&mut self, attempt_id: u64) -> bool {
+        if self.active.as_ref().map(|a| a.attempt_id) == Some(attempt_id) {
+            self.active = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_connecting(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub fn pending_op(&self) -> Option<PendingConnOp> {
+        self.active.as_ref().map(|a| a.op)
+    }
+}
+
+impl Drop for TabConnectAttemptTracker {
+    fn drop(&mut self) {
+        let _ = self.cancel_current();
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormFieldValues {
@@ -78,6 +167,7 @@ pub struct FormFieldValues {
     pub gdrive_client_secret: String,
     pub gdrive_proxy: String,
     pub onedrive_client_id: String,
+    pub onedrive_client_secret: String,
     pub onedrive_proxy: String,
 }
 
@@ -114,6 +204,7 @@ impl FormFieldValues {
             gdrive_client_secret: String::new(),
             gdrive_proxy: String::new(),
             onedrive_client_id: String::new(),
+            onedrive_client_secret: String::new(),
             onedrive_proxy: String::new(),
         }
     }
@@ -172,6 +263,7 @@ impl FormFieldValues {
             }
             ProtocolConfig::OneDrive(c) => {
                 vals.onedrive_client_id = c.client_id.clone();
+                vals.onedrive_client_secret = c.client_secret.clone().unwrap_or_default();
                 vals.onedrive_proxy = c.proxy_url.clone().unwrap_or_default();
                 vals.initial_path = c.initial_path.clone();
             }
@@ -269,6 +361,14 @@ impl FormFieldValues {
             }),
             ProtocolKind::OneDrive => ProtocolConfig::OneDrive(OneDriveConfig {
                 client_id: self.onedrive_client_id.trim().to_string(),
+                client_secret: {
+                    let cs = self.onedrive_client_secret.trim();
+                    if cs.is_empty() {
+                        None
+                    } else {
+                        Some(cs.to_string())
+                    }
+                },
                 proxy_url: {
                     let p = self.onedrive_proxy.trim();
                     if p.is_empty() {
@@ -313,6 +413,7 @@ pub struct ConnectionFormInputs {
     pub gdrive_client_secret_input: Entity<InputState>,
     pub gdrive_proxy_input: Entity<InputState>,
     pub onedrive_client_id_input: Entity<InputState>,
+    pub onedrive_client_secret_input: Entity<InputState>,
     pub onedrive_proxy_input: Entity<InputState>,
     pub secret_input: Entity<InputState>,
     pub initial_path_input: Entity<InputState>,
@@ -371,17 +472,34 @@ impl ConnectionFormInputs {
             webdav_endpoint_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_webdav_endpoint())),
             webdav_user_input: cx.new(|cx| InputState::new(window, cx).placeholder("username")),
-            gdrive_client_id_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_oauth_client_id())),
+            gdrive_client_id_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    t.placeholder_oauth_client_id_with_default(
+                        has_default_gdrive_oauth_credentials(),
+                    ),
+                )
+            }),
             gdrive_client_secret_input: cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder(t.placeholder_oauth_client_secret())
+                    .placeholder(t.placeholder_gdrive_client_secret_with_default(
+                        has_default_gdrive_oauth_credentials(),
+                    ))
                     .masked(true)
             }),
             gdrive_proxy_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_proxy_url())),
-            onedrive_client_id_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_oauth_client_id())),
+            onedrive_client_id_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(
+                    t.placeholder_oauth_client_id_with_default(
+                        has_default_onedrive_oauth_credentials(),
+                    ),
+                )
+            }),
+            onedrive_client_secret_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(t.placeholder_oauth_client_secret())
+                    .masked(true)
+            }),
             onedrive_proxy_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_proxy_url())),
             secret_input: cx.new(|cx| {
@@ -425,6 +543,11 @@ impl ConnectionFormInputs {
             gdrive_client_secret: self.gdrive_client_secret_input.read(cx).value().to_string(),
             gdrive_proxy: self.gdrive_proxy_input.read(cx).value().to_string(),
             onedrive_client_id: self.onedrive_client_id_input.read(cx).value().to_string(),
+            onedrive_client_secret: self
+                .onedrive_client_secret_input
+                .read(cx)
+                .value()
+                .to_string(),
             onedrive_proxy: self.onedrive_proxy_input.read(cx).value().to_string(),
         }
     }
@@ -508,6 +631,9 @@ impl ConnectionFormInputs {
         self.onedrive_client_id_input.update(cx, |s, cx| {
             s.set_value(vals.onedrive_client_id.clone(), window, cx)
         });
+        self.onedrive_client_secret_input.update(cx, |s, cx| {
+            s.set_value(vals.onedrive_client_secret.clone(), window, cx)
+        });
         self.onedrive_proxy_input.update(cx, |s, cx| {
             s.set_value(vals.onedrive_proxy.clone(), window, cx)
         });
@@ -546,16 +672,35 @@ impl ConnectionFormInputs {
             s.set_placeholder(t.placeholder_webdav_endpoint(), window, cx)
         });
         self.gdrive_client_id_input.update(cx, |s, cx| {
-            s.set_placeholder(t.placeholder_oauth_client_id(), window, cx)
+            s.set_placeholder(
+                t.placeholder_oauth_client_id_with_default(has_default_gdrive_oauth_credentials()),
+                window,
+                cx,
+            )
         });
         self.gdrive_client_secret_input.update(cx, |s, cx| {
-            s.set_placeholder(t.placeholder_oauth_client_secret(), window, cx)
+            s.set_placeholder(
+                t.placeholder_gdrive_client_secret_with_default(
+                    has_default_gdrive_oauth_credentials(),
+                ),
+                window,
+                cx,
+            )
         });
         self.gdrive_proxy_input.update(cx, |s, cx| {
             s.set_placeholder(t.placeholder_proxy_url(), window, cx)
         });
         self.onedrive_client_id_input.update(cx, |s, cx| {
-            s.set_placeholder(t.placeholder_oauth_client_id(), window, cx)
+            s.set_placeholder(
+                t.placeholder_oauth_client_id_with_default(
+                    has_default_onedrive_oauth_credentials(),
+                ),
+                window,
+                cx,
+            )
+        });
+        self.onedrive_client_secret_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_oauth_client_secret(), window, cx)
         });
         self.onedrive_proxy_input.update(cx, |s, cx| {
             s.set_placeholder(t.placeholder_proxy_url(), window, cx)
@@ -763,7 +908,7 @@ pub struct TabSession {
     pub id: Uuid,
     pub title: String,
     pub is_connected: bool,
-    pub is_connecting: bool,
+    pub connect_tracker: TabConnectAttemptTracker,
     pub status_message: Option<String>,
     pub form: ConnectionFormInputs,
     pub local_backend: Arc<dyn StorageBackend>,
@@ -803,6 +948,14 @@ pub struct TabSession {
 }
 
 impl TabSession {
+    pub fn is_connecting(&self) -> bool {
+        self.connect_tracker.is_connecting()
+    }
+
+    pub fn pending_conn_op(&self) -> Option<PendingConnOp> {
+        self.connect_tracker.pending_op()
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<RustduckWorkspace>) -> Self {
         Self::new_with_initial_local_dir(LocalFileSystem::initial_local_dir(), window, cx)
     }
@@ -840,7 +993,7 @@ impl TabSession {
             id: Uuid::new_v4(),
             title: t.default_tab_title().to_string(),
             is_connected: false,
-            is_connecting: false,
+            connect_tracker: TabConnectAttemptTracker::default(),
             status_message: None,
             form: ConnectionFormInputs::new(window, cx),
             local_backend: Arc::new(local_fs),
@@ -1234,6 +1387,7 @@ impl RustduckWorkspace {
     pub fn release_all_resources(&mut self) {
         self.transfer_manager.shutdown();
         for tab in &mut self.tabs {
+            let _ = tab.connect_tracker.cancel_current();
             tab.remote_backend = None;
             tab.is_connected = false;
         }
@@ -1467,6 +1621,9 @@ impl RustduckWorkspace {
     }
 
     pub fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            let _ = tab.connect_tracker.cancel_current();
+        }
         if self.tabs.len() <= 1 {
             let initial_local = self.preferences_store.resolve_effective_local_dir();
             self.tabs[0] = TabSession::new_with_initial_local_dir(initial_local, window, cx);
@@ -1485,6 +1642,20 @@ impl RustduckWorkspace {
         cx.notify();
     }
 
+    pub fn cancel_tab_connect_op(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+        let t = i18n();
+        if let Some(tab) = self.tabs.get_mut(tab_idx)
+            && let Some(op) = tab.connect_tracker.cancel_current()
+        {
+            tab.status_message = Some(match op {
+                PendingConnOp::Connect => t.msg_conn_cancelled(),
+                PendingConnOp::Test => t.msg_test_cancelled(),
+                PendingConnOp::OAuth => t.msg_oauth_cancelled(),
+            });
+            cx.notify();
+        }
+    }
+
     pub fn reset_form_for_new_connection(
         &mut self,
         tab_idx: usize,
@@ -1492,6 +1663,7 @@ impl RustduckWorkspace {
         cx: &mut Context<Self>,
     ) {
         let t = i18n();
+        let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
         let protocol = self.tabs[tab_idx].form.protocol;
         let search_input = self.tabs[tab_idx].form.bookmark_search_input.clone();
         let blank = FormFieldValues::blank_for_protocol(protocol);
@@ -1622,29 +1794,54 @@ impl RustduckWorkspace {
             ProtocolKind::OneDrive => "OneDrive",
             other => other.short_tag(),
         };
-        self.tabs[tab_idx].is_connecting = true;
+
+        // Pre-flight validation BEFORE entering connecting state or opening system browser
+        let preflight_err = match &config {
+            ProtocolConfig::GoogleDrive(cfg) => validate_gdrive_oauth_config(cfg).err(),
+            ProtocolConfig::OneDrive(cfg) => validate_onedrive_oauth_config(cfg).err(),
+            _ => Some(anyhow::anyhow!(
+                "OAuth browser login is only supported for Google Drive / OneDrive"
+            )),
+        };
+        if let Some(err) = preflight_err {
+            let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
+            self.tabs[tab_idx].status_message = Some(err.to_string());
+            cx.notify();
+            return;
+        }
+
+        let (attempt_id, cancel) = self.tabs[tab_idx]
+            .connect_tracker
+            .begin(PendingConnOp::OAuth);
         self.tabs[tab_idx].status_message = Some(t.msg_oauth_authorizing_browser(provider));
         cx.notify();
 
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
-        tokio_runtime().spawn(async move {
+        let join_handle = tokio_runtime().spawn(async move {
             let res = match config {
-                ProtocolConfig::GoogleDrive(cfg) => authorize_google_drive_in_browser(&cfg).await,
-                ProtocolConfig::OneDrive(cfg) => authorize_onedrive_in_browser(&cfg).await,
+                ProtocolConfig::GoogleDrive(cfg) => {
+                    authorize_google_drive_in_browser(&cfg, cancel).await
+                }
+                ProtocolConfig::OneDrive(cfg) => authorize_onedrive_in_browser(&cfg, cancel).await,
                 _ => Err(anyhow::anyhow!(
                     "OAuth browser login is only supported for Google Drive / OneDrive"
                 )),
             };
             let _ = tx.send(res);
         });
+        self.tabs[tab_idx]
+            .connect_tracker
+            .attach_abort_handle(attempt_id, join_handle.abort_handle());
 
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(result) = rx.await {
                 let _ = this.update_in(cx, |ws, window, cx| {
                     let t = i18n();
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.is_connecting = false;
+                        if !tab.connect_tracker.finish_if_current(attempt_id) {
+                            return;
+                        }
                         match result {
                             Ok(refresh_token) => {
                                 tab.form.secret_input.update(cx, |s, cx| {
@@ -1676,6 +1873,7 @@ impl RustduckWorkspace {
         cx: &mut Context<Self>,
     ) {
         let t = i18n();
+        let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
         let secret = self
             .bookmark_store
             .get_secret(bm.id)
@@ -1717,6 +1915,7 @@ impl RustduckWorkspace {
         cx: &mut Context<Self>,
     ) {
         let t = i18n();
+        let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
         let (_title, config, secret) = self.read_form_config(tab_idx, cx);
         let backend = match create_backend(&config, &secret) {
             Ok(b) => b,
@@ -1727,26 +1926,33 @@ impl RustduckWorkspace {
             }
         };
 
-        self.tabs[tab_idx].is_connecting = true;
+        let (attempt_id, cancel) = self.tabs[tab_idx]
+            .connect_tracker
+            .begin(PendingConnOp::Test);
         self.tabs[tab_idx].status_message = Some(t.msg_testing_connection());
         cx.notify();
 
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
-        tokio_runtime().spawn(async move {
-            let res = backend
-                .connect_and_verify()
-                .await
-                .map(|root| (root, backend.exported_secret()));
+        let join_handle = tokio_runtime().spawn(async move {
+            let res = tokio::select! {
+                _ = cancel.cancelled() => Err(anyhow::anyhow!("Connection test cancelled")),
+                r = backend.connect_and_verify() => r.map(|root| (root, backend.exported_secret())),
+            };
             let _ = tx.send(res);
         });
+        self.tabs[tab_idx]
+            .connect_tracker
+            .attach_abort_handle(attempt_id, join_handle.abort_handle());
 
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(result) = rx.await {
                 let _ = this.update_in(cx, |ws, window, cx| {
                     let t = i18n();
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.is_connecting = false;
+                        if !tab.connect_tracker.finish_if_current(attempt_id) {
+                            return;
+                        }
                         match result {
                             Ok((root, maybe_secret)) => {
                                 if let Some(new_sec) = maybe_secret {
@@ -1773,6 +1979,7 @@ impl RustduckWorkspace {
 
     pub fn connect_tab(&mut self, tab_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let t = i18n();
+        let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
         let (title, config, secret) = self.read_form_config(tab_idx, cx);
         let backend = match create_backend(&config, &secret) {
             Ok(b) => b,
@@ -1783,28 +1990,38 @@ impl RustduckWorkspace {
             }
         };
 
-        self.tabs[tab_idx].is_connecting = true;
+        let (attempt_id, cancel) = self.tabs[tab_idx]
+            .connect_tracker
+            .begin(PendingConnOp::Connect);
         self.tabs[tab_idx].status_message = Some(t.msg_connecting_handshake());
         cx.notify();
 
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
-        tokio_runtime().spawn(async move {
-            let res = async {
+        let join_handle = tokio_runtime().spawn(async move {
+            let connect_fut = async {
                 let initial_path = backend.connect_and_verify().await?;
                 let entries = backend.list_dir(&initial_path).await?;
                 Ok::<_, anyhow::Error>((backend, initial_path, entries))
-            }
-            .await;
+            };
+            let res = tokio::select! {
+                _ = cancel.cancelled() => Err(anyhow::anyhow!("Connection cancelled")),
+                r = connect_fut => r,
+            };
             let _ = tx.send(res);
         });
+        self.tabs[tab_idx]
+            .connect_tracker
+            .attach_abort_handle(attempt_id, join_handle.abort_handle());
 
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(result) = rx.await {
                 let _ = this.update_in(cx, |ws, window, cx| {
                     let t = i18n();
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.is_connecting = false;
+                        if !tab.connect_tracker.finish_if_current(attempt_id) {
+                            return;
+                        }
                         match result {
                             Ok((backend, initial_path, entries)) => {
                                 if let Some(new_sec) = backend.exported_secret() {
@@ -1844,6 +2061,7 @@ impl RustduckWorkspace {
     pub fn disconnect_tab(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
         let t = i18n();
         let tab = &mut self.tabs[tab_idx];
+        let _ = tab.connect_tracker.cancel_current();
         tab.is_connected = false;
         tab.remote_backend = None;
         tab.remote_entries.clear();
@@ -2915,7 +3133,7 @@ impl RustduckWorkspace {
                 let (proto_icon, proto_color) = protocol_icon_and_color(tab.form.protocol);
                 let dot_color = if tab.is_connected {
                     accent_green()
-                } else if tab.is_connecting {
+                } else if tab.is_connecting() {
                     accent_amber()
                 } else {
                     text_muted()
@@ -3295,14 +3513,84 @@ mod tests {
         }
 
         let mut od_vals = FormFieldValues::blank_for_protocol(ProtocolKind::OneDrive);
+        od_vals.onedrive_client_id = "od-cid".into();
+        od_vals.onedrive_client_secret = "od-csec".into();
         od_vals.onedrive_proxy = "http://127.0.0.1:7890".into();
         match od_vals.to_protocol_config() {
             ProtocolConfig::OneDrive(c) => {
-                assert!(c.client_id.is_empty());
+                assert_eq!(c.client_id, "od-cid");
+                assert_eq!(c.client_secret.as_deref(), Some("od-csec"));
                 assert_eq!(c.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
             }
             _ => panic!("expected OneDrive config"),
         }
+
+        let od_bm = Bookmark {
+            id: Uuid::new_v4(),
+            name: "Work OneDrive".into(),
+            config: od_vals.to_protocol_config(),
+        };
+        let od_from_bm = FormFieldValues::from_bookmark(&od_bm, "rt-token");
+        assert_eq!(od_from_bm.onedrive_client_id, "od-cid");
+        assert_eq!(od_from_bm.onedrive_client_secret, "od-csec");
+        let od_blank = FormFieldValues::blank_for_protocol(ProtocolKind::OneDrive);
+        assert!(od_blank.onedrive_client_id.is_empty());
+        assert!(od_blank.onedrive_client_secret.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tab_connect_attempt_tracker_cancels_aborts_and_ignores_stale_completions() {
+        let mut tracker = TabConnectAttemptTracker::default();
+        assert!(!tracker.is_connecting());
+        assert_eq!(tracker.pending_op(), None);
+
+        // 1. Start a Connect attempt and attach an abortable background task
+        let (id1, cancel1) = tracker.begin(PendingConnOp::Connect);
+        assert!(tracker.is_connecting());
+        assert_eq!(tracker.pending_op(), Some(PendingConnOp::Connect));
+        assert!(!cancel1.is_cancelled());
+
+        let spawned1 = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        tracker.attach_abort_handle(id1, spawned1.abort_handle());
+
+        // 2. User cancels the hung connection attempt
+        let cancelled_op = tracker.cancel_current();
+        assert_eq!(cancelled_op, Some(PendingConnOp::Connect));
+        assert!(!tracker.is_connecting());
+        assert_eq!(tracker.pending_op(), None);
+        assert!(cancel1.is_cancelled());
+        assert!(!tracker.finish_if_current(id1));
+        let join1 = spawned1.await;
+        assert!(join1.unwrap_err().is_cancelled());
+
+        // 3. Start OAuth attempt, then user clicks Retry / switches bookmark -> supersedes id2
+        let (id2, cancel2) = tracker.begin(PendingConnOp::OAuth);
+        assert_ne!(id2, id1);
+        assert_eq!(tracker.pending_op(), Some(PendingConnOp::OAuth));
+
+        let (id3, cancel3) = tracker.begin(PendingConnOp::Test);
+        assert!(cancel2.is_cancelled());
+        assert!(!cancel3.is_cancelled());
+        assert_eq!(tracker.pending_op(), Some(PendingConnOp::Test));
+        assert!(!tracker.finish_if_current(id2));
+        assert!(tracker.finish_if_current(id3));
+        assert!(!tracker.is_connecting());
+
+        // 4. Dropping tracker (e.g. closing tab) cancels and aborts in-flight task automatically
+        let spawned_drop = {
+            let mut drop_tracker = TabConnectAttemptTracker::default();
+            let (id_drop, cancel_drop) = drop_tracker.begin(PendingConnOp::OAuth);
+            let task = tokio::spawn(async move {
+                cancel_drop.cancelled().await;
+            });
+            drop_tracker.attach_abort_handle(id_drop, task.abort_handle());
+            task
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), spawned_drop)
+            .await
+            .expect("dropping TabConnectAttemptTracker must immediately unblock/abort task");
     }
 
     #[test]

@@ -5,9 +5,12 @@ use russh::client::{self, AuthResult, Config, Handler};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh_sftp::client::SftpSession;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+pub const DEFAULT_SFTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct SshClientHandler;
 
@@ -46,6 +49,81 @@ pub struct SftpBackend {
     session: Mutex<Option<Arc<SftpSession>>>,
 }
 
+pub async fn connect_sftp_session_with_timeout(
+    config: &SftpConfig,
+    secret: &str,
+    timeout_dur: Duration,
+) -> anyhow::Result<Arc<SftpSession>> {
+    let host = config.host.trim();
+    let port = config.port;
+
+    tokio::time::timeout(timeout_dur, async {
+        let ssh_config = Arc::new(Config {
+            inactivity_timeout: Some(Duration::from_secs(30)),
+            ..Config::default()
+        });
+        let addr = (host, port);
+        let mut handle = client::connect(ssh_config, addr, SshClientHandler)
+            .await
+            .with_context(|| format!("Failed to connect to SSH server {host}:{port}"))?;
+
+        let user = config.username.trim();
+        let auth_res = if let Some(key_path) = config
+            .private_key_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let pass = if secret.is_empty() {
+                None
+            } else {
+                Some(secret)
+            };
+            let resolved_key_path = expand_tilde_path(key_path);
+            let key_pair = load_secret_key(&resolved_key_path, pass)
+                .with_context(|| format!("Failed to load SSH private key from {key_path}"))?;
+            let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key_pair), None);
+            handle
+                .authenticate_publickey(user, key_with_alg)
+                .await
+                .context("SSH public key authentication failed")?
+        } else {
+            handle
+                .authenticate_password(user, secret)
+                .await
+                .context("SSH password authentication failed")?
+        };
+
+        if !matches!(auth_res, AuthResult::Success) {
+            return Err(anyhow!(
+                "SSH authentication rejected for user '{}'",
+                config.username
+            ));
+        }
+
+        let channel = handle
+            .channel_open_session()
+            .await
+            .context("Failed to open SSH session channel")?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .context("Failed to request SFTP subsystem")?;
+
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .context("Failed to initialize SFTP session")?;
+        Ok(Arc::new(sftp))
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "Timed out connecting to SSH/SFTP server {host}:{port} ({}s)",
+            timeout_dur.as_secs().max(1)
+        )
+    })?
+}
+
 impl SftpBackend {
     pub fn new(config: SftpConfig, secret: String) -> anyhow::Result<Self> {
         if config.host.trim().is_empty() {
@@ -67,65 +145,12 @@ impl SftpBackend {
             return Ok(existing.clone());
         }
 
-        let ssh_config = Arc::new(Config::default());
-        let addr = (self.config.host.trim(), self.config.port);
-        let mut handle = client::connect(ssh_config, addr, SshClientHandler)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to connect to SSH server {}:{}",
-                    self.config.host, self.config.port
-                )
-            })?;
-
-        let user = self.config.username.trim();
-        let auth_res = if let Some(key_path) = self
-            .config
-            .private_key_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let pass = if self.secret.is_empty() {
-                None
-            } else {
-                Some(self.secret.as_str())
-            };
-            let resolved_key_path = expand_tilde_path(key_path);
-            let key_pair = load_secret_key(&resolved_key_path, pass)
-                .with_context(|| format!("Failed to load SSH private key from {key_path}"))?;
-            let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key_pair), None);
-            handle
-                .authenticate_publickey(user, key_with_alg)
-                .await
-                .context("SSH public key authentication failed")?
-        } else {
-            handle
-                .authenticate_password(user, &self.secret)
-                .await
-                .context("SSH password authentication failed")?
-        };
-
-        if !matches!(auth_res, AuthResult::Success) {
-            return Err(anyhow!(
-                "SSH authentication rejected for user '{}'",
-                self.config.username
-            ));
-        }
-
-        let channel = handle
-            .channel_open_session()
-            .await
-            .context("Failed to open SSH session channel")?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .context("Failed to request SFTP subsystem")?;
-
-        let sftp = SftpSession::new(channel.into_stream())
-            .await
-            .context("Failed to initialize SFTP session")?;
-        let arc_sftp = Arc::new(sftp);
+        let arc_sftp = connect_sftp_session_with_timeout(
+            &self.config,
+            &self.secret,
+            DEFAULT_SFTP_CONNECT_TIMEOUT,
+        )
+        .await?;
         *guard = Some(arc_sftp.clone());
         Ok(arc_sftp)
     }
@@ -309,5 +334,37 @@ mod tests {
 
         let literal = expand_tilde_path("C:\\keys\\id_rsa");
         assert_eq!(literal, std::path::PathBuf::from("C:\\keys\\id_rsa"));
+    }
+
+    #[tokio::test]
+    async fn test_sftp_connect_times_out_on_unresponsive_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _silent_server = tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+
+        let cfg = SftpConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "root".to_string(),
+            private_key_path: None,
+            initial_path: "/".to_string(),
+        };
+        let started = std::time::Instant::now();
+        let res = connect_sftp_session_with_timeout(
+            &cfg,
+            "pw",
+            std::time::Duration::from_millis(60),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "SFTP silent server must time out promptly, took {:?}",
+            started.elapsed()
+        );
     }
 }

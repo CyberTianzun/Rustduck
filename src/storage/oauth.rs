@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OAuthTokenResponse {
@@ -16,6 +17,28 @@ pub struct OAuthTokenResponse {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub expires_in: Option<u64>,
+}
+
+pub fn resolve_oauth_credential_from_sources(
+    configured: Option<&str>,
+    runtime_env: Option<&str>,
+    compile_time_env: Option<&str>,
+) -> Option<String> {
+    for candidate in [configured, runtime_env, compile_time_env] {
+        if let Some(val) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+pub fn resolve_oauth_credential(
+    configured: Option<&str>,
+    env_var_name: &str,
+    compile_time_env: Option<&str>,
+) -> Option<String> {
+    let runtime_val = std::env::var(env_var_name).ok();
+    resolve_oauth_credential_from_sources(configured, runtime_val.as_deref(), compile_time_env)
 }
 
 pub fn normalize_proxy_url(raw: Option<&str>) -> Option<String> {
@@ -184,6 +207,7 @@ async fn handle_loopback_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn authorize_via_browser_with_launcher<F>(
     client: &Client,
     auth_endpoint: &str,
@@ -192,18 +216,22 @@ pub async fn authorize_via_browser_with_launcher<F>(
     client_secret: Option<&str>,
     scope: &str,
     extra_auth_params: &[(&str, &str)],
+    cancel: CancellationToken,
     launch_browser: F,
 ) -> anyhow::Result<OAuthTokenResponse>
 where
     F: FnOnce(&str) -> anyhow::Result<()>,
 {
+    if cancel.is_cancelled() {
+        return Err(anyhow!("OAuth browser authorization cancelled"));
+    }
+
     let v4_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("Failed to bind local OAuth callback listener")?;
     let port = v4_listener.local_addr()?.port();
-    let v6_listener = TcpListener::bind(("[::1]", port)).await.ok();
 
-    let redirect_uri = format!("http://localhost:{port}");
+    let redirect_uri = format!("http://127.0.0.1:{port}");
     let (verifier, challenge) = generate_pkce_pair();
     let state = generate_oauth_state();
 
@@ -219,18 +247,21 @@ where
 
     launch_browser(&auth_url)?;
 
-    let code = tokio::time::timeout(Duration::from_secs(180), async {
+    let wait_callback = async {
         loop {
-            let stream = match &v6_listener {
-                Some(v6) => {
-                    tokio::select! {
-                        res = v4_listener.accept() => res?.0,
-                        res = v6.accept() => res?.0,
-                    }
+            let stream = tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(anyhow!("OAuth browser authorization cancelled"));
                 }
-                None => v4_listener.accept().await?.0,
+                res = v4_listener.accept() => res?.0,
             };
-            match handle_loopback_stream(stream, &state).await {
+            let handle_res = tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(anyhow!("OAuth browser authorization cancelled"));
+                }
+                r = handle_loopback_stream(stream, &state) => r,
+            };
+            match handle_res {
                 Ok(code) => return Ok::<String, anyhow::Error>(code),
                 Err(e) => {
                     // Ignore favicon.ico or unrelated requests without 'code' or 'error'
@@ -243,22 +274,27 @@ where
                 }
             }
         }
-    })
-    .await
-    .context("Timed out waiting for browser OAuth callback (180s)")??;
+    };
 
-    exchange_code_for_token(
-        client,
-        token_endpoint,
-        client_id,
-        client_secret,
-        &code,
-        &redirect_uri,
-        &verifier,
-    )
-    .await
+    let code = tokio::time::timeout(Duration::from_secs(180), wait_callback)
+        .await
+        .context("Timed out waiting for browser OAuth callback (180s)")??;
+
+    tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow!("OAuth browser authorization cancelled")),
+        res = exchange_code_for_token(
+            client,
+            token_endpoint,
+            client_id,
+            client_secret,
+            &code,
+            &redirect_uri,
+            &verifier,
+        ) => res,
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn authorize_via_browser_loopback(
     client: &Client,
     auth_endpoint: &str,
@@ -267,6 +303,7 @@ pub async fn authorize_via_browser_loopback(
     client_secret: Option<&str>,
     scope: &str,
     extra_auth_params: &[(&str, &str)],
+    cancel: CancellationToken,
 ) -> anyhow::Result<OAuthTokenResponse> {
     authorize_via_browser_with_launcher(
         client,
@@ -276,8 +313,9 @@ pub async fn authorize_via_browser_loopback(
         client_secret,
         scope,
         extra_auth_params,
+        cancel,
         |url| {
-            open::that(url)
+            open::that_detached(url)
                 .with_context(|| format!("Failed to launch browser for OAuth URL: {url}"))
         },
     )
@@ -400,6 +438,38 @@ mod tests {
         assert!(err.to_string().contains("access_denied"));
     }
 
+    #[test]
+    fn test_resolve_oauth_credential_priority_and_empty_handling() {
+        assert_eq!(
+            resolve_oauth_credential_from_sources(None, None, None),
+            None
+        );
+        assert_eq!(
+            resolve_oauth_credential_from_sources(Some("   "), Some(""), Some("  ")),
+            None
+        );
+        assert_eq!(
+            resolve_oauth_credential_from_sources(
+                Some("  user-cid  "),
+                Some("env-cid"),
+                Some("build-cid")
+            ),
+            Some("user-cid".to_string())
+        );
+        assert_eq!(
+            resolve_oauth_credential_from_sources(
+                Some(""),
+                Some("  env-cid  "),
+                Some("build-cid")
+            ),
+            Some("env-cid".to_string())
+        );
+        assert_eq!(
+            resolve_oauth_credential_from_sources(None, None, Some("  build-cid ")),
+            Some("build-cid".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn test_loopback_oauth_flow_with_mock_token_server() {
         // Start a mock OAuth token server
@@ -421,6 +491,7 @@ mod tests {
 
         let client = build_http_client(None).unwrap();
         let token_endpoint = format!("http://127.0.0.1:{token_port}/token");
+        let cancel = tokio_util::sync::CancellationToken::new();
 
         let token_res = authorize_via_browser_with_launcher(
             &client,
@@ -430,6 +501,7 @@ mod tests {
             Some("test-secret"),
             "drive",
             &[("access_type", "offline")],
+            cancel,
             |auth_url| {
                 let parsed = Url::parse(auth_url).unwrap();
                 let mut redirect_uri = String::new();
@@ -441,6 +513,10 @@ mod tests {
                         state = v.to_string();
                     }
                 }
+                assert!(
+                    redirect_uri.starts_with("http://127.0.0.1:"),
+                    "Loopback redirect_uri should bind explicit IPv4 127.0.0.1, got: {redirect_uri}"
+                );
                 tokio::spawn(async move {
                     let callback_url = format!("{redirect_uri}/?code=MOCK_AUTH_CODE&state={state}");
                     let _ = Client::new().get(&callback_url).send().await;
@@ -453,5 +529,47 @@ mod tests {
 
         assert_eq!(token_res.access_token, "mock_access_123");
         assert_eq!(token_res.refresh_token.as_deref(), Some("mock_refresh_456"));
+    }
+
+    #[tokio::test]
+    async fn test_loopback_oauth_flow_cancels_immediately_without_browser_callback() {
+        let client = build_http_client(None).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_trigger = cancel.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            cancel_trigger.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let err = authorize_via_browser_with_launcher(
+            &client,
+            "https://accounts.example.com/authorize",
+            "http://127.0.0.1:9/token",
+            "test-client-id",
+            Some("test-secret"),
+            "drive",
+            &[],
+            cancel,
+            |_auth_url| {
+                // Simulate browser displaying "Access blocked: This app's request is invalid"
+                // and never redirecting back to 127.0.0.1.
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "Cancelled OAuth flow must abort immediately, took {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("cancel") || msg.contains("取消"),
+            "Unexpected cancel error: {err}"
+        );
     }
 }

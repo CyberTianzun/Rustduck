@@ -1,11 +1,13 @@
 use crate::i18n::i18n;
 use crate::models::{Bookmark, ProtocolKind, S3AddressingStyle, S3Preset};
+use crate::storage::gdrive::has_default_gdrive_oauth_credentials;
+use crate::storage::onedrive::has_default_onedrive_oauth_credentials;
 use crate::ui::{
     accent_amber, accent_blue, accent_red, bg_canvas, bg_elevated, bg_panel, bg_row_hover,
     bg_row_selected, border_selected, border_strong, border_subtle, protocol_icon_and_color,
     text_muted, text_primary, text_secondary,
     workspace::{
-        format_single_line_status, is_error_status_message, ConnectionFormInputs,
+        format_single_line_status, is_error_status_message, ConnectionFormInputs, PendingConnOp,
         RustduckWorkspace,
     },
 };
@@ -80,7 +82,7 @@ fn render_favorites_gallery(
         tab_idx,
         filtered_bookmarks,
         selected_bookmark_id,
-        tab.is_connecting,
+        tab.pending_conn_op(),
         cx,
     );
     let footer = h_flex()
@@ -205,10 +207,11 @@ fn render_favorites_list(
     tab_idx: usize,
     filtered_bookmarks: Vec<Bookmark>,
     selected_bookmark_id: Option<Uuid>,
-    is_connecting: bool,
+    pending_op: Option<PendingConnOp>,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
+    let is_connect_pending = pending_op == Some(PendingConnOp::Connect);
     let children: Vec<AnyElement> = if filtered_bookmarks.is_empty() {
         vec![v_flex()
             .w_full()
@@ -258,7 +261,7 @@ fn render_favorites_list(
                     bm_idx,
                     bm,
                     is_selected,
-                    is_selected && is_connecting,
+                    is_selected && is_connect_pending,
                     cx,
                 )
             })
@@ -326,7 +329,7 @@ fn render_bookmark_card(
             move |this, ev: &gpui::ClickEvent, window, cx| {
                 cx.stop_propagation();
                 this.load_bookmark_into_form(tab_idx, &bm_select, window, cx);
-                if ev.click_count() >= 2 && !this.tabs[tab_idx].is_connecting {
+                if ev.click_count() >= 2 {
                     this.connect_tab(tab_idx, window, cx);
                 }
             },
@@ -387,21 +390,30 @@ fn render_bookmark_card(
                 .gap_1p5()
                 .items_center()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
+                .child(if is_card_connecting {
+                    Button::new(("cancel-conn-bm", bm_idx))
+                        .xsmall()
+                        .danger()
+                        .icon(IconName::X)
+                        .label(t.cancel_btn())
+                        .on_click(cx.listener(move |this, _ev, _window, cx| {
+                            cx.stop_propagation();
+                            this.cancel_tab_connect_op(tab_idx, cx);
+                        }))
+                        .into_any_element()
+                } else {
                     Button::new(("conn-bm", bm_idx))
                         .xsmall()
                         .primary()
                         .icon(IconName::Play)
-                        .loading(is_card_connecting)
                         .label(t.connect_short_btn())
                         .on_click(cx.listener(move |this, _ev, window, cx| {
                             cx.stop_propagation();
-                            if !this.tabs[tab_idx].is_connecting {
-                                this.load_bookmark_into_form(tab_idx, &bm_connect, window, cx);
-                                this.connect_tab(tab_idx, window, cx);
-                            }
-                        })),
-                )
+                            this.load_bookmark_into_form(tab_idx, &bm_connect, window, cx);
+                            this.connect_tab(tab_idx, window, cx);
+                        }))
+                        .into_any_element()
+                })
                 .child(
                     Button::new(("del-bm", bm_idx))
                         .xsmall()
@@ -431,13 +443,14 @@ fn render_quick_connect_inspector(
     let form = &tab.form;
     let active_protocol = form.protocol;
     let has_bookmark = form.bookmark_id.is_some();
-    let is_connecting = tab.is_connecting;
+    let pending_op = tab.pending_conn_op();
+    let is_connecting = pending_op.is_some();
 
     let header = render_inspector_header(tab_idx, has_bookmark, active_protocol, cx);
-    let body = render_inspector_body(tab_idx, form, is_connecting, cx);
+    let body = render_inspector_body(tab_idx, form, pending_op, cx);
     let status_banner =
         render_inspector_status_banner(tab_idx, is_connecting, tab.status_message.as_deref(), cx);
-    let footer = render_inspector_footer(tab_idx, is_connecting, cx);
+    let footer = render_inspector_footer(tab_idx, pending_op, cx);
 
     v_flex()
         .w(gpui::relative(0.56))
@@ -462,6 +475,7 @@ fn render_inspector_status_banner(
         return None;
     }
 
+    let t = i18n();
     let is_err = !is_connecting && is_error_status_message(&clean);
     let (icon_name, fg_color, border_col) = if is_connecting {
         (IconName::RefreshCw, accent_blue(), accent_blue())
@@ -504,18 +518,27 @@ fn render_inspector_status_banner(
                                     .child(clean),
                             ),
                     )
-                    .when(!is_connecting, |bar| {
-                        bar.child(
-                            Button::new(("dismiss-conn-status", tab_idx))
-                                .xsmall()
-                                .ghost()
-                                .compact()
-                                .icon(IconName::X)
-                                .on_click(cx.listener(move |this, _ev, _win, cx| {
-                                    this.tabs[tab_idx].status_message = None;
-                                    cx.notify();
-                                })),
-                        )
+                    .child(if is_connecting {
+                        Button::new(("cancel-conn-status", tab_idx))
+                            .xsmall()
+                            .secondary()
+                            .icon(IconName::X)
+                            .label(t.cancel_btn())
+                            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                this.cancel_tab_connect_op(tab_idx, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        Button::new(("dismiss-conn-status", tab_idx))
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .icon(IconName::X)
+                            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                this.tabs[tab_idx].status_message = None;
+                                cx.notify();
+                            }))
+                            .into_any_element()
                     }),
             )
             .into_any_element(),
@@ -552,8 +575,13 @@ fn render_inspector_header(
                 })
                 .label(label)
                 .on_click(cx.listener(move |this, _ev, _win, cx| {
-                    this.tabs[tab_idx].form.protocol = proto;
-                    cx.notify();
+                    if this.tabs[tab_idx].form.protocol != proto {
+                        if this.tabs[tab_idx].is_connecting() {
+                            this.cancel_tab_connect_op(tab_idx, cx);
+                        }
+                        this.tabs[tab_idx].form.protocol = proto;
+                        cx.notify();
+                    }
                 }))
                 .into_any_element()
         })
@@ -615,7 +643,7 @@ fn render_inspector_header(
 fn render_inspector_body(
     tab_idx: usize,
     form: &ConnectionFormInputs,
-    is_connecting: bool,
+    pending_op: Option<PendingConnOp>,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
@@ -652,8 +680,8 @@ fn render_inspector_body(
         ProtocolKind::S3 => render_s3_form_card(tab_idx, form, cx),
         ProtocolKind::Smb => render_smb_form_card(form),
         ProtocolKind::WebDav => render_webdav_form_card(form),
-        ProtocolKind::GoogleDrive => render_gdrive_form_card(tab_idx, form, is_connecting, cx),
-        ProtocolKind::OneDrive => render_onedrive_form_card(tab_idx, form, is_connecting, cx),
+        ProtocolKind::GoogleDrive => render_gdrive_form_card(tab_idx, form, pending_op, cx),
+        ProtocolKind::OneDrive => render_onedrive_form_card(tab_idx, form, pending_op, cx),
     };
 
     v_flex()
@@ -937,10 +965,98 @@ fn render_webdav_form_card(form: &ConnectionFormInputs) -> AnyElement {
 fn render_gdrive_form_card(
     tab_idx: usize,
     form: &ConnectionFormInputs,
-    is_connecting: bool,
+    pending_op: Option<PendingConnOp>,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
+    let is_oauth_pending = pending_op == Some(PendingConnOp::OAuth);
+    let has_default = has_default_gdrive_oauth_credentials();
+
+    let setup_hint = h_flex()
+        .w_full()
+        .p_2p5()
+        .gap_2()
+        .rounded(px(8.0))
+        .bg(bg_panel())
+        .border_1()
+        .border_color(border_subtle())
+        .items_start()
+        .child(
+            Icon::new(IconName::Lock)
+                .xsmall()
+                .text_color(accent_blue()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(text_muted())
+                .child(t.oauth_gdrive_setup_guide_with_default(has_default)),
+        )
+        .into_any_element();
+
+    let row_custom_client = h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_oauth_client_id_with_default(has_default)))
+                .child(
+                    Input::new(&form.gdrive_client_id_input)
+                        .small()
+                        .prefix(Icon::new(IconName::Key).xsmall().text_color(text_muted()))
+                        .cleanable(true),
+                ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(
+                    t.label_gdrive_client_secret_with_default(has_default),
+                ))
+                .child(Input::new(&form.gdrive_client_secret_input).small().mask_toggle()),
+        )
+        .into_any_element();
+
+    let oauth_actions = if is_oauth_pending {
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(
+                Button::new("retry-gdrive-oauth-btn")
+                    .xsmall()
+                    .secondary()
+                    .icon(IconName::RefreshCw)
+                    .label(t.oauth_retry_btn())
+                    .on_click(cx.listener(move |this, _ev, window, cx| {
+                        this.authorize_oauth_in_browser(tab_idx, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("cancel-gdrive-oauth-btn")
+                    .xsmall()
+                    .danger()
+                    .icon(IconName::X)
+                    .label(t.cancel_btn())
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.cancel_tab_connect_op(tab_idx, cx);
+                    })),
+            )
+            .into_any_element()
+    } else {
+        Button::new("authorize-gdrive-btn")
+            .xsmall()
+            .primary()
+            .icon(IconName::ExternalLink)
+            .label(t.oauth_browser_btn())
+            .on_click(cx.listener(move |this, _ev, window, cx| {
+                this.authorize_oauth_in_browser(tab_idx, window, cx);
+            }))
+            .into_any_element()
+    };
+
     let oauth_banner = h_flex()
         .w_full()
         .p_2p5()
@@ -948,7 +1064,11 @@ fn render_gdrive_form_card(
         .rounded(px(8.0))
         .bg(bg_elevated())
         .border_1()
-        .border_color(border_subtle())
+        .border_color(if is_oauth_pending {
+            accent_blue()
+        } else {
+            border_subtle()
+        })
         .justify_between()
         .items_center()
         .child(
@@ -958,16 +1078,32 @@ fn render_gdrive_form_card(
                 .text_color(text_secondary())
                 .child(t.label_oauth_refresh_token()),
         )
+        .child(oauth_actions)
+        .into_any_element();
+
+    let row_token_dir = h_flex()
+        .gap_3()
         .child(
-            Button::new("authorize-gdrive-btn")
-                .xsmall()
-                .primary()
-                .icon(IconName::ExternalLink)
-                .loading(is_connecting)
-                .label(t.oauth_browser_btn())
-                .on_click(cx.listener(move |this, _ev, window, cx| {
-                    this.authorize_oauth_in_browser(tab_idx, window, cx);
-                })),
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_oauth_refresh_token()))
+                .child(Input::new(&form.secret_input).small().mask_toggle()),
+        )
+        .child(
+            v_flex()
+                .w(px(160.0))
+                .gap_1()
+                .child(field_label(t.label_initial_remote_dir()))
+                .child(
+                    Input::new(&form.initial_path_input)
+                        .small()
+                        .prefix(
+                            Icon::new(IconName::FolderOpen)
+                                .xsmall()
+                                .text_color(text_muted()),
+                        ),
+                ),
         )
         .into_any_element();
 
@@ -983,6 +1119,139 @@ fn render_gdrive_form_card(
         )
         .into_any_element();
 
+    v_flex()
+        .w_full()
+        .p_3p5()
+        .gap_3()
+        .rounded(px(8.0))
+        .bg(bg_canvas())
+        .border_1()
+        .border_color(border_subtle())
+        .child(setup_hint)
+        .child(row_custom_client)
+        .child(oauth_banner)
+        .child(row_token_dir)
+        .child(row_proxy)
+        .into_any_element()
+}
+
+fn render_onedrive_form_card(
+    tab_idx: usize,
+    form: &ConnectionFormInputs,
+    pending_op: Option<PendingConnOp>,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
+    let t = i18n();
+    let is_oauth_pending = pending_op == Some(PendingConnOp::OAuth);
+    let has_default = has_default_onedrive_oauth_credentials();
+
+    let setup_hint = h_flex()
+        .w_full()
+        .p_2p5()
+        .gap_2()
+        .rounded(px(8.0))
+        .bg(bg_panel())
+        .border_1()
+        .border_color(border_subtle())
+        .items_start()
+        .child(
+            Icon::new(IconName::Lock)
+                .xsmall()
+                .text_color(accent_blue()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(text_muted())
+                .child(t.oauth_onedrive_setup_guide_with_default(has_default)),
+        )
+        .into_any_element();
+
+    let row_custom_client = h_flex()
+        .gap_3()
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_oauth_client_id_with_default(has_default)))
+                .child(
+                    Input::new(&form.onedrive_client_id_input)
+                        .small()
+                        .prefix(Icon::new(IconName::Key).xsmall().text_color(text_muted()))
+                        .cleanable(true),
+                ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(field_label(t.label_oauth_client_secret()))
+                .child(Input::new(&form.onedrive_client_secret_input).small().mask_toggle()),
+        )
+        .into_any_element();
+
+    let oauth_actions = if is_oauth_pending {
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(
+                Button::new("retry-onedrive-oauth-btn")
+                    .xsmall()
+                    .secondary()
+                    .icon(IconName::RefreshCw)
+                    .label(t.oauth_retry_btn())
+                    .on_click(cx.listener(move |this, _ev, window, cx| {
+                        this.authorize_oauth_in_browser(tab_idx, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("cancel-onedrive-oauth-btn")
+                    .xsmall()
+                    .danger()
+                    .icon(IconName::X)
+                    .label(t.cancel_btn())
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.cancel_tab_connect_op(tab_idx, cx);
+                    })),
+            )
+            .into_any_element()
+    } else {
+        Button::new("authorize-onedrive-btn")
+            .xsmall()
+            .primary()
+            .icon(IconName::ExternalLink)
+            .label(t.oauth_browser_btn())
+            .on_click(cx.listener(move |this, _ev, window, cx| {
+                this.authorize_oauth_in_browser(tab_idx, window, cx);
+            }))
+            .into_any_element()
+    };
+
+    let oauth_banner = h_flex()
+        .w_full()
+        .p_2p5()
+        .gap_3()
+        .rounded(px(8.0))
+        .bg(bg_elevated())
+        .border_1()
+        .border_color(if is_oauth_pending {
+            accent_blue()
+        } else {
+            border_subtle()
+        })
+        .justify_between()
+        .items_center()
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(text_secondary())
+                .child(t.label_oauth_refresh_token()),
+        )
+        .child(oauth_actions)
+        .into_any_element();
+
     let row_token_dir = h_flex()
         .gap_3()
         .child(
@@ -1006,81 +1275,6 @@ fn render_gdrive_form_card(
                                 .text_color(text_muted()),
                         ),
                 ),
-        )
-        .into_any_element();
-
-    let row_custom_client = h_flex()
-        .gap_3()
-        .child(
-            v_flex()
-                .flex_1()
-                .gap_1()
-                .child(field_label(t.label_oauth_client_id()))
-                .child(
-                    Input::new(&form.gdrive_client_id_input)
-                        .small()
-                        .prefix(Icon::new(IconName::Key).xsmall().text_color(text_muted()))
-                        .cleanable(true),
-                ),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .gap_1()
-                .child(field_label(t.label_oauth_client_secret()))
-                .child(Input::new(&form.gdrive_client_secret_input).small().mask_toggle()),
-        )
-        .into_any_element();
-
-    v_flex()
-        .w_full()
-        .p_3p5()
-        .gap_3()
-        .rounded(px(8.0))
-        .bg(bg_canvas())
-        .border_1()
-        .border_color(border_subtle())
-        .child(oauth_banner)
-        .child(row_proxy)
-        .child(row_token_dir)
-        .child(row_custom_client)
-        .into_any_element()
-}
-
-fn render_onedrive_form_card(
-    tab_idx: usize,
-    form: &ConnectionFormInputs,
-    is_connecting: bool,
-    cx: &mut Context<RustduckWorkspace>,
-) -> AnyElement {
-    let t = i18n();
-    let oauth_banner = h_flex()
-        .w_full()
-        .p_2p5()
-        .gap_3()
-        .rounded(px(8.0))
-        .bg(bg_elevated())
-        .border_1()
-        .border_color(border_subtle())
-        .justify_between()
-        .items_center()
-        .child(
-            div()
-                .flex_1()
-                .text_xs()
-                .text_color(text_secondary())
-                .child(t.label_oauth_refresh_token()),
-        )
-        .child(
-            Button::new("authorize-onedrive-btn")
-                .xsmall()
-                .primary()
-                .icon(IconName::ExternalLink)
-                .loading(is_connecting)
-                .label(t.oauth_browser_btn())
-                .on_click(cx.listener(move |this, _ev, window, cx| {
-                    this.authorize_oauth_in_browser(tab_idx, window, cx);
-                })),
         )
         .into_any_element();
 
@@ -1096,44 +1290,6 @@ fn render_onedrive_form_card(
         )
         .into_any_element();
 
-    let row_token_dir = h_flex()
-        .gap_3()
-        .child(
-            v_flex()
-                .flex_1()
-                .gap_1()
-                .child(field_label(t.label_oauth_refresh_token()))
-                .child(Input::new(&form.secret_input).small().mask_toggle()),
-        )
-        .child(
-            v_flex()
-                .w(px(160.0))
-                .gap_1()
-                .child(field_label(t.label_initial_remote_dir()))
-                .child(
-                    Input::new(&form.initial_path_input)
-                        .small()
-                        .prefix(
-                            Icon::new(IconName::FolderOpen)
-                                .xsmall()
-                                .text_color(text_muted()),
-                        ),
-                ),
-        )
-        .into_any_element();
-
-    let row_custom_client = v_flex()
-        .w_full()
-        .gap_1()
-        .child(field_label(t.label_oauth_client_id()))
-        .child(
-            Input::new(&form.onedrive_client_id_input)
-                .small()
-                .prefix(Icon::new(IconName::Key).xsmall().text_color(text_muted()))
-                .cleanable(true),
-        )
-        .into_any_element();
-
     v_flex()
         .w_full()
         .p_3p5()
@@ -1142,10 +1298,11 @@ fn render_onedrive_form_card(
         .bg(bg_canvas())
         .border_1()
         .border_color(border_subtle())
-        .child(oauth_banner)
-        .child(row_proxy)
-        .child(row_token_dir)
+        .child(setup_hint)
         .child(row_custom_client)
+        .child(oauth_banner)
+        .child(row_token_dir)
+        .child(row_proxy)
         .into_any_element()
 }
 
@@ -1445,10 +1602,13 @@ fn render_smb_form_card(form: &ConnectionFormInputs) -> AnyElement {
 
 fn render_inspector_footer(
     tab_idx: usize,
-    is_connecting: bool,
+    pending_op: Option<PendingConnOp>,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
+    let is_testing = pending_op == Some(PendingConnOp::Test);
+    let is_connecting_server = pending_op == Some(PendingConnOp::Connect);
+
     h_flex()
         .w_full()
         .h(px(54.0))
@@ -1466,7 +1626,7 @@ fn render_inspector_footer(
                         .small()
                         .secondary()
                         .icon(IconName::CircleCheck)
-                        .loading(is_connecting)
+                        .loading(is_testing)
                         .label(t.test_conn_btn())
                         .on_click(cx.listener(move |this, _ev, window, cx| {
                             this.test_connection_tab(tab_idx, window, cx);
@@ -1484,15 +1644,32 @@ fn render_inspector_footer(
                 ),
         )
         .child(
-            Button::new("connect-now-btn")
-                .small()
-                .primary()
-                .icon(IconName::Play)
-                .loading(is_connecting)
-                .label(t.connect_now_btn(is_connecting))
-                .on_click(cx.listener(move |this, _ev, window, cx| {
-                    this.connect_tab(tab_idx, window, cx);
-                })),
+            h_flex()
+                .gap_2()
+                .items_center()
+                .when(pending_op.is_some(), |row| {
+                    row.child(
+                        Button::new("cancel-conn-footer-btn")
+                            .small()
+                            .danger()
+                            .icon(IconName::X)
+                            .label(t.cancel_connect_btn())
+                            .on_click(cx.listener(move |this, _ev, _window, cx| {
+                                this.cancel_tab_connect_op(tab_idx, cx);
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("connect-now-btn")
+                        .small()
+                        .primary()
+                        .icon(IconName::Play)
+                        .loading(is_connecting_server)
+                        .label(t.connect_now_btn(is_connecting_server))
+                        .on_click(cx.listener(move |this, _ev, window, cx| {
+                            this.connect_tab(tab_idx, window, cx);
+                        })),
+                ),
         )
         .into_any_element()
 }

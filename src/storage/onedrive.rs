@@ -1,9 +1,11 @@
+use crate::i18n::i18n;
 use crate::models::{
     join_remote_path, normalize_remote_path, parent_remote_path, FileEntry, FileKind,
-    OneDriveConfig, DEFAULT_ONEDRIVE_CLIENT_ID,
+    OneDriveConfig,
 };
 use crate::storage::oauth::{
     authorize_via_browser_loopback, build_http_client, refresh_access_token,
+    resolve_oauth_credential,
 };
 use crate::storage::s3::encode_s3_key_path;
 use crate::storage::{ProgressCallback, StorageBackend};
@@ -40,13 +42,33 @@ struct OneDriveItem {
     folder: Option<serde_json::Value>,
 }
 
-pub fn effective_onedrive_client_id(config: &OneDriveConfig) -> &str {
-    let cid = config.client_id.trim();
-    if cid.is_empty() {
-        DEFAULT_ONEDRIVE_CLIENT_ID
-    } else {
-        cid
-    }
+pub fn effective_onedrive_client_id(config: &OneDriveConfig) -> Option<String> {
+    resolve_oauth_credential(
+        Some(&config.client_id),
+        "RUSTDUCK_ONEDRIVE_CLIENT_ID",
+        option_env!("RUSTDUCK_ONEDRIVE_CLIENT_ID"),
+    )
+}
+
+pub fn effective_onedrive_client_secret(config: &OneDriveConfig) -> Option<String> {
+    resolve_oauth_credential(
+        config.client_secret.as_deref(),
+        "RUSTDUCK_ONEDRIVE_CLIENT_SECRET",
+        option_env!("RUSTDUCK_ONEDRIVE_CLIENT_SECRET"),
+    )
+}
+
+pub fn validate_onedrive_oauth_config(
+    config: &OneDriveConfig,
+) -> anyhow::Result<(String, Option<String>)> {
+    let client_id = effective_onedrive_client_id(config)
+        .ok_or_else(|| anyhow!("{}", i18n().err_onedrive_client_id_missing()))?;
+    let client_secret = effective_onedrive_client_secret(config);
+    Ok((client_id, client_secret))
+}
+
+pub fn has_default_onedrive_oauth_credentials() -> bool {
+    validate_onedrive_oauth_config(&OneDriveConfig::default()).is_ok()
 }
 
 pub fn build_onedrive_item_url(remote_path: &str, suffix: &str) -> String {
@@ -101,17 +123,21 @@ pub fn parse_onedrive_children_json(
     Ok(entries)
 }
 
-pub async fn authorize_onedrive_in_browser(config: &OneDriveConfig) -> anyhow::Result<String> {
+pub async fn authorize_onedrive_in_browser(
+    config: &OneDriveConfig,
+    cancel: CancellationToken,
+) -> anyhow::Result<String> {
+    let (client_id, client_secret) = validate_onedrive_oauth_config(config)?;
     let client = build_http_client(config.proxy_url.as_deref())?;
-    let client_id = effective_onedrive_client_id(config);
     let token_res = authorize_via_browser_loopback(
         &client,
         ONEDRIVE_AUTH_URL,
         ONEDRIVE_TOKEN_URL,
-        client_id,
-        None,
+        &client_id,
+        client_secret.as_deref(),
         ONEDRIVE_SCOPE,
         &[("prompt", "select_account")],
+        cancel,
     )
     .await?;
 
@@ -135,8 +161,11 @@ pub struct OneDriveBackend {
 
 impl OneDriveBackend {
     pub fn new(config: OneDriveConfig, secret: String) -> anyhow::Result<Self> {
-        let client = build_http_client(config.proxy_url.as_deref())?;
         let initial_rt = secret.trim().to_string();
+        if initial_rt.is_empty() {
+            return Err(anyhow!("{}", i18n().err_oauth_token_empty("OneDrive")));
+        }
+        let client = build_http_client(config.proxy_url.as_deref())?;
         Ok(Self {
             config,
             client,
@@ -144,9 +173,7 @@ impl OneDriveBackend {
                 access_token: None,
                 refresh_token: initial_rt.clone(),
             }),
-            latest_refresh_token: RwLock::new(
-                (!initial_rt.is_empty()).then_some(initial_rt),
-            ),
+            latest_refresh_token: RwLock::new(Some(initial_rt)),
         })
     }
 
@@ -156,42 +183,21 @@ impl OneDriveBackend {
             return Ok(tok.clone());
         }
 
-        let client_id = effective_onedrive_client_id(&self.config);
         if guard.refresh_token.trim().is_empty() {
-            let token_res = authorize_via_browser_loopback(
-                &self.client,
-                ONEDRIVE_AUTH_URL,
-                ONEDRIVE_TOKEN_URL,
-                client_id,
-                None,
-                ONEDRIVE_SCOPE,
-                &[("prompt", "select_account")],
-            )
-            .await?;
-
-            let access = token_res.access_token.clone();
-            let refresh = token_res
-                .refresh_token
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| access.clone());
-            guard.access_token = Some(access.clone());
-            guard.refresh_token = refresh.clone();
-            if let Ok(mut w) = self.latest_refresh_token.write() {
-                *w = Some(refresh);
-            }
-            return Ok(access);
+            return Err(anyhow!("{}", i18n().err_oauth_token_empty("OneDrive")));
         }
 
-        match refresh_access_token(
-            &self.client,
-            ONEDRIVE_TOKEN_URL,
-            client_id,
-            None,
-            &guard.refresh_token,
-        )
-        .await
-        {
-            Ok(refreshed) => {
+        if let Some(client_id) = effective_onedrive_client_id(&self.config) {
+            let client_secret = effective_onedrive_client_secret(&self.config);
+            if let Ok(refreshed) = refresh_access_token(
+                &self.client,
+                ONEDRIVE_TOKEN_URL,
+                &client_id,
+                client_secret.as_deref(),
+                &guard.refresh_token,
+            )
+            .await
+            {
                 let access = refreshed.access_token;
                 if let Some(new_rt) = refreshed.refresh_token.filter(|s| !s.trim().is_empty()) {
                     guard.refresh_token = new_rt.clone();
@@ -200,14 +206,13 @@ impl OneDriveBackend {
                     }
                 }
                 guard.access_token = Some(access.clone());
-                Ok(access)
-            }
-            Err(_) => {
-                let direct = guard.refresh_token.trim().to_string();
-                guard.access_token = Some(direct.clone());
-                Ok(direct)
+                return Ok(access);
             }
         }
+
+        let direct = guard.refresh_token.trim().to_string();
+        guard.access_token = Some(direct.clone());
+        Ok(direct)
     }
 }
 
@@ -510,5 +515,39 @@ mod tests {
         assert_eq!(items[1].path, "/Work/budget.xlsx");
         assert_eq!(items[1].size, 65536);
         assert_eq!(items[1].kind, FileKind::File);
+    }
+
+    #[tokio::test]
+    async fn test_onedrive_oauth_and_backend_validation_rejects_missing_credentials_without_hanging() {
+        let mut cfg = OneDriveConfig::default();
+        if std::env::var("RUSTDUCK_ONEDRIVE_CLIENT_ID")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            assert_eq!(effective_onedrive_client_id(&cfg), None);
+            let err = authorize_onedrive_in_browser(&cfg, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("Client ID"),
+                "Expected missing Client ID validation error, got: {err}"
+            );
+        }
+
+        cfg.client_id = "  00000000-1111-2222-3333-444444444444  ".to_string();
+        cfg.client_secret = Some("  od-secret-val  ".to_string());
+        assert_eq!(
+            effective_onedrive_client_id(&cfg).as_deref(),
+            Some("00000000-1111-2222-3333-444444444444")
+        );
+        assert_eq!(
+            effective_onedrive_client_secret(&cfg).as_deref(),
+            Some("od-secret-val")
+        );
+
+        // Empty Refresh Token must fail fast on OneDriveBackend::new instead of silently launching browser on Connect
+        let empty_token_res = OneDriveBackend::new(OneDriveConfig::default(), "".to_string());
+        assert!(empty_token_res.is_err());
     }
 }

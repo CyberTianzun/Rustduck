@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const DEFAULT_GDRIVE_CLIENT_ID: &str = "407408718192.apps.googleusercontent.com";
-pub const DEFAULT_ONEDRIVE_CLIENT_ID: &str = "b15665d9-eda6-4092-8539-0eec376afd59";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtocolKind {
     Sftp,
@@ -229,6 +226,8 @@ pub struct OneDriveConfig {
     #[serde(default)]
     pub client_id: String,
     #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
     pub proxy_url: Option<String>,
     pub initial_path: String,
 }
@@ -237,6 +236,7 @@ impl Default for OneDriveConfig {
     fn default() -> Self {
         Self {
             client_id: String::new(),
+            client_secret: None,
             proxy_url: None,
             initial_path: "/".to_string(),
         }
@@ -513,6 +513,7 @@ mod tests {
 
         let onedrive = ProtocolConfig::OneDrive(OneDriveConfig {
             client_id: "od-client-id".to_string(),
+            client_secret: Some("od-secret".to_string()),
             proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
             initial_path: "/Backups".to_string(),
         });
@@ -520,6 +521,19 @@ mod tests {
         assert!(onedrive.summary().contains("OneDrive"));
         assert!(onedrive.summary().contains("127.0.0.1:1080"));
         assert_eq!(onedrive.initial_path(), "/Backups");
+
+        let legacy_onedrive_json =
+            r#"{"protocol":"one_drive","client_id":"legacy-od","initial_path":"/Docs"}"#;
+        let legacy_parsed: ProtocolConfig = serde_json::from_str(legacy_onedrive_json).unwrap();
+        assert_eq!(
+            legacy_parsed,
+            ProtocolConfig::OneDrive(OneDriveConfig {
+                client_id: "legacy-od".to_string(),
+                client_secret: None,
+                proxy_url: None,
+                initial_path: "/Docs".to_string(),
+            })
+        );
 
         let json = serde_json::to_string(&gdrive).unwrap();
         let roundtrip: ProtocolConfig = serde_json::from_str(&json).unwrap();

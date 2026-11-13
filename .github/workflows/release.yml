@@ -94,6 +94,11 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build desktop GUI client
+        env:
+          RUSTDUCK_GDRIVE_CLIENT_ID: ${{ secrets.RUSTDUCK_GDRIVE_CLIENT_ID || vars.RUSTDUCK_GDRIVE_CLIENT_ID }}
+          RUSTDUCK_GDRIVE_CLIENT_SECRET: ${{ secrets.RUSTDUCK_GDRIVE_CLIENT_SECRET || vars.RUSTDUCK_GDRIVE_CLIENT_SECRET }}
+          RUSTDUCK_ONEDRIVE_CLIENT_ID: ${{ secrets.RUSTDUCK_ONEDRIVE_CLIENT_ID || vars.RUSTDUCK_ONEDRIVE_CLIENT_ID }}
+          RUSTDUCK_ONEDRIVE_CLIENT_SECRET: ${{ secrets.RUSTDUCK_ONEDRIVE_CLIENT_SECRET || vars.RUSTDUCK_ONEDRIVE_CLIENT_SECRET }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Bundle desktop (macOS)

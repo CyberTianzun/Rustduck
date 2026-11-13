@@ -1636,33 +1636,209 @@ impl I18n {
 
     pub fn label_oauth_client_id(&self) -> &'static str {
         if self.is_zh() {
-            "OAuth Client ID (选填，留空使用内置桌面端 Client ID)"
+            "OAuth Client ID (必填，或配置环境变量)"
         } else {
-            "OAuth Client ID (Optional, leave empty for built-in default)"
+            "OAuth Client ID (Required, or set via env var)"
+        }
+    }
+
+    pub fn label_oauth_client_id_with_default(&self, has_default: bool) -> &'static str {
+        if has_default {
+            if self.is_zh() {
+                "OAuth Client ID (选填，留空使用内置默认)"
+            } else {
+                "OAuth Client ID (Optional, leave blank for built-in)"
+            }
+        } else {
+            self.label_oauth_client_id()
         }
     }
 
     pub fn placeholder_oauth_client_id(&self) -> &'static str {
         if self.is_zh() {
-            "选填: 自定义 OAuth Client ID"
+            "填入自建桌面端 OAuth Client ID"
         } else {
-            "Optional: Custom OAuth Client ID"
+            "Enter your Desktop OAuth Client ID"
+        }
+    }
+
+    pub fn placeholder_oauth_client_id_with_default(&self, has_default: bool) -> &'static str {
+        if has_default {
+            if self.is_zh() {
+                "留空使用内置默认，或填入自建桌面端 Client ID"
+            } else {
+                "Leave blank for built-in default, or enter custom Client ID"
+            }
+        } else {
+            self.placeholder_oauth_client_id()
+        }
+    }
+
+    pub fn label_gdrive_client_secret(&self) -> &'static str {
+        if self.is_zh() {
+            "OAuth Client Secret (Google 桌面端必填)"
+        } else {
+            "OAuth Client Secret (Required for Google Desktop app)"
+        }
+    }
+
+    pub fn label_gdrive_client_secret_with_default(&self, has_default: bool) -> &'static str {
+        if has_default {
+            if self.is_zh() {
+                "OAuth Client Secret (选填，留空使用内置默认)"
+            } else {
+                "OAuth Client Secret (Optional, leave blank for built-in)"
+            }
+        } else {
+            self.label_gdrive_client_secret()
+        }
+    }
+
+    pub fn placeholder_gdrive_client_secret(&self) -> &'static str {
+        if self.is_zh() {
+            "填入 Google OAuth Client Secret (如 GOCSPX-...)"
+        } else {
+            "Enter Google OAuth Client Secret (e.g. GOCSPX-...)"
+        }
+    }
+
+    pub fn placeholder_gdrive_client_secret_with_default(&self, has_default: bool) -> &'static str {
+        if has_default {
+            if self.is_zh() {
+                "留空使用内置默认，或填入自建 Client Secret"
+            } else {
+                "Leave blank for built-in default, or enter custom Client Secret"
+            }
+        } else {
+            self.placeholder_gdrive_client_secret()
         }
     }
 
     pub fn label_oauth_client_secret(&self) -> &'static str {
         if self.is_zh() {
-            "OAuth Client Secret (选填)"
+            "OAuth Client Secret (公共客户端留空，机密客户端选填)"
         } else {
-            "OAuth Client Secret (Optional)"
+            "OAuth Client Secret (Optional for public client)"
         }
     }
 
     pub fn placeholder_oauth_client_secret(&self) -> &'static str {
         if self.is_zh() {
-            "选填: 自定义 Client Secret"
+            "选填: 机密客户端 Client Secret"
         } else {
-            "Optional: Custom Client Secret"
+            "Optional: Confidential Client Secret"
+        }
+    }
+
+    pub fn oauth_gdrive_setup_guide(&self) -> &'static str {
+        if self.is_zh() {
+            "配置指引: 前往 Google Cloud Console 启用 Google Drive API → 创建「桌面应用 (Desktop app)」类型的 OAuth 客户端，在下方填入生成的 Client ID 与 Client Secret 后点击浏览器登录授权（本地回调 http://127.0.0.1）。"
+        } else {
+            "Setup Guide: In Google Cloud Console, enable Google Drive API → create an OAuth Client ID of type \"Desktop app\", enter both Client ID and Client Secret below, then click Authorize in Browser (loopback http://127.0.0.1)."
+        }
+    }
+
+    pub fn oauth_gdrive_setup_guide_with_default(&self, has_default: bool) -> &'static str {
+        if has_default {
+            if self.is_zh() {
+                "已内置默认 OAuth 客户端凭证：可直接点击下方「浏览器登录授权」完成登录；如需使用自建 Google 桌面端 OAuth 应用，也可在下方填入覆盖默认配置。"
+            } else {
+                "Built-in OAuth credentials ready: click \"Authorize in Browser\" below to sign in directly, or enter your own Google Desktop OAuth Client ID & Secret to override."
+            }
+        } else {
+            self.oauth_gdrive_setup_guide()
+        }
+    }
+
+    pub fn oauth_onedrive_setup_guide(&self) -> &'static str {
+        if self.is_zh() {
+            "配置指引: 前往 Microsoft Entra ID (应用注册) 创建应用 → 身份验证平台添加「移动和桌面应用程序」并填写重定向 URI http://127.0.0.1，启用公共客户端流，在下方填入 Application (client) ID 后点击授权。"
+        } else {
+            "Setup Guide: In Microsoft Entra ID (App registrations), register an app → Authentication → add \"Mobile and desktop applications\" with redirect URI http://127.0.0.1, enable public client flows, and enter the Application (client) ID below."
+        }
+    }
+
+    pub fn oauth_onedrive_setup_guide_with_default(&self, has_default: bool) -> &'static str {
+        if has_default {
+            if self.is_zh() {
+                "已内置默认 OAuth 客户端凭证：可直接点击下方「浏览器登录授权」完成登录；如需使用自建 Microsoft Entra ID 桌面应用，也可在下方填入覆盖默认配置。"
+            } else {
+                "Built-in OAuth credentials ready: click \"Authorize in Browser\" below to sign in directly, or enter your own Microsoft Entra ID Client ID to override."
+            }
+        } else {
+            self.oauth_onedrive_setup_guide()
+        }
+    }
+
+    pub fn err_gdrive_client_id_missing(&self) -> &'static str {
+        if self.is_zh() {
+            "缺少 Google Drive OAuth Client ID：请先在 Google Cloud Console 创建「桌面应用 (Desktop app)」OAuth 客户端并在下方填入 Client ID（或配置环境变量 RUSTDUCK_GDRIVE_CLIENT_ID）"
+        } else {
+            "Missing Google Drive OAuth Client ID: create a \"Desktop app\" OAuth client in Google Cloud Console and enter its Client ID below (or set RUSTDUCK_GDRIVE_CLIENT_ID)"
+        }
+    }
+
+    pub fn err_gdrive_client_secret_missing(&self) -> &'static str {
+        if self.is_zh() {
+            "缺少 Google Drive OAuth Client Secret：Google 桌面端令牌交换要求同时提供 Client Secret，请在下方填入（或配置环境变量 RUSTDUCK_GDRIVE_CLIENT_SECRET）"
+        } else {
+            "Missing Google Drive OAuth Client Secret: Google's token endpoint requires Client Secret even for Desktop apps — enter it below (or set RUSTDUCK_GDRIVE_CLIENT_SECRET)"
+        }
+    }
+
+    pub fn err_onedrive_client_id_missing(&self) -> &'static str {
+        if self.is_zh() {
+            "缺少 OneDrive OAuth Client ID：请先在 Microsoft Entra ID 注册「移动和桌面应用程序」（重定向 URI: http://127.0.0.1）并在下方填入 Application (client) ID（或配置环境变量 RUSTDUCK_ONEDRIVE_CLIENT_ID）"
+        } else {
+            "Missing OneDrive OAuth Client ID: register a \"Mobile and desktop applications\" client in Microsoft Entra ID (redirect URI: http://127.0.0.1) and enter its Application (client) ID below (or set RUSTDUCK_ONEDRIVE_CLIENT_ID)"
+        }
+    }
+
+    pub fn err_oauth_token_empty(&self, provider: &str) -> String {
+        if self.is_zh() {
+            format!("缺少 {provider} 授权凭证 (Refresh Token)：请先点击上方「浏览器登录授权」完成账号授权，或手动粘贴有效 Token")
+        } else {
+            format!("Missing {provider} OAuth Refresh Token: click \"Authorize in Browser\" above first, or paste a valid token")
+        }
+    }
+
+    pub fn cancel_connect_btn(&self) -> &'static str {
+        if self.is_zh() {
+            "取消连接"
+        } else {
+            "Cancel"
+        }
+    }
+
+    pub fn oauth_retry_btn(&self) -> &'static str {
+        if self.is_zh() {
+            "重新授权"
+        } else {
+            "Retry OAuth"
+        }
+    }
+
+    pub fn msg_conn_cancelled(&self) -> String {
+        if self.is_zh() {
+            "已取消当前连接尝试".to_string()
+        } else {
+            "Connection attempt cancelled".to_string()
+        }
+    }
+
+    pub fn msg_test_cancelled(&self) -> String {
+        if self.is_zh() {
+            "已取消连接测试".to_string()
+        } else {
+            "Connection test cancelled".to_string()
+        }
+    }
+
+    pub fn msg_oauth_cancelled(&self) -> String {
+        if self.is_zh() {
+            "已取消浏览器授权等待（可随时修改参数后重新点击授权）".to_string()
+        } else {
+            "Browser authorization cancelled (you can edit settings and retry anytime)".to_string()
         }
     }
 
@@ -1790,5 +1966,23 @@ mod tests {
             en.pane_footer_multi_selection(3, Some("a.txt")),
             "3 selected (a.txt, ...)"
         );
+    }
+
+    #[test]
+    fn test_oauth_setup_guides_and_connection_cancel_i18n() {
+        let zh = I18n::new(AppLanguage::ZhCn);
+        let en = I18n::new(AppLanguage::EnUs);
+
+        assert!(zh.oauth_gdrive_setup_guide().contains("127.0.0.1"));
+        assert!(en.oauth_gdrive_setup_guide().contains("127.0.0.1"));
+        assert!(zh.oauth_onedrive_setup_guide().contains("127.0.0.1"));
+        assert!(en.oauth_onedrive_setup_guide().contains("127.0.0.1"));
+        assert!(zh.err_gdrive_client_id_missing().contains("Client ID"));
+        assert!(en.err_gdrive_client_secret_missing().contains("Client Secret"));
+        assert!(zh.err_onedrive_client_id_missing().contains("Client ID"));
+        assert_eq!(zh.cancel_connect_btn(), "取消连接");
+        assert_eq!(en.cancel_connect_btn(), "Cancel");
+        assert_eq!(zh.oauth_retry_btn(), "重新授权");
+        assert_eq!(en.oauth_retry_btn(), "Retry OAuth");
     }
 }

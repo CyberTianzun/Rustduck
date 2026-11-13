@@ -494,6 +494,7 @@ impl S3Backend {
         }
         let client = Client::builder()
             .user_agent("Rustduck/0.1.0")
+            .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .context("Failed to initialize S3 HTTP client")?;
         Ok(Self {
