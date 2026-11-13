@@ -2,8 +2,44 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 static ACTIVE_S3_UPLOAD_ACL: AtomicU8 = AtomicU8::new(0);
+static ACTIVE_GLOBAL_PROXY: OnceLock<RwLock<(GlobalProxyMode, Option<String>)>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GlobalProxyMode {
+    #[default]
+    System,
+    Direct,
+    Custom,
+}
+
+impl GlobalProxyMode {
+    pub const ALL: [GlobalProxyMode; 3] = [Self::System, Self::Direct, Self::Custom];
+}
+
+fn global_proxy_cell() -> &'static RwLock<(GlobalProxyMode, Option<String>)> {
+    ACTIVE_GLOBAL_PROXY.get_or_init(|| RwLock::new((GlobalProxyMode::System, None)))
+}
+
+pub fn set_current_global_proxy_config(mode: GlobalProxyMode, raw_url: Option<&str>) {
+    let cleaned = raw_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    if let Ok(mut guard) = global_proxy_cell().write() {
+        *guard = (mode, cleaned);
+    }
+}
+
+pub fn current_global_proxy_config() -> (GlobalProxyMode, Option<String>) {
+    global_proxy_cell()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or((GlobalProxyMode::System, None))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -207,6 +243,10 @@ pub struct AppPreferences {
     pub custom_local_dir: String,
     #[serde(default)]
     pub last_local_dir: Option<String>,
+    #[serde(default)]
+    pub global_proxy_mode: GlobalProxyMode,
+    #[serde(default)]
+    pub global_proxy_url: String,
 }
 
 impl AppPreferences {
@@ -219,6 +259,8 @@ impl AppPreferences {
             local_startup_mode: LocalStartupDirMode::RememberLast,
             custom_local_dir: crate::storage::local::LocalFileSystem::initial_local_dir(),
             last_local_dir: None,
+            global_proxy_mode: GlobalProxyMode::System,
+            global_proxy_url: String::new(),
         }
     }
 }
@@ -248,12 +290,17 @@ impl PreferencesStore {
                         crate::storage::local::LocalFileSystem::initial_local_dir();
                 }
                 set_current_s3_upload_acl(prefs.s3_default_acl);
+                set_current_global_proxy_config(
+                    prefs.global_proxy_mode,
+                    Some(&prefs.global_proxy_url),
+                );
                 return Ok(Self { path, prefs });
             }
         }
 
         let prefs = AppPreferences::system_defaults();
         set_current_s3_upload_acl(prefs.s3_default_acl);
+        set_current_global_proxy_config(prefs.global_proxy_mode, Some(&prefs.global_proxy_url));
         let store = Self { path, prefs };
         let _ = store.save();
         Ok(store)
@@ -291,6 +338,24 @@ impl PreferencesStore {
     pub fn set_s3_default_acl(&mut self, acl: S3UploadAcl) -> anyhow::Result<()> {
         self.prefs.s3_default_acl = acl;
         set_current_s3_upload_acl(acl);
+        self.save()
+    }
+
+    pub fn set_global_proxy_mode(&mut self, mode: GlobalProxyMode) -> anyhow::Result<()> {
+        self.prefs.global_proxy_mode = mode;
+        set_current_global_proxy_config(
+            self.prefs.global_proxy_mode,
+            Some(&self.prefs.global_proxy_url),
+        );
+        self.save()
+    }
+
+    pub fn set_global_proxy_url(&mut self, url: String) -> anyhow::Result<()> {
+        self.prefs.global_proxy_url = url.trim().to_string();
+        set_current_global_proxy_config(
+            self.prefs.global_proxy_mode,
+            Some(&self.prefs.global_proxy_url),
+        );
         self.save()
     }
 
@@ -494,11 +559,35 @@ mod tests {
             .map(|m| m.is_dir())
             .unwrap_or(false));
 
-        let reloaded = PreferencesStore::load_or_init(pref_path).unwrap();
+        let reloaded = PreferencesStore::load_or_init(pref_path.clone()).unwrap();
         assert_eq!(reloaded.preferences().s3_default_acl, S3UploadAcl::PublicRead);
         assert_eq!(
             reloaded.preferences().local_startup_mode,
             LocalStartupDirMode::Custom
         );
+        assert_eq!(
+            reloaded.preferences().global_proxy_mode,
+            GlobalProxyMode::System
+        );
+
+        let mut store2 = reloaded;
+        store2
+            .set_global_proxy_mode(GlobalProxyMode::Custom)
+            .unwrap();
+        store2
+            .set_global_proxy_url("  127.0.0.1:7890  ".to_string())
+            .unwrap();
+        assert_eq!(
+            current_global_proxy_config(),
+            (GlobalProxyMode::Custom, Some("127.0.0.1:7890".to_string()))
+        );
+        let reloaded2 = PreferencesStore::load_or_init(pref_path).unwrap();
+        assert_eq!(
+            reloaded2.preferences().global_proxy_mode,
+            GlobalProxyMode::Custom
+        );
+        assert_eq!(reloaded2.preferences().global_proxy_url, "127.0.0.1:7890");
+        // Reset global singleton back to System so parallel unit tests start clean
+        set_current_global_proxy_config(GlobalProxyMode::System, None);
     }
 }

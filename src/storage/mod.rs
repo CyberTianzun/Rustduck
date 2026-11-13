@@ -3,6 +3,7 @@ pub mod gdrive;
 pub mod local;
 pub mod oauth;
 pub mod onedrive;
+pub mod proxy;
 pub mod s3;
 pub mod sftp;
 pub mod smb;

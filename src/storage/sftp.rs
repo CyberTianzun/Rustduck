@@ -352,6 +352,7 @@ mod tests {
             username: "root".to_string(),
             private_key_path: None,
             initial_path: "/".to_string(),
+            ..SftpConfig::default()
         };
         let started = std::time::Instant::now();
         let res = connect_sftp_session_with_timeout(

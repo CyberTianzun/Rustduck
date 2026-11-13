@@ -89,6 +89,34 @@ impl S3Preset {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectionProxyMode {
+    #[default]
+    Default,
+    Direct,
+    Custom,
+}
+
+impl ConnectionProxyMode {
+    pub const ALL: [ConnectionProxyMode; 3] = [Self::Default, Self::Direct, Self::Custom];
+
+    /// Preserves backward compatibility for legacy bookmarks that saved `proxy_url` before
+    /// `proxy_mode` existed (`Default` + non-empty `proxy_url` => `Custom`).
+    pub fn effective_mode(self, raw_proxy_url: Option<&str>) -> Self {
+        match self {
+            Self::Default => {
+                if raw_proxy_url.map(str::trim).is_some_and(|s| !s.is_empty()) {
+                    Self::Custom
+                } else {
+                    Self::Default
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SftpConfig {
     pub host: String,
@@ -96,6 +124,10 @@ pub struct SftpConfig {
     pub username: String,
     pub private_key_path: Option<String>,
     pub initial_path: String,
+    #[serde(default)]
+    pub proxy_mode: ConnectionProxyMode,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl Default for SftpConfig {
@@ -106,6 +138,8 @@ impl Default for SftpConfig {
             username: "root".to_string(),
             private_key_path: None,
             initial_path: "/".to_string(),
+            proxy_mode: ConnectionProxyMode::Default,
+            proxy_url: None,
         }
     }
 }
@@ -118,6 +152,10 @@ pub struct FtpConfig {
     #[serde(default)]
     pub use_tls: bool,
     pub initial_path: String,
+    #[serde(default)]
+    pub proxy_mode: ConnectionProxyMode,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl Default for FtpConfig {
@@ -128,6 +166,8 @@ impl Default for FtpConfig {
             username: "anonymous".to_string(),
             use_tls: false,
             initial_path: "/".to_string(),
+            proxy_mode: ConnectionProxyMode::Default,
+            proxy_url: None,
         }
     }
 }
@@ -141,6 +181,10 @@ pub struct S3Config {
     pub bucket: Option<String>,
     pub initial_prefix: String,
     pub addressing_style: S3AddressingStyle,
+    #[serde(default)]
+    pub proxy_mode: ConnectionProxyMode,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl Default for S3Config {
@@ -155,6 +199,8 @@ impl Default for S3Config {
             bucket: None,
             initial_prefix: "/".to_string(),
             addressing_style: preset.default_addressing_style(),
+            proxy_mode: ConnectionProxyMode::Default,
+            proxy_url: None,
         }
     }
 }
@@ -187,6 +233,10 @@ pub struct WebDavConfig {
     pub endpoint: String,
     pub username: String,
     pub initial_path: String,
+    #[serde(default)]
+    pub proxy_mode: ConnectionProxyMode,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl Default for WebDavConfig {
@@ -195,6 +245,8 @@ impl Default for WebDavConfig {
             endpoint: "https://dav.example.com/remote.php/webdav".to_string(),
             username: String::new(),
             initial_path: "/".to_string(),
+            proxy_mode: ConnectionProxyMode::Default,
+            proxy_url: None,
         }
     }
 }
@@ -206,6 +258,8 @@ pub struct GoogleDriveConfig {
     #[serde(default)]
     pub client_secret: Option<String>,
     #[serde(default)]
+    pub proxy_mode: ConnectionProxyMode,
+    #[serde(default)]
     pub proxy_url: Option<String>,
     pub initial_path: String,
 }
@@ -215,6 +269,7 @@ impl Default for GoogleDriveConfig {
         Self {
             client_id: String::new(),
             client_secret: None,
+            proxy_mode: ConnectionProxyMode::Default,
             proxy_url: None,
             initial_path: "/".to_string(),
         }
@@ -228,6 +283,8 @@ pub struct OneDriveConfig {
     #[serde(default)]
     pub client_secret: Option<String>,
     #[serde(default)]
+    pub proxy_mode: ConnectionProxyMode,
+    #[serde(default)]
     pub proxy_url: Option<String>,
     pub initial_path: String,
 }
@@ -237,6 +294,7 @@ impl Default for OneDriveConfig {
         Self {
             client_id: String::new(),
             client_secret: None,
+            proxy_mode: ConnectionProxyMode::Default,
             proxy_url: None,
             initial_path: "/".to_string(),
         }
@@ -255,6 +313,18 @@ pub enum ProtocolConfig {
     OneDrive(OneDriveConfig),
 }
 
+fn format_proxy_badge(mode: ConnectionProxyMode, proxy_url: Option<&str>) -> String {
+    match mode.effective_mode(proxy_url) {
+        ConnectionProxyMode::Default => String::new(),
+        ConnectionProxyMode::Direct => " [Direct]".to_string(),
+        ConnectionProxyMode::Custom => proxy_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|p| format!(" [Proxy: {p}]"))
+            .unwrap_or_default(),
+    }
+}
+
 impl ProtocolConfig {
     pub fn kind(&self) -> ProtocolKind {
         match self {
@@ -270,17 +340,22 @@ impl ProtocolConfig {
 
     pub fn summary(&self) -> String {
         match self {
-            ProtocolConfig::Sftp(c) => format!("SFTP · {}@{}:{}", c.username, c.host, c.port),
+            ProtocolConfig::Sftp(c) => {
+                let badge = format_proxy_badge(c.proxy_mode, c.proxy_url.as_deref());
+                format!("SFTP · {}@{}:{}{badge}", c.username, c.host, c.port)
+            }
             ProtocolConfig::Ftp(c) => {
                 let tag = if c.use_tls { "FTPS" } else { "FTP" };
-                format!("{tag} · {}@{}:{}", c.username, c.host, c.port)
+                let badge = format_proxy_badge(c.proxy_mode, c.proxy_url.as_deref());
+                format!("{tag} · {}@{}:{}{badge}", c.username, c.host, c.port)
             }
             ProtocolConfig::S3(c) => {
                 let bkt = c
                     .bucket
                     .as_deref()
                     .unwrap_or_else(|| crate::i18n::i18n().s3_all_buckets_summary());
-                format!("S3 · {} ({})", c.endpoint, bkt)
+                let badge = format_proxy_badge(c.proxy_mode, c.proxy_url.as_deref());
+                format!("S3 · {} ({}){badge}", c.endpoint, bkt)
             }
             ProtocolConfig::Smb(c) => format!("SMB · //{}/{}", c.server, c.share),
             ProtocolConfig::WebDav(c) => {
@@ -289,27 +364,22 @@ impl ProtocolConfig {
                 } else {
                     c.username.trim()
                 };
-                format!("WebDAV · {} ({usr})", c.endpoint)
+                let badge = format_proxy_badge(c.proxy_mode, c.proxy_url.as_deref());
+                format!("WebDAV · {} ({usr}){badge}", c.endpoint)
             }
             ProtocolConfig::GoogleDrive(c) => {
-                let proxy = c
-                    .proxy_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|p| format!(" [Proxy: {p}]"))
-                    .unwrap_or_default();
-                format!("Google Drive · {}{proxy}", normalize_remote_path(&c.initial_path))
+                let badge = format_proxy_badge(c.proxy_mode, c.proxy_url.as_deref());
+                format!(
+                    "Google Drive · {}{badge}",
+                    normalize_remote_path(&c.initial_path)
+                )
             }
             ProtocolConfig::OneDrive(c) => {
-                let proxy = c
-                    .proxy_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|p| format!(" [Proxy: {p}]"))
-                    .unwrap_or_default();
-                format!("OneDrive · {}{proxy}", normalize_remote_path(&c.initial_path))
+                let badge = format_proxy_badge(c.proxy_mode, c.proxy_url.as_deref());
+                format!(
+                    "OneDrive · {}{badge}",
+                    normalize_remote_path(&c.initial_path)
+                )
             }
         }
     }
@@ -486,6 +556,7 @@ mod tests {
             username: "deploy".to_string(),
             use_tls: true,
             initial_path: "/pub/releases".to_string(),
+            ..FtpConfig::default()
         });
         assert_eq!(ftp.kind(), ProtocolKind::Ftp);
         assert_eq!(ftp.summary(), "FTPS · deploy@ftp.example.com:21");
@@ -495,6 +566,7 @@ mod tests {
             endpoint: "https://dav.example.com/remote.php/webdav".to_string(),
             username: "alice".to_string(),
             initial_path: "/docs".to_string(),
+            ..WebDavConfig::default()
         });
         assert_eq!(webdav.kind(), ProtocolKind::WebDav);
         assert!(webdav.summary().contains("WebDAV"));
@@ -503,6 +575,7 @@ mod tests {
         let gdrive = ProtocolConfig::GoogleDrive(GoogleDriveConfig {
             client_id: "my-client-id".to_string(),
             client_secret: Some("my-secret".to_string()),
+            proxy_mode: ConnectionProxyMode::Custom,
             proxy_url: Some("http://127.0.0.1:7890".to_string()),
             initial_path: "/Projects".to_string(),
         });
@@ -514,6 +587,7 @@ mod tests {
         let onedrive = ProtocolConfig::OneDrive(OneDriveConfig {
             client_id: "od-client-id".to_string(),
             client_secret: Some("od-secret".to_string()),
+            proxy_mode: ConnectionProxyMode::Custom,
             proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
             initial_path: "/Backups".to_string(),
         });
@@ -530,6 +604,7 @@ mod tests {
             ProtocolConfig::OneDrive(OneDriveConfig {
                 client_id: "legacy-od".to_string(),
                 client_secret: None,
+                proxy_mode: ConnectionProxyMode::Default,
                 proxy_url: None,
                 initial_path: "/Docs".to_string(),
             })

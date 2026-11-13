@@ -338,6 +338,7 @@ mod tests {
                 bucket: Some("prod-bucket".to_string()),
                 initial_prefix: "/".to_string(),
                 addressing_style: S3AddressingStyle::VirtualHosted,
+                ..S3Config::default()
             }),
         };
 

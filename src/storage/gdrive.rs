@@ -698,6 +698,7 @@ mod tests {
             let missing_secret_cfg = GoogleDriveConfig {
                 client_id: "123456-abc.apps.googleusercontent.com".to_string(),
                 client_secret: None,
+                proxy_mode: crate::models::ConnectionProxyMode::Default,
                 proxy_url: None,
                 initial_path: "/".to_string(),
             };

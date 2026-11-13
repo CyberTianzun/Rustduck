@@ -1,8 +1,8 @@
 use crate::i18n::{I18n, i18n, set_current_language};
 use crate::models::{
-    Bookmark, FileEntry, FileKind, FtpConfig, GoogleDriveConfig, OneDriveConfig, ProtocolConfig,
-    ProtocolKind, S3AddressingStyle, S3Config, S3Preset, SftpConfig, SmbConfig, TransferDirection,
-    TransferStatus, TransferTask, WebDavConfig,
+    Bookmark, ConnectionProxyMode, FileEntry, FileKind, FtpConfig, GoogleDriveConfig,
+    OneDriveConfig, ProtocolConfig, ProtocolKind, S3AddressingStyle, S3Config, S3Preset,
+    SftpConfig, SmbConfig, TransferDirection, TransferStatus, TransferTask, WebDavConfig,
 };
 use crate::services::bookmark_store::{BookmarkStore, KeyringCredentialVault};
 use crate::services::preferences::{
@@ -291,6 +291,8 @@ impl FormFieldValues {
                     }
                 },
                 initial_path,
+                proxy_mode: ConnectionProxyMode::Default,
+                proxy_url: None,
             }),
             ProtocolKind::Ftp => ProtocolConfig::Ftp(FtpConfig {
                 host: self.ftp_host.trim().to_string(),
@@ -302,6 +304,8 @@ impl FormFieldValues {
                 },
                 use_tls: self.ftp_use_tls,
                 initial_path,
+                proxy_mode: ConnectionProxyMode::Default,
+                proxy_url: None,
             }),
             ProtocolKind::S3 => ProtocolConfig::S3(S3Config {
                 preset: self.s3_preset,
@@ -318,6 +322,8 @@ impl FormFieldValues {
                 },
                 initial_prefix: initial_path,
                 addressing_style: self.s3_addressing,
+                proxy_mode: ConnectionProxyMode::Default,
+                proxy_url: None,
             }),
             ProtocolKind::Smb => ProtocolConfig::Smb(SmbConfig {
                 server: self.smb_server.trim().to_string(),
@@ -338,6 +344,8 @@ impl FormFieldValues {
                 endpoint: self.webdav_endpoint.trim().to_string(),
                 username: self.webdav_user.trim().to_string(),
                 initial_path,
+                proxy_mode: ConnectionProxyMode::Default,
+                proxy_url: None,
             }),
             ProtocolKind::GoogleDrive => ProtocolConfig::GoogleDrive(GoogleDriveConfig {
                 client_id: self.gdrive_client_id.trim().to_string(),
@@ -348,6 +356,11 @@ impl FormFieldValues {
                     } else {
                         Some(cs.to_string())
                     }
+                },
+                proxy_mode: if self.gdrive_proxy.trim().is_empty() {
+                    ConnectionProxyMode::Default
+                } else {
+                    ConnectionProxyMode::Custom
                 },
                 proxy_url: {
                     let p = self.gdrive_proxy.trim();
@@ -368,6 +381,11 @@ impl FormFieldValues {
                     } else {
                         Some(cs.to_string())
                     }
+                },
+                proxy_mode: if self.onedrive_proxy.trim().is_empty() {
+                    ConnectionProxyMode::Default
+                } else {
+                    ConnectionProxyMode::Custom
                 },
                 proxy_url: {
                     let p = self.onedrive_proxy.trim();
@@ -3441,6 +3459,7 @@ mod tests {
                 bucket: Some("prod-bucket".into()),
                 initial_prefix: "/assets".into(),
                 addressing_style: S3AddressingStyle::VirtualHosted,
+                ..S3Config::default()
             }),
         };
 

@@ -731,6 +731,7 @@ mod tests {
             username: "anonymous".to_string(),
             use_tls: false,
             initial_path: "/".to_string(),
+            ..FtpConfig::default()
         };
         let started = std::time::Instant::now();
         let res = connect_ftp_control_with_timeout(

@@ -1074,6 +1074,7 @@ mod tests {
             bucket: Some("test-bkt".to_string()),
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::PathStyle,
+            ..S3Config::default()
         };
         let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
 
@@ -1161,6 +1162,7 @@ mod tests {
             bucket: Some("test-bkt".to_string()),
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::PathStyle,
+            ..S3Config::default()
         };
         let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
         backend.remove("/docs", true).await.unwrap();
@@ -1218,6 +1220,7 @@ mod tests {
             bucket: None,
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::VirtualHosted,
+            ..S3Config::default()
         };
         assert_eq!(resolve_effective_s3_region(&cos_cfg), "na-siliconvalley");
 
@@ -1230,6 +1233,7 @@ mod tests {
             bucket: None,
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::PathStyle,
+            ..S3Config::default()
         };
         assert_eq!(resolve_effective_s3_region(&minio_cfg), "us-east-1");
     }
@@ -1246,6 +1250,7 @@ mod tests {
             bucket: None,
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::VirtualHosted,
+            ..S3Config::default()
         };
 
         assert!(S3Backend::new(base.clone(), "".to_string()).is_err());
@@ -1310,6 +1315,7 @@ mod tests {
             bucket: Some("test-bkt".to_string()),
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::PathStyle,
+            ..S3Config::default()
         };
         let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
 
