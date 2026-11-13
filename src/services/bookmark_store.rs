@@ -157,15 +157,30 @@ impl BookmarkStore {
                     ProtocolConfig::Sftp(c) => {
                         c.host.to_lowercase().contains(&q)
                             || c.username.to_lowercase().contains(&q)
+                            || c.proxy_url
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&q)
                     }
                     ProtocolConfig::Ftp(c) => {
                         c.host.to_lowercase().contains(&q)
                             || c.username.to_lowercase().contains(&q)
+                            || c.proxy_url
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&q)
                     }
                     ProtocolConfig::S3(c) => {
                         c.endpoint.to_lowercase().contains(&q)
                             || c.region.to_lowercase().contains(&q)
                             || c.bucket
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&q)
+                            || c.proxy_url
                                 .as_deref()
                                 .unwrap_or_default()
                                 .to_lowercase()
@@ -178,6 +193,11 @@ impl BookmarkStore {
                     ProtocolConfig::WebDav(c) => {
                         c.endpoint.to_lowercase().contains(&q)
                             || c.username.to_lowercase().contains(&q)
+                            || c.proxy_url
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&q)
                     }
                     ProtocolConfig::GoogleDrive(c) => {
                         c.client_id.to_lowercase().contains(&q)

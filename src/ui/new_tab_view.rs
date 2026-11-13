@@ -1,5 +1,5 @@
 use crate::i18n::i18n;
-use crate::models::{Bookmark, ProtocolKind, S3AddressingStyle, S3Preset};
+use crate::models::{Bookmark, ConnectionProxyMode, ProtocolKind, S3AddressingStyle, S3Preset};
 use crate::storage::gdrive::has_default_gdrive_oauth_credentials;
 use crate::storage::onedrive::has_default_onedrive_oauth_credentials;
 use crate::ui::{
@@ -675,11 +675,11 @@ fn render_inspector_body(
         .into_any_element();
 
     let protocol_card = match form.protocol {
-        ProtocolKind::Sftp => render_sftp_form_card(form),
+        ProtocolKind::Sftp => render_sftp_form_card(tab_idx, form, cx),
         ProtocolKind::Ftp => render_ftp_form_card(tab_idx, form, cx),
         ProtocolKind::S3 => render_s3_form_card(tab_idx, form, cx),
         ProtocolKind::Smb => render_smb_form_card(form),
-        ProtocolKind::WebDav => render_webdav_form_card(form),
+        ProtocolKind::WebDav => render_webdav_form_card(tab_idx, form, cx),
         ProtocolKind::GoogleDrive => render_gdrive_form_card(tab_idx, form, pending_op, cx),
         ProtocolKind::OneDrive => render_onedrive_form_card(tab_idx, form, pending_op, cx),
     };
@@ -697,7 +697,70 @@ fn render_inspector_body(
         .into_any_element()
 }
 
-fn render_sftp_form_card(form: &ConnectionFormInputs) -> AnyElement {
+fn render_connection_proxy_row(
+    tab_idx: usize,
+    form: &ConnectionFormInputs,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
+    let t = i18n();
+    let active_mode = form.conn_proxy_mode;
+    let mode_buttons: Vec<AnyElement> = [
+        ("conn-proxy-default", ConnectionProxyMode::Default),
+        ("conn-proxy-direct", ConnectionProxyMode::Direct),
+        ("conn-proxy-custom", ConnectionProxyMode::Custom),
+    ]
+    .into_iter()
+    .map(|(btn_id, mode)| {
+        let is_active = active_mode == mode;
+        Button::new((btn_id, tab_idx))
+            .xsmall()
+            .with_variant(if is_active {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            })
+            .label(t.conn_proxy_mode_label(mode))
+            .on_click(cx.listener(move |this, _ev, window, cx| {
+                this.tabs[tab_idx].form.conn_proxy_mode = mode;
+                if mode == ConnectionProxyMode::Custom {
+                    this.tabs[tab_idx]
+                        .form
+                        .conn_proxy_input
+                        .update(cx, |s, cx| s.focus(window, cx));
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    })
+    .collect();
+
+    v_flex()
+        .w_full()
+        .gap_1p5()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(field_label(t.label_conn_proxy_mode()))
+                .child(h_flex().gap_1p5().items_center().children(mode_buttons)),
+        )
+        .when(active_mode == ConnectionProxyMode::Custom, |el| {
+            el.child(
+                Input::new(&form.conn_proxy_input)
+                    .small()
+                    .prefix(Icon::new(IconName::Network).xsmall().text_color(text_muted()))
+                    .cleanable(true),
+            )
+        })
+        .into_any_element()
+}
+
+fn render_sftp_form_card(
+    tab_idx: usize,
+    form: &ConnectionFormInputs,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
     let t = i18n();
     let row_host_port = h_flex()
         .gap_3()
@@ -771,6 +834,8 @@ fn render_sftp_form_card(form: &ConnectionFormInputs) -> AnyElement {
         )
         .into_any_element();
 
+    let row_proxy = render_connection_proxy_row(tab_idx, form, cx);
+
     v_flex()
         .w_full()
         .p_3p5()
@@ -782,6 +847,7 @@ fn render_sftp_form_card(form: &ConnectionFormInputs) -> AnyElement {
         .child(row_host_port)
         .child(row_user_secret)
         .child(row_key_path)
+        .child(row_proxy)
         .into_any_element()
 }
 
@@ -888,6 +954,8 @@ fn render_ftp_form_card(
         )
         .into_any_element();
 
+    let row_proxy = render_connection_proxy_row(tab_idx, form, cx);
+
     v_flex()
         .w_full()
         .p_3p5()
@@ -899,10 +967,15 @@ fn render_ftp_form_card(
         .child(row_host_port)
         .child(row_tls)
         .child(row_auth)
+        .child(row_proxy)
         .into_any_element()
 }
 
-fn render_webdav_form_card(form: &ConnectionFormInputs) -> AnyElement {
+fn render_webdav_form_card(
+    tab_idx: usize,
+    form: &ConnectionFormInputs,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
     let t = i18n();
     let row_endpoint = v_flex()
         .w_full()
@@ -949,6 +1022,8 @@ fn render_webdav_form_card(form: &ConnectionFormInputs) -> AnyElement {
         )
         .into_any_element();
 
+    let row_proxy = render_connection_proxy_row(tab_idx, form, cx);
+
     v_flex()
         .w_full()
         .p_3p5()
@@ -959,6 +1034,7 @@ fn render_webdav_form_card(form: &ConnectionFormInputs) -> AnyElement {
         .border_color(border_subtle())
         .child(row_endpoint)
         .child(row_auth)
+        .child(row_proxy)
         .into_any_element()
 }
 
@@ -1107,17 +1183,7 @@ fn render_gdrive_form_card(
         )
         .into_any_element();
 
-    let row_proxy = v_flex()
-        .w_full()
-        .gap_1()
-        .child(field_label(t.label_proxy_url()))
-        .child(
-            Input::new(&form.gdrive_proxy_input)
-                .small()
-                .prefix(Icon::new(IconName::Network).xsmall().text_color(text_muted()))
-                .cleanable(true),
-        )
-        .into_any_element();
+    let row_proxy = render_connection_proxy_row(tab_idx, form, cx);
 
     v_flex()
         .w_full()
@@ -1129,9 +1195,9 @@ fn render_gdrive_form_card(
         .border_color(border_subtle())
         .child(setup_hint)
         .child(row_custom_client)
+        .child(row_proxy)
         .child(oauth_banner)
         .child(row_token_dir)
-        .child(row_proxy)
         .into_any_element()
 }
 
@@ -1278,17 +1344,7 @@ fn render_onedrive_form_card(
         )
         .into_any_element();
 
-    let row_proxy = v_flex()
-        .w_full()
-        .gap_1()
-        .child(field_label(t.label_proxy_url()))
-        .child(
-            Input::new(&form.onedrive_proxy_input)
-                .small()
-                .prefix(Icon::new(IconName::Network).xsmall().text_color(text_muted()))
-                .cleanable(true),
-        )
-        .into_any_element();
+    let row_proxy = render_connection_proxy_row(tab_idx, form, cx);
 
     v_flex()
         .w_full()
@@ -1300,9 +1356,9 @@ fn render_onedrive_form_card(
         .border_color(border_subtle())
         .child(setup_hint)
         .child(row_custom_client)
+        .child(row_proxy)
         .child(oauth_banner)
         .child(row_token_dir)
-        .child(row_proxy)
         .into_any_element()
 }
 
@@ -1396,6 +1452,8 @@ fn render_s3_form_card(
         )
         .into_any_element();
 
+    let row_proxy = render_connection_proxy_row(tab_idx, form, cx);
+
     v_flex()
         .w_full()
         .p_3p5()
@@ -1409,6 +1467,7 @@ fn render_s3_form_card(
         .child(row_addressing)
         .child(row_keys)
         .child(row_bucket)
+        .child(row_proxy)
         .into_any_element()
 }
 

@@ -1,7 +1,7 @@
 use crate::i18n::i18n;
 use crate::models::ProtocolKind;
 use crate::services::preferences::{
-    AppLanguage, LocalStartupDirMode, S3UploadAcl, ThemePreference,
+    AppLanguage, GlobalProxyMode, LocalStartupDirMode, S3UploadAcl, ThemePreference,
 };
 use crate::services::update_checker::UpdateCheckState;
 use crate::ui::workspace::RustduckWorkspace;
@@ -227,6 +227,7 @@ fn render_general_settings(
     let t = i18n();
     let prefs = ws.preferences_store.preferences();
     let current_local_mode = prefs.local_startup_mode;
+    let current_global_proxy_mode = prefs.global_proxy_mode;
     let current_s3_acl = prefs.s3_default_acl;
 
     let theme_section = v_flex()
@@ -429,14 +430,132 @@ fn render_general_settings(
                 .children(acl_pills),
         );
 
+    let proxy_section = v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2p5()
+        .child(
+            v_flex()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(text_primary())
+                        .child(t.settings_section_proxy()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(text_muted())
+                        .child(t.settings_section_proxy_desc()),
+                ),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .gap_2p5()
+                .child(render_global_proxy_mode_card(
+                    "global-proxy-mode-system",
+                    GlobalProxyMode::System,
+                    IconName::Globe,
+                    t.global_proxy_mode_title(GlobalProxyMode::System),
+                    current_global_proxy_mode == GlobalProxyMode::System,
+                    cx,
+                ))
+                .child(render_global_proxy_mode_card(
+                    "global-proxy-mode-direct",
+                    GlobalProxyMode::Direct,
+                    IconName::Server,
+                    t.global_proxy_mode_title(GlobalProxyMode::Direct),
+                    current_global_proxy_mode == GlobalProxyMode::Direct,
+                    cx,
+                ))
+                .child(render_global_proxy_mode_card(
+                    "global-proxy-mode-custom",
+                    GlobalProxyMode::Custom,
+                    IconName::Network,
+                    t.global_proxy_mode_title(GlobalProxyMode::Custom),
+                    current_global_proxy_mode == GlobalProxyMode::Custom,
+                    cx,
+                )),
+        )
+        .when(current_global_proxy_mode == GlobalProxyMode::Custom, |el| {
+            el.child(
+                div().w_full().min_w_0().child(
+                    Input::new(&ws.settings_global_proxy_input)
+                        .small()
+                        .prefix(
+                            Icon::new(IconName::Network)
+                                .xsmall()
+                                .text_color(text_muted()),
+                        )
+                        .cleanable(true),
+                ),
+            )
+        });
+
     v_flex()
         .w_full()
         .min_w_0()
         .gap_5()
         .child(theme_section)
         .child(language_section)
+        .child(proxy_section)
         .child(local_dir_section)
         .child(s3_acl_section)
+        .into_any_element()
+}
+
+fn render_global_proxy_mode_card(
+    id: &'static str,
+    mode: GlobalProxyMode,
+    icon: IconName,
+    title: &'static str,
+    selected: bool,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
+    let icon_color = if selected {
+        accent_blue()
+    } else {
+        text_secondary()
+    };
+
+    h_flex()
+        .id(id)
+        .flex_1()
+        .px_3p5()
+        .py_2p5()
+        .gap_2()
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .items_center()
+        .when(selected, |el| {
+            el.bg(bg_row_selected())
+                .border_1()
+                .border_color(border_selected())
+        })
+        .when(!selected, |el| {
+            el.bg(bg_elevated())
+                .border_1()
+                .border_color(border_subtle())
+                .hover(|s| s.bg(bg_row_hover()))
+        })
+        .on_click(cx.listener(move |this, _ev, window, cx| {
+            this.set_global_proxy_mode(mode, window, cx);
+        }))
+        .child(Icon::new(icon).small().text_color(icon_color))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(if selected {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .text_color(text_primary())
+                .child(title),
+        )
         .into_any_element()
 }
 

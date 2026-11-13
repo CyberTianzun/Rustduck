@@ -6,7 +6,8 @@ use crate::models::{
 };
 use crate::services::bookmark_store::{BookmarkStore, KeyringCredentialVault};
 use crate::services::preferences::{
-    AppLanguage, LocalStartupDirMode, PreferencesStore, S3UploadAcl, ThemePreference,
+    AppLanguage, GlobalProxyMode, LocalStartupDirMode, PreferencesStore, S3UploadAcl,
+    ThemePreference,
 };
 use crate::services::runtime::tokio_runtime;
 use crate::services::transfer_manager::TransferManager;
@@ -165,10 +166,10 @@ pub struct FormFieldValues {
     pub webdav_user: String,
     pub gdrive_client_id: String,
     pub gdrive_client_secret: String,
-    pub gdrive_proxy: String,
     pub onedrive_client_id: String,
     pub onedrive_client_secret: String,
-    pub onedrive_proxy: String,
+    pub conn_proxy_mode: ConnectionProxyMode,
+    pub conn_proxy_url: String,
 }
 
 impl FormFieldValues {
@@ -202,10 +203,10 @@ impl FormFieldValues {
             webdav_user: String::new(),
             gdrive_client_id: String::new(),
             gdrive_client_secret: String::new(),
-            gdrive_proxy: String::new(),
             onedrive_client_id: String::new(),
             onedrive_client_secret: String::new(),
-            onedrive_proxy: String::new(),
+            conn_proxy_mode: ConnectionProxyMode::Default,
+            conn_proxy_url: String::new(),
         }
     }
 
@@ -222,6 +223,8 @@ impl FormFieldValues {
                 vals.sftp_user = c.username.clone();
                 vals.sftp_key_path = c.private_key_path.clone().unwrap_or_default();
                 vals.initial_path = c.initial_path.clone();
+                vals.conn_proxy_mode = c.proxy_mode.effective_mode(c.proxy_url.as_deref());
+                vals.conn_proxy_url = c.proxy_url.clone().unwrap_or_default();
             }
             ProtocolConfig::Ftp(c) => {
                 vals.ftp_host = c.host.clone();
@@ -229,6 +232,8 @@ impl FormFieldValues {
                 vals.ftp_user = c.username.clone();
                 vals.ftp_use_tls = c.use_tls;
                 vals.initial_path = c.initial_path.clone();
+                vals.conn_proxy_mode = c.proxy_mode.effective_mode(c.proxy_url.as_deref());
+                vals.conn_proxy_url = c.proxy_url.clone().unwrap_or_default();
             }
             ProtocolConfig::S3(c) => {
                 let effective_region =
@@ -241,6 +246,8 @@ impl FormFieldValues {
                 vals.s3_access_key = c.access_key_id.clone();
                 vals.s3_bucket = c.bucket.clone().unwrap_or_default();
                 vals.initial_path = c.initial_prefix.clone();
+                vals.conn_proxy_mode = c.proxy_mode.effective_mode(c.proxy_url.as_deref());
+                vals.conn_proxy_url = c.proxy_url.clone().unwrap_or_default();
             }
             ProtocolConfig::Smb(c) => {
                 vals.smb_server = c.server.clone();
@@ -254,25 +261,45 @@ impl FormFieldValues {
                 vals.webdav_endpoint = c.endpoint.clone();
                 vals.webdav_user = c.username.clone();
                 vals.initial_path = c.initial_path.clone();
+                vals.conn_proxy_mode = c.proxy_mode.effective_mode(c.proxy_url.as_deref());
+                vals.conn_proxy_url = c.proxy_url.clone().unwrap_or_default();
             }
             ProtocolConfig::GoogleDrive(c) => {
                 vals.gdrive_client_id = c.client_id.clone();
                 vals.gdrive_client_secret = c.client_secret.clone().unwrap_or_default();
-                vals.gdrive_proxy = c.proxy_url.clone().unwrap_or_default();
                 vals.initial_path = c.initial_path.clone();
+                vals.conn_proxy_mode = c.proxy_mode.effective_mode(c.proxy_url.as_deref());
+                vals.conn_proxy_url = c.proxy_url.clone().unwrap_or_default();
             }
             ProtocolConfig::OneDrive(c) => {
                 vals.onedrive_client_id = c.client_id.clone();
                 vals.onedrive_client_secret = c.client_secret.clone().unwrap_or_default();
-                vals.onedrive_proxy = c.proxy_url.clone().unwrap_or_default();
                 vals.initial_path = c.initial_path.clone();
+                vals.conn_proxy_mode = c.proxy_mode.effective_mode(c.proxy_url.as_deref());
+                vals.conn_proxy_url = c.proxy_url.clone().unwrap_or_default();
             }
         }
         vals
     }
 
+    fn normalized_proxy_pair(&self) -> (ConnectionProxyMode, Option<String>) {
+        match self.conn_proxy_mode {
+            ConnectionProxyMode::Default => (ConnectionProxyMode::Default, None),
+            ConnectionProxyMode::Direct => (ConnectionProxyMode::Direct, None),
+            ConnectionProxyMode::Custom => {
+                let trimmed = self.conn_proxy_url.trim();
+                if trimmed.is_empty() {
+                    (ConnectionProxyMode::Default, None)
+                } else {
+                    (ConnectionProxyMode::Custom, Some(trimmed.to_string()))
+                }
+            }
+        }
+    }
+
     pub fn to_protocol_config(&self) -> ProtocolConfig {
         let initial_path = self.initial_path.trim().to_string();
+        let (proxy_mode, proxy_url) = self.normalized_proxy_pair();
         match self.protocol {
             ProtocolKind::Sftp => ProtocolConfig::Sftp(SftpConfig {
                 host: self.sftp_host.trim().to_string(),
@@ -291,8 +318,8 @@ impl FormFieldValues {
                     }
                 },
                 initial_path,
-                proxy_mode: ConnectionProxyMode::Default,
-                proxy_url: None,
+                proxy_mode,
+                proxy_url,
             }),
             ProtocolKind::Ftp => ProtocolConfig::Ftp(FtpConfig {
                 host: self.ftp_host.trim().to_string(),
@@ -304,8 +331,8 @@ impl FormFieldValues {
                 },
                 use_tls: self.ftp_use_tls,
                 initial_path,
-                proxy_mode: ConnectionProxyMode::Default,
-                proxy_url: None,
+                proxy_mode,
+                proxy_url,
             }),
             ProtocolKind::S3 => ProtocolConfig::S3(S3Config {
                 preset: self.s3_preset,
@@ -322,8 +349,8 @@ impl FormFieldValues {
                 },
                 initial_prefix: initial_path,
                 addressing_style: self.s3_addressing,
-                proxy_mode: ConnectionProxyMode::Default,
-                proxy_url: None,
+                proxy_mode,
+                proxy_url,
             }),
             ProtocolKind::Smb => ProtocolConfig::Smb(SmbConfig {
                 server: self.smb_server.trim().to_string(),
@@ -344,8 +371,8 @@ impl FormFieldValues {
                 endpoint: self.webdav_endpoint.trim().to_string(),
                 username: self.webdav_user.trim().to_string(),
                 initial_path,
-                proxy_mode: ConnectionProxyMode::Default,
-                proxy_url: None,
+                proxy_mode,
+                proxy_url,
             }),
             ProtocolKind::GoogleDrive => ProtocolConfig::GoogleDrive(GoogleDriveConfig {
                 client_id: self.gdrive_client_id.trim().to_string(),
@@ -357,19 +384,8 @@ impl FormFieldValues {
                         Some(cs.to_string())
                     }
                 },
-                proxy_mode: if self.gdrive_proxy.trim().is_empty() {
-                    ConnectionProxyMode::Default
-                } else {
-                    ConnectionProxyMode::Custom
-                },
-                proxy_url: {
-                    let p = self.gdrive_proxy.trim();
-                    if p.is_empty() {
-                        None
-                    } else {
-                        Some(p.to_string())
-                    }
-                },
+                proxy_mode,
+                proxy_url,
                 initial_path,
             }),
             ProtocolKind::OneDrive => ProtocolConfig::OneDrive(OneDriveConfig {
@@ -382,19 +398,8 @@ impl FormFieldValues {
                         Some(cs.to_string())
                     }
                 },
-                proxy_mode: if self.onedrive_proxy.trim().is_empty() {
-                    ConnectionProxyMode::Default
-                } else {
-                    ConnectionProxyMode::Custom
-                },
-                proxy_url: {
-                    let p = self.onedrive_proxy.trim();
-                    if p.is_empty() {
-                        None
-                    } else {
-                        Some(p.to_string())
-                    }
-                },
+                proxy_mode,
+                proxy_url,
                 initial_path,
             }),
         }
@@ -407,6 +412,7 @@ pub struct ConnectionFormInputs {
     pub s3_preset: S3Preset,
     pub s3_addressing: S3AddressingStyle,
     pub ftp_use_tls: bool,
+    pub conn_proxy_mode: ConnectionProxyMode,
     pub bookmark_search_input: Entity<InputState>,
     pub name_input: Entity<InputState>,
     pub sftp_host_input: Entity<InputState>,
@@ -429,10 +435,9 @@ pub struct ConnectionFormInputs {
     pub webdav_user_input: Entity<InputState>,
     pub gdrive_client_id_input: Entity<InputState>,
     pub gdrive_client_secret_input: Entity<InputState>,
-    pub gdrive_proxy_input: Entity<InputState>,
     pub onedrive_client_id_input: Entity<InputState>,
     pub onedrive_client_secret_input: Entity<InputState>,
-    pub onedrive_proxy_input: Entity<InputState>,
+    pub conn_proxy_input: Entity<InputState>,
     pub secret_input: Entity<InputState>,
     pub initial_path_input: Entity<InputState>,
 }
@@ -458,6 +463,7 @@ impl ConnectionFormInputs {
             s3_preset: S3Preset::AlibabaOss,
             s3_addressing: S3AddressingStyle::VirtualHosted,
             ftp_use_tls: false,
+            conn_proxy_mode: ConnectionProxyMode::Default,
             bookmark_search_input,
             name_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_conn_name())),
@@ -504,8 +510,6 @@ impl ConnectionFormInputs {
                     ))
                     .masked(true)
             }),
-            gdrive_proxy_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_proxy_url())),
             onedrive_client_id_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(
                     t.placeholder_oauth_client_id_with_default(
@@ -518,8 +522,8 @@ impl ConnectionFormInputs {
                     .placeholder(t.placeholder_oauth_client_secret())
                     .masked(true)
             }),
-            onedrive_proxy_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_proxy_url())),
+            conn_proxy_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t.placeholder_conn_proxy_url())),
             secret_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(t.placeholder_secret())
@@ -559,14 +563,14 @@ impl ConnectionFormInputs {
             webdav_user: self.webdav_user_input.read(cx).value().to_string(),
             gdrive_client_id: self.gdrive_client_id_input.read(cx).value().to_string(),
             gdrive_client_secret: self.gdrive_client_secret_input.read(cx).value().to_string(),
-            gdrive_proxy: self.gdrive_proxy_input.read(cx).value().to_string(),
             onedrive_client_id: self.onedrive_client_id_input.read(cx).value().to_string(),
             onedrive_client_secret: self
                 .onedrive_client_secret_input
                 .read(cx)
                 .value()
                 .to_string(),
-            onedrive_proxy: self.onedrive_proxy_input.read(cx).value().to_string(),
+            conn_proxy_mode: self.conn_proxy_mode,
+            conn_proxy_url: self.conn_proxy_input.read(cx).value().to_string(),
         }
     }
 
@@ -581,6 +585,7 @@ impl ConnectionFormInputs {
         self.s3_preset = vals.s3_preset;
         self.s3_addressing = vals.s3_addressing;
         self.ftp_use_tls = vals.ftp_use_tls;
+        self.conn_proxy_mode = vals.conn_proxy_mode;
 
         self.name_input
             .update(cx, |s, cx| s.set_value(vals.name.clone(), window, cx));
@@ -642,9 +647,6 @@ impl ConnectionFormInputs {
         self.gdrive_client_secret_input.update(cx, |s, cx| {
             s.set_value(vals.gdrive_client_secret.clone(), window, cx)
         });
-        self.gdrive_proxy_input.update(cx, |s, cx| {
-            s.set_value(vals.gdrive_proxy.clone(), window, cx)
-        });
 
         self.onedrive_client_id_input.update(cx, |s, cx| {
             s.set_value(vals.onedrive_client_id.clone(), window, cx)
@@ -652,8 +654,8 @@ impl ConnectionFormInputs {
         self.onedrive_client_secret_input.update(cx, |s, cx| {
             s.set_value(vals.onedrive_client_secret.clone(), window, cx)
         });
-        self.onedrive_proxy_input.update(cx, |s, cx| {
-            s.set_value(vals.onedrive_proxy.clone(), window, cx)
+        self.conn_proxy_input.update(cx, |s, cx| {
+            s.set_value(vals.conn_proxy_url.clone(), window, cx)
         });
     }
 
@@ -705,9 +707,6 @@ impl ConnectionFormInputs {
                 cx,
             )
         });
-        self.gdrive_proxy_input.update(cx, |s, cx| {
-            s.set_placeholder(t.placeholder_proxy_url(), window, cx)
-        });
         self.onedrive_client_id_input.update(cx, |s, cx| {
             s.set_placeholder(
                 t.placeholder_oauth_client_id_with_default(
@@ -720,8 +719,8 @@ impl ConnectionFormInputs {
         self.onedrive_client_secret_input.update(cx, |s, cx| {
             s.set_placeholder(t.placeholder_oauth_client_secret(), window, cx)
         });
-        self.onedrive_proxy_input.update(cx, |s, cx| {
-            s.set_placeholder(t.placeholder_proxy_url(), window, cx)
+        self.conn_proxy_input.update(cx, |s, cx| {
+            s.set_placeholder(t.placeholder_conn_proxy_url(), window, cx)
         });
         self.secret_input.update(cx, |s, cx| {
             s.set_placeholder(t.placeholder_secret(), window, cx)
@@ -1327,6 +1326,7 @@ pub struct RustduckWorkspace {
     pub settings_open: bool,
     pub settings_tab: SettingsTab,
     pub settings_custom_local_dir_input: Entity<InputState>,
+    pub settings_global_proxy_input: Entity<InputState>,
     pub update_state: UpdateCheckState,
     pub seen_completed_transfers: HashSet<Uuid>,
     last_window_title: String,
@@ -1341,6 +1341,7 @@ impl RustduckWorkspace {
         let initial_lang = preferences_store.preferences().language;
         let initial_theme = preferences_store.preferences().theme;
         let initial_custom_dir = preferences_store.preferences().custom_local_dir.clone();
+        let initial_global_proxy_url = preferences_store.preferences().global_proxy_url.clone();
         let effective_initial_local = preferences_store.resolve_effective_local_dir();
         set_current_language(initial_lang);
         apply_theme_preference(initial_theme, Some(window), cx);
@@ -1365,6 +1366,17 @@ impl RustduckWorkspace {
         })
         .detach();
 
+        let settings_global_proxy_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n().placeholder_global_proxy_url())
+                .default_value(initial_global_proxy_url)
+        });
+        cx.observe(&settings_global_proxy_input, |ws, input, _cx| {
+            let val = input.read(_cx).value().trim().to_string();
+            let _ = ws.preferences_store.set_global_proxy_url(val);
+        })
+        .detach();
+
         let vault = Arc::new(KeyringCredentialVault::new());
         let config_path = BookmarkStore::default_config_path();
         let bookmark_store = BookmarkStore::load_or_default(config_path, vault)
@@ -1383,6 +1395,7 @@ impl RustduckWorkspace {
             settings_open: false,
             settings_tab: SettingsTab::General,
             settings_custom_local_dir_input,
+            settings_global_proxy_input,
             update_state: UpdateCheckState::Idle,
             seen_completed_transfers: HashSet::new(),
             last_window_title: String::new(),
@@ -1419,6 +1432,21 @@ impl RustduckWorkspace {
 
     pub fn set_local_startup_mode(&mut self, mode: LocalStartupDirMode, cx: &mut Context<Self>) {
         let _ = self.preferences_store.set_local_startup_mode(mode);
+        cx.notify();
+    }
+
+    pub fn set_global_proxy_mode(
+        &mut self,
+        mode: GlobalProxyMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.preferences_store.set_global_proxy_mode(mode);
+        if mode == GlobalProxyMode::Custom {
+            self.settings_global_proxy_input.update(cx, |s, cx| {
+                s.focus(window, cx);
+            });
+        }
         cx.notify();
     }
 
@@ -1566,6 +1594,10 @@ impl RustduckWorkspace {
         let custom_dir_placeholder = i18n().placeholder_custom_local_dir();
         self.settings_custom_local_dir_input.update(cx, |s, cx| {
             s.set_placeholder(custom_dir_placeholder, window, cx)
+        });
+        let global_proxy_placeholder = i18n().placeholder_global_proxy_url();
+        self.settings_global_proxy_input.update(cx, |s, cx| {
+            s.set_placeholder(global_proxy_placeholder, window, cx)
         });
         for tab in &mut self.tabs {
             tab.refresh_placeholders(window, cx);
@@ -3481,19 +3513,33 @@ mod tests {
         assert!(reset.ftp_host.is_empty());
         assert!(reset.smb_server.is_empty());
         assert!(reset.webdav_endpoint.is_empty());
-        assert!(reset.gdrive_proxy.is_empty());
-        assert!(reset.onedrive_proxy.is_empty());
+        assert_eq!(reset.conn_proxy_mode, ConnectionProxyMode::Default);
+        assert!(reset.conn_proxy_url.is_empty());
         assert_eq!(reset.initial_path, "/");
     }
 
     #[test]
     fn test_form_field_values_to_protocol_config_all_protocols() {
+        let mut sftp_vals = FormFieldValues::blank_for_protocol(ProtocolKind::Sftp);
+        sftp_vals.sftp_host = "10.0.0.12".into();
+        sftp_vals.conn_proxy_mode = ConnectionProxyMode::Custom;
+        sftp_vals.conn_proxy_url = "socks5://127.0.0.1:1080".into();
+        match sftp_vals.to_protocol_config() {
+            ProtocolConfig::Sftp(c) => {
+                assert_eq!(c.proxy_mode, ConnectionProxyMode::Custom);
+                assert_eq!(c.proxy_url.as_deref(), Some("socks5://127.0.0.1:1080"));
+            }
+            _ => panic!("expected SFTP config"),
+        }
+
         let mut ftp_vals = FormFieldValues::blank_for_protocol(ProtocolKind::Ftp);
         ftp_vals.ftp_host = "ftp.example.com".into();
         ftp_vals.ftp_port = "2121".into();
         ftp_vals.ftp_user = "deploy".into();
         ftp_vals.ftp_use_tls = true;
         ftp_vals.initial_path = "/pub".into();
+        ftp_vals.conn_proxy_mode = ConnectionProxyMode::Direct;
+        ftp_vals.conn_proxy_url = "http://ignored:7890".into();
         match ftp_vals.to_protocol_config() {
             ProtocolConfig::Ftp(c) => {
                 assert_eq!(c.host, "ftp.example.com");
@@ -3501,6 +3547,8 @@ mod tests {
                 assert_eq!(c.username, "deploy");
                 assert!(c.use_tls);
                 assert_eq!(c.initial_path, "/pub");
+                assert_eq!(c.proxy_mode, ConnectionProxyMode::Direct);
+                assert_eq!(c.proxy_url, None);
             }
             _ => panic!("expected FTP config"),
         }
@@ -3509,11 +3557,15 @@ mod tests {
         dav_vals.webdav_endpoint = "https://dav.example.com/remote.php/dav".into();
         dav_vals.webdav_user = "alice".into();
         dav_vals.initial_path = "/notes".into();
+        dav_vals.conn_proxy_mode = ConnectionProxyMode::Custom;
+        dav_vals.conn_proxy_url = "http://127.0.0.1:7890".into();
         match dav_vals.to_protocol_config() {
             ProtocolConfig::WebDav(c) => {
                 assert_eq!(c.endpoint, "https://dav.example.com/remote.php/dav");
                 assert_eq!(c.username, "alice");
                 assert_eq!(c.initial_path, "/notes");
+                assert_eq!(c.proxy_mode, ConnectionProxyMode::Custom);
+                assert_eq!(c.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
             }
             _ => panic!("expected WebDAV config"),
         }
@@ -3521,24 +3573,44 @@ mod tests {
         let mut gdrive_vals = FormFieldValues::blank_for_protocol(ProtocolKind::GoogleDrive);
         gdrive_vals.gdrive_client_id = "my-cid".into();
         gdrive_vals.gdrive_client_secret = "my-csec".into();
-        gdrive_vals.gdrive_proxy = "socks5://127.0.0.1:1080".into();
+        gdrive_vals.conn_proxy_mode = ConnectionProxyMode::Custom;
+        gdrive_vals.conn_proxy_url = "socks5://127.0.0.1:1080".into();
         match gdrive_vals.to_protocol_config() {
             ProtocolConfig::GoogleDrive(c) => {
                 assert_eq!(c.client_id, "my-cid");
                 assert_eq!(c.client_secret.as_deref(), Some("my-csec"));
+                assert_eq!(c.proxy_mode, ConnectionProxyMode::Custom);
                 assert_eq!(c.proxy_url.as_deref(), Some("socks5://127.0.0.1:1080"));
             }
             _ => panic!("expected GoogleDrive config"),
         }
 
+        // Legacy GoogleDrive bookmark (proxy_mode = Default + non-empty proxy_url) upgrades to Custom in form
+        let legacy_gdrive_bm = Bookmark {
+            id: Uuid::new_v4(),
+            name: "Legacy GDrive".into(),
+            config: ProtocolConfig::GoogleDrive(GoogleDriveConfig {
+                client_id: "legacy-cid".into(),
+                client_secret: None,
+                proxy_mode: ConnectionProxyMode::Default,
+                proxy_url: Some("http://127.0.0.1:7890".into()),
+                initial_path: "/".into(),
+            }),
+        };
+        let legacy_loaded = FormFieldValues::from_bookmark(&legacy_gdrive_bm, "rt");
+        assert_eq!(legacy_loaded.conn_proxy_mode, ConnectionProxyMode::Custom);
+        assert_eq!(legacy_loaded.conn_proxy_url, "http://127.0.0.1:7890");
+
         let mut od_vals = FormFieldValues::blank_for_protocol(ProtocolKind::OneDrive);
         od_vals.onedrive_client_id = "od-cid".into();
         od_vals.onedrive_client_secret = "od-csec".into();
-        od_vals.onedrive_proxy = "http://127.0.0.1:7890".into();
+        od_vals.conn_proxy_mode = ConnectionProxyMode::Custom;
+        od_vals.conn_proxy_url = "http://127.0.0.1:7890".into();
         match od_vals.to_protocol_config() {
             ProtocolConfig::OneDrive(c) => {
                 assert_eq!(c.client_id, "od-cid");
                 assert_eq!(c.client_secret.as_deref(), Some("od-csec"));
+                assert_eq!(c.proxy_mode, ConnectionProxyMode::Custom);
                 assert_eq!(c.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
             }
             _ => panic!("expected OneDrive config"),
@@ -3552,9 +3624,13 @@ mod tests {
         let od_from_bm = FormFieldValues::from_bookmark(&od_bm, "rt-token");
         assert_eq!(od_from_bm.onedrive_client_id, "od-cid");
         assert_eq!(od_from_bm.onedrive_client_secret, "od-csec");
+        assert_eq!(od_from_bm.conn_proxy_mode, ConnectionProxyMode::Custom);
+        assert_eq!(od_from_bm.conn_proxy_url, "http://127.0.0.1:7890");
         let od_blank = FormFieldValues::blank_for_protocol(ProtocolKind::OneDrive);
         assert!(od_blank.onedrive_client_id.is_empty());
         assert!(od_blank.onedrive_client_secret.is_empty());
+        assert_eq!(od_blank.conn_proxy_mode, ConnectionProxyMode::Default);
+        assert!(od_blank.conn_proxy_url.is_empty());
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
-use crate::models::{S3AddressingStyle, S3Preset};
+use crate::models::{ConnectionProxyMode, S3AddressingStyle, S3Preset};
 use crate::services::preferences::{
-    AppLanguage, LocalStartupDirMode, S3UploadAcl, ThemePreference,
+    AppLanguage, GlobalProxyMode, LocalStartupDirMode, S3UploadAcl, ThemePreference,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -194,6 +194,101 @@ impl I18n {
             "切换应用显示的语言，修改后立即生效"
         } else {
             "Switch display language; changes take effect immediately"
+        }
+    }
+
+    pub fn settings_section_proxy(&self) -> &'static str {
+        if self.is_zh() {
+            "默认网络代理"
+        } else {
+            "Default Network Proxy"
+        }
+    }
+
+    pub fn settings_section_proxy_desc(&self) -> &'static str {
+        if self.is_zh() {
+            "设置所有连接的默认代理规则（支持 HTTP / HTTPS / SOCKS5，各连接也可单独覆盖）"
+        } else {
+            "Default proxy policy for all connections (HTTP / HTTPS / SOCKS5; overridable per connection)"
+        }
+    }
+
+    pub fn global_proxy_mode_title(&self, mode: GlobalProxyMode) -> &'static str {
+        match (self.lang, mode) {
+            (AppLanguage::ZhCn, GlobalProxyMode::System) => "跟随系统代理",
+            (AppLanguage::ZhCn, GlobalProxyMode::Direct) => "直连不走代理",
+            (AppLanguage::ZhCn, GlobalProxyMode::Custom) => "自定义代理",
+            (AppLanguage::EnUs, GlobalProxyMode::System) => "System Proxy",
+            (AppLanguage::EnUs, GlobalProxyMode::Direct) => "Direct (No Proxy)",
+            (AppLanguage::EnUs, GlobalProxyMode::Custom) => "Custom Proxy",
+        }
+    }
+
+    pub fn placeholder_global_proxy_url(&self) -> &'static str {
+        if self.is_zh() {
+            "例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+        } else {
+            "e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
+        }
+    }
+
+    pub fn label_conn_proxy_mode(&self) -> &'static str {
+        if self.is_zh() {
+            "网络代理 (HTTP / HTTPS / SOCKS5)"
+        } else {
+            "Network Proxy (HTTP / HTTPS / SOCKS5)"
+        }
+    }
+
+    pub fn conn_proxy_mode_label(&self, mode: ConnectionProxyMode) -> &'static str {
+        match (self.lang, mode) {
+            (AppLanguage::ZhCn, ConnectionProxyMode::Default) => "跟随默认",
+            (AppLanguage::ZhCn, ConnectionProxyMode::Direct) => "直连",
+            (AppLanguage::ZhCn, ConnectionProxyMode::Custom) => "自定义代理",
+            (AppLanguage::EnUs, ConnectionProxyMode::Default) => "Default",
+            (AppLanguage::EnUs, ConnectionProxyMode::Direct) => "Direct",
+            (AppLanguage::EnUs, ConnectionProxyMode::Custom) => "Custom",
+        }
+    }
+
+    pub fn placeholder_conn_proxy_url(&self) -> &'static str {
+        if self.is_zh() {
+            "输入代理地址，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+        } else {
+            "Proxy URL, e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
+        }
+    }
+
+    pub fn msg_remote_conn_lost(&self, err: &str) -> String {
+        if self.is_zh() {
+            format!("远程连接异常: {err}")
+        } else {
+            format!("Remote connection error: {err}")
+        }
+    }
+
+    pub fn reconnect_now_btn(&self, is_reconnecting: bool) -> &'static str {
+        match (self.is_zh(), is_reconnecting) {
+            (true, true) => "正在重连...",
+            (true, false) => "立即重连",
+            (false, true) => "Reconnecting...",
+            (false, false) => "Reconnect",
+        }
+    }
+
+    pub fn msg_reconnecting_remote(&self) -> String {
+        if self.is_zh() {
+            "正在重新建立远程会话并同步当前目录...".to_string()
+        } else {
+            "Reconnecting remote session & syncing directory...".to_string()
+        }
+    }
+
+    pub fn msg_reconnected_ok(&self) -> String {
+        if self.is_zh() {
+            "远程会话已重连并同步".to_string()
+        } else {
+            "Remote session reconnected".to_string()
         }
     }
 
@@ -1984,5 +2079,35 @@ mod tests {
         assert_eq!(en.cancel_connect_btn(), "Cancel");
         assert_eq!(zh.oauth_retry_btn(), "重新授权");
         assert_eq!(en.oauth_retry_btn(), "Retry OAuth");
+    }
+
+    #[test]
+    fn test_proxy_and_remote_reconnect_i18n_strings() {
+        use crate::models::ConnectionProxyMode;
+        use crate::services::preferences::GlobalProxyMode;
+
+        let zh = I18n::new(AppLanguage::ZhCn);
+        let en = I18n::new(AppLanguage::EnUs);
+
+        assert_eq!(zh.global_proxy_mode_title(GlobalProxyMode::System), "跟随系统代理");
+        assert_eq!(en.global_proxy_mode_title(GlobalProxyMode::System), "System Proxy");
+        assert_eq!(zh.global_proxy_mode_title(GlobalProxyMode::Direct), "直连不走代理");
+        assert_eq!(en.global_proxy_mode_title(GlobalProxyMode::Direct), "Direct (No Proxy)");
+        assert_eq!(zh.global_proxy_mode_title(GlobalProxyMode::Custom), "自定义代理");
+        assert_eq!(en.global_proxy_mode_title(GlobalProxyMode::Custom), "Custom Proxy");
+
+        assert_eq!(zh.conn_proxy_mode_label(ConnectionProxyMode::Default), "跟随默认");
+        assert_eq!(en.conn_proxy_mode_label(ConnectionProxyMode::Default), "Default");
+        assert_eq!(zh.conn_proxy_mode_label(ConnectionProxyMode::Direct), "直连");
+        assert_eq!(en.conn_proxy_mode_label(ConnectionProxyMode::Direct), "Direct");
+        assert_eq!(zh.conn_proxy_mode_label(ConnectionProxyMode::Custom), "自定义代理");
+        assert_eq!(en.conn_proxy_mode_label(ConnectionProxyMode::Custom), "Custom");
+
+        assert_eq!(zh.reconnect_now_btn(false), "立即重连");
+        assert_eq!(en.reconnect_now_btn(false), "Reconnect");
+        assert_eq!(zh.reconnect_now_btn(true), "正在重连...");
+        assert_eq!(en.reconnect_now_btn(true), "Reconnecting...");
+        assert!(zh.msg_remote_conn_lost("EOF").contains("EOF"));
+        assert!(en.msg_remote_conn_lost("EOF").contains("EOF"));
     }
 }
