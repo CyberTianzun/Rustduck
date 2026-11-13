@@ -570,6 +570,14 @@ mod tests {
             GlobalProxyMode::System
         );
 
+        struct ResetGlobalProxyOnDrop;
+        impl Drop for ResetGlobalProxyOnDrop {
+            fn drop(&mut self) {
+                set_current_global_proxy_config(GlobalProxyMode::System, None);
+            }
+        }
+        let _reset_guard = ResetGlobalProxyOnDrop;
+
         let mut store2 = reloaded;
         store2
             .set_global_proxy_mode(GlobalProxyMode::Custom)
@@ -581,13 +589,15 @@ mod tests {
             current_global_proxy_config(),
             (GlobalProxyMode::Custom, Some("127.0.0.1:7890".to_string()))
         );
+        // Immediately restore global singleton after verifying in-memory sync; disk reload check below uses file contents
+        set_current_global_proxy_config(GlobalProxyMode::System, None);
+
         let reloaded2 = PreferencesStore::load_or_init(pref_path).unwrap();
+        set_current_global_proxy_config(GlobalProxyMode::System, None);
         assert_eq!(
             reloaded2.preferences().global_proxy_mode,
             GlobalProxyMode::Custom
         );
         assert_eq!(reloaded2.preferences().global_proxy_url, "127.0.0.1:7890");
-        // Reset global singleton back to System so parallel unit tests start clean
-        set_current_global_proxy_config(GlobalProxyMode::System, None);
     }
 }

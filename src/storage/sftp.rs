@@ -166,16 +166,11 @@ impl<T: Clone> ReconnectSlot<T> {
         }
     }
 
-    pub async fn invalidate_all(&self) {
-        let mut guard = self.inner.lock().await;
-        guard.1 = None;
-    }
-
-    pub async fn run_with_retry<CF, CFut, OF, OFut, R>(
+    pub async fn run_with_retry_with_id<CF, CFut, OF, OFut, R>(
         &self,
         mut connect: CF,
         mut op: OF,
-    ) -> anyhow::Result<R>
+    ) -> anyhow::Result<(u64, R)>
     where
         CF: FnMut() -> CFut,
         CFut: Future<Output = anyhow::Result<(T, bool)>>,
@@ -185,7 +180,7 @@ impl<T: Clone> ReconnectSlot<T> {
         for attempt in 0..2 {
             let (session_id, session) = self.get_or_connect(&mut connect).await?;
             match op(&session).await {
-                Ok(val) => return Ok(val),
+                Ok(val) => return Ok((session_id, val)),
                 Err(err) => {
                     if is_sftp_session_disconnect_error(&err) {
                         self.evict_if_id(session_id).await;
@@ -198,6 +193,23 @@ impl<T: Clone> ReconnectSlot<T> {
             }
         }
         unreachable!("retry loop always returns on attempt 0 or 1")
+    }
+
+    #[cfg(test)]
+    pub async fn run_with_retry<CF, CFut, OF, OFut, R>(
+        &self,
+        connect: CF,
+        op: OF,
+    ) -> anyhow::Result<R>
+    where
+        CF: FnMut() -> CFut,
+        CFut: Future<Output = anyhow::Result<(T, bool)>>,
+        OF: FnMut(&T) -> OFut,
+        OFut: Future<Output = anyhow::Result<R>>,
+    {
+        self.run_with_retry_with_id(connect, op)
+            .await
+            .map(|(_, val)| val)
     }
 }
 
@@ -311,7 +323,7 @@ impl SftpBackend {
         })
     }
 
-    async fn run_sftp<OF, OFut, R>(&self, mut op: OF) -> anyhow::Result<R>
+    async fn run_sftp_with_id<OF, OFut, R>(&self, mut op: OF) -> anyhow::Result<(u64, R)>
     where
         OF: FnMut(Arc<SftpSession>) -> OFut,
         OFut: Future<Output = anyhow::Result<R>>,
@@ -319,7 +331,7 @@ impl SftpBackend {
         let cfg = &self.config;
         let sec = &self.secret;
         self.session_slot
-            .run_with_retry(
+            .run_with_retry_with_id(
                 || async move {
                     let live =
                         connect_sftp_live_session_with_timeout(cfg, sec, DEFAULT_SFTP_CONNECT_TIMEOUT)
@@ -329,6 +341,14 @@ impl SftpBackend {
                 |live| op(Arc::clone(&live.sftp)),
             )
             .await
+    }
+
+    async fn run_sftp<OF, OFut, R>(&self, op: OF) -> anyhow::Result<R>
+    where
+        OF: FnMut(Arc<SftpSession>) -> OFut,
+        OFut: Future<Output = anyhow::Result<R>>,
+    {
+        self.run_sftp_with_id(op).await.map(|(_, val)| val)
     }
 }
 
@@ -476,8 +496,8 @@ impl StorageBackend for SftpBackend {
             return Err(anyhow!("Transfer cancelled"));
         }
         let norm = normalize_remote_path(remote_path);
-        let mut remote_file = self
-            .run_sftp(|sftp| {
+        let (session_id, mut remote_file) = self
+            .run_sftp_with_id(|sftp| {
                 let p = norm.clone();
                 async move {
                     sftp.open(&p)
@@ -496,8 +516,11 @@ impl StorageBackend for SftpBackend {
             let n = match remote_file.read(&mut buf).await {
                 Ok(n) => n,
                 Err(e) => {
-                    self.session_slot.invalidate_all().await;
-                    return Err(e).with_context(|| format!("SFTP read failed for {norm}"));
+                    let err = anyhow::Error::new(e).context(format!("SFTP read failed for {norm}"));
+                    if is_sftp_session_disconnect_error(&err) {
+                        self.session_slot.evict_if_id(session_id).await;
+                    }
+                    return Err(err);
                 }
             };
             if n == 0 {
@@ -523,8 +546,8 @@ impl StorageBackend for SftpBackend {
             return Err(anyhow!("Transfer cancelled"));
         }
         let norm = normalize_remote_path(remote_path);
-        let mut remote_file = self
-            .run_sftp(|sftp| {
+        let (session_id, mut remote_file) = self
+            .run_sftp_with_id(|sftp| {
                 let p = norm.clone();
                 async move {
                     sftp.create(&p)
@@ -545,15 +568,21 @@ impl StorageBackend for SftpBackend {
                 break;
             }
             if let Err(e) = remote_file.write_all(&buf[..n]).await {
-                self.session_slot.invalidate_all().await;
-                return Err(e).with_context(|| format!("SFTP write failed for {norm}"));
+                let err = anyhow::Error::new(e).context(format!("SFTP write failed for {norm}"));
+                if is_sftp_session_disconnect_error(&err) {
+                    self.session_slot.evict_if_id(session_id).await;
+                }
+                return Err(err);
             }
             total += n as u64;
             progress(total);
         }
         if let Err(e) = remote_file.flush().await {
-            self.session_slot.invalidate_all().await;
-            return Err(e).with_context(|| format!("SFTP flush failed for {norm}"));
+            let err = anyhow::Error::new(e).context(format!("SFTP flush failed for {norm}"));
+            if is_sftp_session_disconnect_error(&err) {
+                self.session_slot.evict_if_id(session_id).await;
+            }
+            return Err(err);
         }
         Ok(())
     }
@@ -589,6 +618,7 @@ mod tests {
             username: "root".to_string(),
             private_key_path: None,
             initial_path: "/".to_string(),
+            proxy_mode: crate::models::ConnectionProxyMode::Direct,
             ..SftpConfig::default()
         };
         let started = std::time::Instant::now();
@@ -699,6 +729,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!is_sftp_session_disconnect_error(&err));
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+
+        // 3. Stale session_id eviction (conn #1) must NOT evict healthy conn #2!
+        slot.evict_if_id(1).await;
+        let cc3 = connect_calls.clone();
+        let (active_id, active_conn) = slot
+            .run_with_retry_with_id(
+                || {
+                    let cc3 = cc3.clone();
+                    async move {
+                        let n = cc3.fetch_add(1, Ordering::SeqCst) + 1;
+                        Ok((n, false))
+                    }
+                },
+                |&conn_num| async move { Ok(conn_num) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_id, 2);
+        assert_eq!(active_conn, 2);
         assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
     }
 }

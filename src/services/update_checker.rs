@@ -201,6 +201,7 @@ pub async fn check_github_latest_release(current_version: &str) -> anyhow::Resul
 
     let resp = client
         .get(GITHUB_LATEST_RELEASE_API_URL)
+        .timeout(Duration::from_secs(10))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?;
@@ -221,7 +222,11 @@ pub async fn check_github_latest_release(current_version: &str) -> anyhow::Resul
     }
 
     if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
-        let redirect_resp = client.get(GITHUB_LATEST_RELEASE_REDIRECT_URL).send().await?;
+        let redirect_resp = client
+            .get(GITHUB_LATEST_RELEASE_REDIRECT_URL)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
         if redirect_resp.status().is_success() || redirect_resp.status() == StatusCode::NOT_FOUND {
             let final_url = redirect_resp.url().as_str();
             let latest = extract_release_from_redirect_url(final_url);

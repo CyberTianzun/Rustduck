@@ -736,6 +736,7 @@ mod tests {
             username: "anonymous".to_string(),
             use_tls: false,
             initial_path: "/".to_string(),
+            proxy_mode: crate::models::ConnectionProxyMode::Direct,
             ..FtpConfig::default()
         };
         let started = std::time::Instant::now();
@@ -754,56 +755,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ftp_connects_control_channel_through_socks5_proxy() {
+    async fn test_ftp_connects_control_and_epsv_data_channels_through_socks5_proxy() {
         use crate::models::ConnectionProxyMode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
+        let data_tunnel_hits = Arc::new(AtomicUsize::new(0));
+        let data_hits_clone = data_tunnel_hits.clone();
 
         let mock_proxy = tokio::spawn(async move {
-            let (mut sock, _) = proxy_listener.accept().await.unwrap();
-            let mut greet = [0u8; 3];
-            sock.read_exact(&mut greet).await.unwrap();
-            sock.write_all(&[0x05, 0x00]).await.unwrap();
+            // 3 tunnels total:
+            // 1) connect_and_verify control (port 2121)
+            // 2) list_dir control (port 2121)
+            // 3) list_dir EPSV passive data stream (port 2122)
+            for _ in 0..3 {
+                let (mut sock, _) = proxy_listener.accept().await.unwrap();
+                let hits = data_hits_clone.clone();
+                tokio::spawn(async move {
+                    let mut greet = [0u8; 3];
+                    sock.read_exact(&mut greet).await.unwrap();
+                    sock.write_all(&[0x05, 0x00]).await.unwrap();
 
-            let mut req_hdr = [0u8; 4];
-            sock.read_exact(&mut req_hdr).await.unwrap();
-            assert_eq!(req_hdr, [0x05, 0x01, 0x00, 0x03]);
-            let mut dlen = [0u8; 1];
-            sock.read_exact(&mut dlen).await.unwrap();
-            let mut domain = vec![0u8; dlen[0] as usize];
-            sock.read_exact(&mut domain).await.unwrap();
-            assert_eq!(&domain, b"ftp.mock-behind-proxy.invalid");
-            let mut port_b = [0u8; 2];
-            sock.read_exact(&mut port_b).await.unwrap();
-            assert_eq!(u16::from_be_bytes(port_b), 2121);
+                    let mut req_hdr = [0u8; 4];
+                    sock.read_exact(&mut req_hdr).await.unwrap();
+                    assert_eq!(req_hdr, [0x05, 0x01, 0x00, 0x03]);
+                    let mut dlen = [0u8; 1];
+                    sock.read_exact(&mut dlen).await.unwrap();
+                    let mut domain = vec![0u8; dlen[0] as usize];
+                    sock.read_exact(&mut domain).await.unwrap();
+                    assert_eq!(&domain, b"ftp.mock-behind-proxy.invalid");
+                    let mut port_b = [0u8; 2];
+                    sock.read_exact(&mut port_b).await.unwrap();
+                    let target_port = u16::from_be_bytes(port_b);
 
-            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x08, 0x49])
-                .await
-                .unwrap();
+                    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x08, 0x49])
+                        .await
+                        .unwrap();
 
-            // Act as minimal FTP control server over the tunnel
-            sock.write_all(b"220 Mock FTP Ready\r\n").await.unwrap();
-            let mut reader = BufReader::new(sock);
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-                    break;
-                }
-                let cmd = line.trim();
-                let resp: &[u8] = if cmd.starts_with("USER ") {
-                    b"230 Logged in\r\n"
-                } else if cmd.starts_with("PWD") {
-                    b"257 \"/remote_root\" is current directory\r\n"
-                } else if cmd.starts_with("QUIT") {
-                    b"221 Bye\r\n"
-                } else {
-                    b"200 OK\r\n"
-                };
-                reader.get_mut().write_all(resp).await.unwrap();
-                if cmd.starts_with("QUIT") {
-                    break;
-                }
+                    if target_port == 2122 {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        sock.write_all(b"type=file;size=42; report.txt\r\n")
+                            .await
+                            .unwrap();
+                        let _ = sock.shutdown().await;
+                        return;
+                    }
+
+                    assert_eq!(target_port, 2121);
+                    sock.write_all(b"220 Mock FTP Ready\r\n").await.unwrap();
+                    let mut reader = BufReader::new(sock);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let cmd = line.trim();
+                        let resp: &[u8] = if cmd.starts_with("USER ") {
+                            b"230 Logged in\r\n"
+                        } else if cmd.starts_with("PWD") {
+                            b"257 \"/remote_root\" is current directory\r\n"
+                        } else if cmd.starts_with("EPSV") {
+                            b"229 Entering Extended Passive Mode (|||2122|)\r\n"
+                        } else if cmd.starts_with("MLSD") {
+                            b"150 Opening data connection\r\n226 Transfer complete\r\n"
+                        } else if cmd.starts_with("QUIT") {
+                            b"221 Bye\r\n"
+                        } else {
+                            b"200 OK\r\n"
+                        };
+                        reader.get_mut().write_all(resp).await.unwrap();
+                        if cmd.starts_with("QUIT") {
+                            break;
+                        }
+                    }
+                });
             }
         });
 
@@ -819,6 +845,12 @@ mod tests {
         let backend = FtpBackend::new(cfg, String::new()).unwrap();
         let verified = backend.connect_and_verify().await.unwrap();
         assert_eq!(verified, "/remote_root");
+
+        let entries = backend.list_dir("/remote_root").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "report.txt");
+        assert_eq!(entries[0].size, 42);
+        assert_eq!(data_tunnel_hits.load(Ordering::SeqCst), 1);
         mock_proxy.await.unwrap();
     }
 }

@@ -1737,6 +1737,7 @@ impl RustduckWorkspace {
         if let Some(tab) = self.tabs.get_mut(tab_idx)
             && let Some(op) = tab.connect_tracker.cancel_current()
         {
+            tab.is_reconnecting_remote = false;
             tab.status_message = Some(match op {
                 PendingConnOp::Connect => t.msg_conn_cancelled(),
                 PendingConnOp::Test => t.msg_test_cancelled(),
@@ -2162,7 +2163,14 @@ impl RustduckWorkspace {
         let t = i18n();
         let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
         let (_title, config, mut secret) = self.read_form_config(tab_idx, cx);
-        if secret.trim().is_empty()
+        if let Some(live_sec) = self.tabs[tab_idx]
+            .remote_backend
+            .as_ref()
+            .and_then(|b| b.exported_secret())
+            .filter(|s| !s.trim().is_empty())
+        {
+            secret = live_sec;
+        } else if secret.trim().is_empty()
             && let Some(bm_id) = self.tabs[tab_idx].form.bookmark_id
             && let Ok(Some(saved_sec)) = self.bookmark_store.get_secret(bm_id)
         {
@@ -2217,8 +2225,11 @@ impl RustduckWorkspace {
                 let _ = this.update_in(cx, |ws, window, cx| {
                     let t = i18n();
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        if !tab.is_connected || !tab.connect_tracker.finish_if_current(attempt_id) {
+                        if !tab.is_connected {
                             tab.is_reconnecting_remote = false;
+                            return;
+                        }
+                        if !tab.connect_tracker.finish_if_current(attempt_id) {
                             return;
                         }
                         tab.is_reconnecting_remote = false;

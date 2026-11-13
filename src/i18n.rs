@@ -868,30 +868,6 @@ impl I18n {
     }
 
     // --- Dual Pane View ---
-    pub fn favorites_back_btn(&self) -> &'static str {
-        if self.is_zh() {
-            "收藏夹"
-        } else {
-            "Favorites"
-        }
-    }
-
-    pub fn favorites_back_tooltip(&self) -> &'static str {
-        if self.is_zh() {
-            "断开并返回收藏夹与连接面板"
-        } else {
-            "Disconnect and return to Favorites"
-        }
-    }
-
-    pub fn sync_refresh_both_btn(&self) -> &'static str {
-        if self.is_zh() {
-            "同步刷新双栏"
-        } else {
-            "Refresh Both Panes"
-        }
-    }
-
     pub fn toggle_hidden_btn(&self, show_hidden: bool) -> &'static str {
         match (self.is_zh(), show_hidden) {
             (true, true) => "显示隐藏文件",
@@ -1710,22 +1686,6 @@ impl I18n {
             "例如: https://dav.example.com/remote.php/webdav"
         } else {
             "e.g. https://dav.example.com/remote.php/webdav"
-        }
-    }
-
-    pub fn label_proxy_url(&self) -> &'static str {
-        if self.is_zh() {
-            "网络代理地址 (Proxy，支持 HTTP / HTTPS / SOCKS5)"
-        } else {
-            "Proxy Server URL (Supports HTTP / HTTPS / SOCKS5)"
-        }
-    }
-
-    pub fn placeholder_proxy_url(&self) -> &'static str {
-        if self.is_zh() {
-            "选填: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
-        } else {
-            "Optional: http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
         }
     }
 

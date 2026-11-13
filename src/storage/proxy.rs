@@ -8,10 +8,12 @@ use reqwest::{Client, Proxy, Url};
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedProxy {
@@ -28,6 +30,8 @@ pub fn normalize_proxy_url(raw: Option<&str>) -> Option<String> {
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("socks5://") {
         Some(format!("socks5h://{}", &trimmed[9..]))
+    } else if lower.starts_with("socks://") {
+        Some(format!("socks5h://{}", &trimmed[8..]))
     } else if lower.starts_with("socks5h://") {
         Some(format!("socks5h://{}", &trimmed[10..]))
     } else if lower.starts_with("socks4://") {
@@ -38,6 +42,8 @@ pub fn normalize_proxy_url(raw: Option<&str>) -> Option<String> {
         Some(format!("http://{}", &trimmed[7..]))
     } else if lower.starts_with("https://") {
         Some(format!("https://{}", &trimmed[8..]))
+    } else if trimmed.contains("://") {
+        Some(trimmed.to_string())
     } else {
         Some(format!("http://{trimmed}"))
     }
@@ -109,10 +115,55 @@ pub fn build_http_client_for_proxy(
     builder.build().context("Failed to initialize HTTP client")
 }
 
+enum ProxyTransport {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ProxyTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ProxyTransport::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            ProxyTransport::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ProxyTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            ProxyTransport::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            ProxyTransport::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ProxyTransport::Plain(s) => Pin::new(s).poll_flush(cx),
+            ProxyTransport::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ProxyTransport::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            ProxyTransport::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 pub struct ProxyStream {
     prefix: Vec<u8>,
     pos: usize,
-    inner: TcpStream,
+    inner: ProxyTransport,
 }
 
 impl ProxyStream {
@@ -120,17 +171,36 @@ impl ProxyStream {
         Self {
             prefix: Vec::new(),
             pos: 0,
-            inner,
+            inner: ProxyTransport::Plain(inner),
         }
     }
 
-    pub fn with_prefix(prefix: Vec<u8>, inner: TcpStream) -> Self {
+    fn with_prefix(prefix: Vec<u8>, inner: ProxyTransport) -> Self {
         Self {
             prefix,
             pos: 0,
             inner,
         }
     }
+}
+
+fn strip_ipv6_brackets(host: &str) -> &str {
+    let h = host.trim();
+    h.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(h)
+}
+
+fn build_proxy_tls_connector() -> anyhow::Result<TlsConnector> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("Failed to configure TLS protocol versions for HTTPS proxy")?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 impl AsyncRead for ProxyStream {
@@ -173,7 +243,7 @@ impl AsyncWrite for ProxyStream {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let h = strip_ipv6_brackets(host);
     h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1"
 }
 
@@ -201,15 +271,15 @@ pub async fn connect_tcp_via_proxy(
     proxy: &ResolvedProxy,
     timeout: Duration,
 ) -> anyhow::Result<ProxyStream> {
-    let host = target_host.trim();
-    if host.is_empty() {
+    let clean_host = strip_ipv6_brackets(target_host);
+    if clean_host.is_empty() {
         return Err(anyhow!("Target host cannot be empty"));
     }
 
     let effective_proxy_url = match proxy {
         ResolvedProxy::Direct => None,
         ResolvedProxy::System => {
-            if is_loopback_host(host) {
+            if is_loopback_host(clean_host) {
                 None
             } else {
                 detect_env_proxy_url()
@@ -221,18 +291,18 @@ pub async fn connect_tcp_via_proxy(
     tokio::time::timeout(timeout, async move {
         match effective_proxy_url {
             None => {
-                let sock = TcpStream::connect((host, target_port))
+                let sock = TcpStream::connect((clean_host, target_port))
                     .await
-                    .with_context(|| format!("Failed to connect to {host}:{target_port}"))?;
+                    .with_context(|| format!("Failed to connect to {clean_host}:{target_port}"))?;
                 Ok(ProxyStream::from_plain(sock))
             }
-            Some(proxy_url) => connect_tunnel(&proxy_url, host, target_port).await,
+            Some(proxy_url) => connect_tunnel(&proxy_url, clean_host, target_port).await,
         }
     })
     .await
     .with_context(|| {
         format!(
-            "Timed out connecting to {host}:{target_port} ({}s)",
+            "Timed out connecting to {clean_host}:{target_port} ({}s)",
             timeout.as_secs().max(1)
         )
     })?
@@ -245,9 +315,13 @@ async fn connect_tunnel(
 ) -> anyhow::Result<ProxyStream> {
     let parsed =
         Url::parse(proxy_url).with_context(|| format!("Invalid proxy URL '{proxy_url}'"))?;
-    let proxy_host = parsed
+    let raw_proxy_host = parsed
         .host_str()
         .ok_or_else(|| anyhow!("Proxy URL missing host: '{proxy_url}'"))?;
+    let proxy_host = strip_ipv6_brackets(raw_proxy_host);
+    if proxy_host.is_empty() {
+        return Err(anyhow!("Proxy URL missing host: '{proxy_url}'"));
+    }
     let scheme = parsed.scheme().to_ascii_lowercase();
     let default_port = match scheme.as_str() {
         "socks5" | "socks5h" | "socks4" | "socks4a" => 1080,
@@ -284,9 +358,28 @@ async fn connect_tunnel(
             )
             .await
         }
-        "http" | "https" => {
+        "http" => {
             connect_http_connect_tunnel(
-                sock,
+                ProxyTransport::Plain(sock),
+                target_host,
+                target_port,
+                username.as_deref(),
+                password.as_deref(),
+            )
+            .await
+        }
+        "https" => {
+            let connector = build_proxy_tls_connector()?;
+            let server_name = rustls::pki_types::ServerName::try_from(proxy_host.to_string())
+                .map_err(|_| anyhow!("Invalid TLS server name for HTTPS proxy '{proxy_host}'"))?;
+            let tls_stream = connector
+                .connect(server_name, sock)
+                .await
+                .with_context(|| {
+                    format!("TLS handshake with HTTPS proxy {proxy_host}:{proxy_port} failed")
+                })?;
+            connect_http_connect_tunnel(
+                ProxyTransport::Tls(Box::new(tls_stream)),
                 target_host,
                 target_port,
                 username.as_deref(),
@@ -295,7 +388,7 @@ async fn connect_tunnel(
             .await
         }
         other => Err(anyhow!(
-            "Unsupported TCP tunnel proxy scheme '{other}' (use http:// or socks5://)"
+            "Unsupported TCP tunnel proxy scheme '{other}' (use http://, https://, or socks5://)"
         )),
     }
 }
@@ -429,16 +522,17 @@ async fn connect_socks5_tunnel(
 }
 
 async fn connect_http_connect_tunnel(
-    mut sock: TcpStream,
+    mut sock: ProxyTransport,
     target_host: &str,
     target_port: u16,
     username: Option<&str>,
     password: Option<&str>,
 ) -> anyhow::Result<ProxyStream> {
-    let authority = if target_host.contains(':') && !target_host.starts_with('[') {
-        format!("[{target_host}]:{target_port}")
+    let clean_target = strip_ipv6_brackets(target_host);
+    let authority = if clean_target.contains(':') {
+        format!("[{clean_target}]:{target_port}")
     } else {
-        format!("{target_host}:{target_port}")
+        format!("{clean_target}:{target_port}")
     };
 
     let mut req = format!(
@@ -658,7 +752,103 @@ mod tests {
         .unwrap();
         let mut http_banner = vec![0u8; 18];
         http_stream.read_exact(&mut http_banner).await.unwrap();
-        assert_eq!(&http_banner, b"SSH-2.0-MockHttp\r\n");
+        assert_eq!(
+            http_banner.as_slice(),
+            b"SSH-2.0-MockHttp\r\n"
+        );
         http_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_https_proxy_initiates_tls_handshake_and_never_sends_plaintext_credentials() {
+        let raw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = raw_listener.local_addr().unwrap().port();
+        let captured = tokio::spawn(async move {
+            let (mut sock, _) = raw_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await;
+            buf
+        });
+
+        let res = connect_tcp_via_proxy(
+            "sftp.internal.example",
+            22,
+            &ResolvedProxy::Custom(format!("https://alice:supersecret@127.0.0.1:{port}")),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "https:// proxy against non-TLS server must fail TLS handshake"
+        );
+        let wire_bytes = captured.await.unwrap();
+        assert!(!wire_bytes.is_empty(), "expected TLS ClientHello bytes");
+        assert_eq!(
+            wire_bytes[0], 0x16,
+            "expected TLS Handshake record (0x16), got 0x{:02x}",
+            wire_bytes[0]
+        );
+        let lossy = String::from_utf8_lossy(&wire_bytes);
+        let b64_creds = BASE64_STD.encode("alice:supersecret");
+        assert!(!lossy.contains("CONNECT "));
+        assert!(!lossy.contains("Proxy-Authorization"));
+        assert!(!lossy.contains("supersecret"));
+        assert!(!lossy.contains(&b64_creds));
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_bracketed_proxy_and_target_hosts_and_scheme_normalization() {
+        assert_eq!(
+            normalize_proxy_url(Some("socks://127.0.0.1:1080")),
+            Some("socks5h://127.0.0.1:1080".to_string())
+        );
+        assert_eq!(
+            normalize_proxy_url(Some("ftp://127.0.0.1:21")),
+            Some("ftp://127.0.0.1:21".to_string())
+        );
+
+        let Ok(v6_listener) = TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let v6_port = v6_listener.local_addr().unwrap().port();
+        let v6_task = tokio::spawn(async move {
+            let (mut sock, _) = v6_listener.accept().await.unwrap();
+            let mut greet = [0u8; 3];
+            sock.read_exact(&mut greet).await.unwrap();
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut req_hdr = [0u8; 4];
+            sock.read_exact(&mut req_hdr).await.unwrap();
+            // ATYP must be 0x04 (16-byte IPv6), NOT 0x03 ("[2001:db8::42]")
+            assert_eq!(req_hdr, [0x05, 0x01, 0x00, 0x04]);
+            let mut v6_octets = [0u8; 16];
+            sock.read_exact(&mut v6_octets).await.unwrap();
+            let expected: std::net::Ipv6Addr = "2001:db8::42".parse().unwrap();
+            assert_eq!(v6_octets, expected.octets());
+            let mut port_b = [0u8; 2];
+            sock.read_exact(&mut port_b).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port_b), 2222);
+
+            let mut reply = vec![0x05, 0x00, 0x00, 0x04];
+            reply.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+            reply.extend_from_slice(&2222u16.to_be_bytes());
+            sock.write_all(&reply).await.unwrap();
+        });
+
+        let proxy_url = normalize_proxy_url(Some(&format!("socks5://[::1]:{v6_port}"))).unwrap();
+        let _stream = connect_tcp_via_proxy(
+            "[2001:db8::42]",
+            2222,
+            &ResolvedProxy::Custom(proxy_url),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        v6_task.await.unwrap();
     }
 }

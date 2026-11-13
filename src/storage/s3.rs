@@ -1079,6 +1079,7 @@ mod tests {
             bucket: Some("test-bkt".to_string()),
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::PathStyle,
+            proxy_mode: crate::models::ConnectionProxyMode::Direct,
             ..S3Config::default()
         };
         let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
@@ -1167,6 +1168,7 @@ mod tests {
             bucket: Some("test-bkt".to_string()),
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::PathStyle,
+            proxy_mode: crate::models::ConnectionProxyMode::Direct,
             ..S3Config::default()
         };
         let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
@@ -1320,6 +1322,7 @@ mod tests {
             bucket: Some("test-bkt".to_string()),
             initial_prefix: "/".to_string(),
             addressing_style: S3AddressingStyle::PathStyle,
+            proxy_mode: crate::models::ConnectionProxyMode::Direct,
             ..S3Config::default()
         };
         let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
