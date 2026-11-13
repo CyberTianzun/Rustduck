@@ -492,11 +492,16 @@ impl S3Backend {
         if clean_secret.is_empty() {
             return Err(anyhow!("{}", t.err_s3_secret_key_empty()));
         }
-        let client = Client::builder()
-            .user_agent("Rustduck/0.1.0")
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .build()
-            .context("Failed to initialize S3 HTTP client")?;
+        let resolved_proxy = crate::storage::proxy::resolve_proxy_for_connection(
+            config.proxy_mode,
+            config.proxy_url.as_deref(),
+        );
+        let client = crate::storage::proxy::build_http_client_for_proxy(
+            &resolved_proxy,
+            std::time::Duration::from_secs(15),
+            Some("Rustduck/0.2.4"),
+        )
+        .context("Failed to initialize S3 HTTP client")?;
         Ok(Self {
             config,
             secret_access_key: clean_secret,

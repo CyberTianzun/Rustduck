@@ -4,7 +4,7 @@ use crate::models::{
     GoogleDriveConfig,
 };
 use crate::storage::oauth::{
-    authorize_via_browser_loopback, build_http_client, refresh_access_token,
+    authorize_via_browser_loopback, build_http_client_with_mode, refresh_access_token,
     resolve_oauth_credential,
 };
 use crate::storage::{ProgressCallback, StorageBackend};
@@ -125,7 +125,7 @@ pub async fn authorize_google_drive_in_browser(
     cancel: CancellationToken,
 ) -> anyhow::Result<String> {
     let (client_id, client_secret) = validate_gdrive_oauth_config(config)?;
-    let client = build_http_client(config.proxy_url.as_deref())?;
+    let client = build_http_client_with_mode(config.proxy_mode, config.proxy_url.as_deref())?;
     let token_res = authorize_via_browser_loopback(
         &client,
         GDRIVE_AUTH_URL,
@@ -163,7 +163,7 @@ impl GoogleDriveBackend {
         if initial_rt.is_empty() {
             return Err(anyhow!("{}", i18n().err_oauth_token_empty("Google Drive")));
         }
-        let client = build_http_client(config.proxy_url.as_deref())?;
+        let client = build_http_client_with_mode(config.proxy_mode, config.proxy_url.as_deref())?;
         let mut cache = HashMap::new();
         cache.insert("/".to_string(), "root".to_string());
         Ok(Self {

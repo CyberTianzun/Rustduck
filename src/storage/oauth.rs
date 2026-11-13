@@ -1,8 +1,13 @@
+use crate::models::ConnectionProxyMode;
+use crate::storage::proxy::{
+    build_http_client_for_proxy, normalize_proxy_url as normalize_proxy_url_impl,
+    resolve_proxy_for_connection,
+};
 use anyhow::{anyhow, Context};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use rand::RngCore;
-use reqwest::{Client, Proxy, Url};
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -42,32 +47,19 @@ pub fn resolve_oauth_credential(
 }
 
 pub fn normalize_proxy_url(raw: Option<&str>) -> Option<String> {
-    let trimmed = raw?.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("socks5://")
-        || lower.starts_with("socks5h://")
-        || lower.starts_with("socks4://")
-        || lower.starts_with("socks4a://")
-    {
-        Some(trimmed.to_string())
-    } else {
-        Some(format!("http://{trimmed}"))
-    }
+    normalize_proxy_url_impl(raw)
 }
 
 pub fn build_http_client(proxy_url: Option<&str>) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().connect_timeout(Duration::from_secs(20));
-    if let Some(norm_proxy) = normalize_proxy_url(proxy_url) {
-        let proxy = Proxy::all(&norm_proxy)
-            .with_context(|| format!("Invalid proxy URL '{norm_proxy}'"))?;
-        builder = builder.proxy(proxy);
-    }
-    builder.build().context("Failed to build HTTP client")
+    build_http_client_with_mode(ConnectionProxyMode::Default, proxy_url)
+}
+
+pub fn build_http_client_with_mode(
+    proxy_mode: ConnectionProxyMode,
+    proxy_url: Option<&str>,
+) -> anyhow::Result<Client> {
+    let resolved = resolve_proxy_for_connection(proxy_mode, proxy_url);
+    build_http_client_for_proxy(&resolved, Duration::from_secs(20), None)
 }
 
 pub fn generate_pkce_pair() -> (String, String) {
@@ -414,7 +406,7 @@ mod tests {
         );
         assert_eq!(
             normalize_proxy_url(Some("socks5://127.0.0.1:1080")),
-            Some("socks5://127.0.0.1:1080".to_string())
+            Some("socks5h://127.0.0.1:1080".to_string())
         );
 
         assert!(build_http_client(Some("http://127.0.0.1:7890")).is_ok());

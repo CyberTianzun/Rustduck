@@ -1,4 +1,5 @@
 use crate::models::{join_remote_path, normalize_remote_path, FileEntry, FileKind, FtpConfig};
+use crate::storage::proxy::{connect_tcp_via_proxy, resolve_proxy_for_connection, ProxyStream};
 use crate::storage::{ProgressCallback, StorageBackend};
 use anyhow::{anyhow, Context};
 use chrono::NaiveDateTime;
@@ -8,7 +9,6 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
@@ -17,8 +17,8 @@ pub const DEFAULT_FTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const FTP_CMD_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 enum FtpStream {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(ProxyStream),
+    Tls(Box<TlsStream<ProxyStream>>),
 }
 
 impl AsyncRead for FtpStream {
@@ -303,9 +303,11 @@ async fn connect_ftp_control_with_timeout(
 ) -> anyhow::Result<BufReader<FtpStream>> {
     let host = config.host.trim();
     let port = config.port;
+    let resolved_proxy =
+        resolve_proxy_for_connection(config.proxy_mode, config.proxy_url.as_deref());
 
     tokio::time::timeout(timeout_dur, async {
-        let tcp = TcpStream::connect((host, port))
+        let tcp = connect_tcp_via_proxy(host, port, &resolved_proxy, timeout_dur)
             .await
             .with_context(|| format!("Failed to connect to FTP server {host}:{port}"))?;
 
@@ -413,14 +415,17 @@ impl FtpBackend {
             }
         };
 
-        let tcp = tokio::time::timeout(
+        let resolved_proxy = resolve_proxy_for_connection(
+            self.config.proxy_mode,
+            self.config.proxy_url.as_deref(),
+        );
+        let tcp = connect_tcp_via_proxy(
+            host,
+            data_port,
+            &resolved_proxy,
             DEFAULT_FTP_CONNECT_TIMEOUT,
-            TcpStream::connect((host, data_port)),
         )
         .await
-        .with_context(|| {
-            format!("Timed out connecting FTP passive data channel {host}:{data_port}")
-        })?
         .with_context(|| format!("Failed to connect FTP passive data channel {host}:{data_port}"))?;
 
         if self.config.use_tls {
@@ -746,5 +751,74 @@ mod tests {
             "FTP silent server must time out promptly, took {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn test_ftp_connects_control_channel_through_socks5_proxy() {
+        use crate::models::ConnectionProxyMode;
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+
+        let mock_proxy = tokio::spawn(async move {
+            let (mut sock, _) = proxy_listener.accept().await.unwrap();
+            let mut greet = [0u8; 3];
+            sock.read_exact(&mut greet).await.unwrap();
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut req_hdr = [0u8; 4];
+            sock.read_exact(&mut req_hdr).await.unwrap();
+            assert_eq!(req_hdr, [0x05, 0x01, 0x00, 0x03]);
+            let mut dlen = [0u8; 1];
+            sock.read_exact(&mut dlen).await.unwrap();
+            let mut domain = vec![0u8; dlen[0] as usize];
+            sock.read_exact(&mut domain).await.unwrap();
+            assert_eq!(&domain, b"ftp.mock-behind-proxy.invalid");
+            let mut port_b = [0u8; 2];
+            sock.read_exact(&mut port_b).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port_b), 2121);
+
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x08, 0x49])
+                .await
+                .unwrap();
+
+            // Act as minimal FTP control server over the tunnel
+            sock.write_all(b"220 Mock FTP Ready\r\n").await.unwrap();
+            let mut reader = BufReader::new(sock);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let cmd = line.trim();
+                let resp: &[u8] = if cmd.starts_with("USER ") {
+                    b"230 Logged in\r\n"
+                } else if cmd.starts_with("PWD") {
+                    b"257 \"/remote_root\" is current directory\r\n"
+                } else if cmd.starts_with("QUIT") {
+                    b"221 Bye\r\n"
+                } else {
+                    b"200 OK\r\n"
+                };
+                reader.get_mut().write_all(resp).await.unwrap();
+                if cmd.starts_with("QUIT") {
+                    break;
+                }
+            }
+        });
+
+        let cfg = FtpConfig {
+            host: "ftp.mock-behind-proxy.invalid".to_string(),
+            port: 2121,
+            username: "anonymous".to_string(),
+            use_tls: false,
+            initial_path: "/".to_string(),
+            proxy_mode: ConnectionProxyMode::Custom,
+            proxy_url: Some(format!("socks5://127.0.0.1:{proxy_port}")),
+        };
+        let backend = FtpBackend::new(cfg, String::new()).unwrap();
+        let verified = backend.connect_and_verify().await.unwrap();
+        assert_eq!(verified, "/remote_root");
+        mock_proxy.await.unwrap();
     }
 }

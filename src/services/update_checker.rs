@@ -191,10 +191,13 @@ pub fn evaluate_latest_release(
 }
 
 pub async fn check_github_latest_release(current_version: &str) -> anyhow::Result<UpdateCheckState> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(format!("Rustduck/{current_version}"))
-        .build()?;
+    let resolved_proxy = crate::storage::proxy::resolve_global_proxy();
+    let ua = format!("Rustduck/{current_version}");
+    let client = crate::storage::proxy::build_http_client_for_proxy(
+        &resolved_proxy,
+        Duration::from_secs(10),
+        Some(&ua),
+    )?;
 
     let resp = client
         .get(GITHUB_LATEST_RELEASE_API_URL)

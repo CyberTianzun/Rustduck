@@ -4,7 +4,7 @@ use crate::models::{
     OneDriveConfig,
 };
 use crate::storage::oauth::{
-    authorize_via_browser_loopback, build_http_client, refresh_access_token,
+    authorize_via_browser_loopback, build_http_client_with_mode, refresh_access_token,
     resolve_oauth_credential,
 };
 use crate::storage::s3::encode_s3_key_path;
@@ -128,7 +128,7 @@ pub async fn authorize_onedrive_in_browser(
     cancel: CancellationToken,
 ) -> anyhow::Result<String> {
     let (client_id, client_secret) = validate_onedrive_oauth_config(config)?;
-    let client = build_http_client(config.proxy_url.as_deref())?;
+    let client = build_http_client_with_mode(config.proxy_mode, config.proxy_url.as_deref())?;
     let token_res = authorize_via_browser_loopback(
         &client,
         ONEDRIVE_AUTH_URL,
@@ -165,7 +165,7 @@ impl OneDriveBackend {
         if initial_rt.is_empty() {
             return Err(anyhow!("{}", i18n().err_oauth_token_empty("OneDrive")));
         }
-        let client = build_http_client(config.proxy_url.as_deref())?;
+        let client = build_http_client_with_mode(config.proxy_mode, config.proxy_url.as_deref())?;
         Ok(Self {
             config,
             client,
