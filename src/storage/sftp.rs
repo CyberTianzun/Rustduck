@@ -1,9 +1,13 @@
 use crate::models::{join_remote_path, normalize_remote_path, FileEntry, FileKind, SftpConfig};
+use crate::storage::proxy::{connect_tcp_via_proxy, resolve_proxy_for_connection};
 use crate::storage::{ProgressCallback, StorageBackend};
 use anyhow::{anyhow, Context};
-use russh::client::{self, AuthResult, Config, Handler};
+use russh::client::{self, AuthResult, Config, Handle, Handler};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
+use russh_sftp::client::error::Error as SftpClientError;
 use russh_sftp::client::SftpSession;
+use std::future::Future;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -11,6 +15,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_SFTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_SFTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub const DEFAULT_SFTP_KEEPALIVE_MAX: usize = 3;
 
 struct SshClientHandler;
 
@@ -43,29 +49,177 @@ impl Handler for SshClientHandler {
     }
 }
 
-pub struct SftpBackend {
-    config: SftpConfig,
-    secret: String,
-    session: Mutex<Option<Arc<SftpSession>>>,
+pub fn build_sftp_ssh_config() -> Config {
+    Config {
+        // Never garbage-collect active tabs on idle; keep NAT/firewalls alive via SSH keepalives instead.
+        inactivity_timeout: None,
+        keepalive_interval: Some(DEFAULT_SFTP_KEEPALIVE_INTERVAL),
+        keepalive_max: DEFAULT_SFTP_KEEPALIVE_MAX,
+        ..Config::default()
+    }
 }
 
-pub async fn connect_sftp_session_with_timeout(
+pub fn is_sftp_session_disconnect_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(sftp_err) = cause.downcast_ref::<SftpClientError>() {
+            return match sftp_err {
+                SftpClientError::Status(_) | SftpClientError::Limited(_) => false,
+                SftpClientError::IO(_)
+                | SftpClientError::Timeout
+                | SftpClientError::UnexpectedPacket
+                | SftpClientError::UnexpectedBehavior(_) => true,
+            };
+        }
+        if let Some(ssh_err) = cause.downcast_ref::<russh::Error>() {
+            return matches!(
+                ssh_err,
+                russh::Error::Disconnect
+                    | russh::Error::InactivityTimeout
+                    | russh::Error::KeepaliveTimeout
+                    | russh::Error::SendError
+                    | russh::Error::HUP
+                    | russh::Error::IO(_)
+                    | russh::Error::ConnectionTimeout
+            );
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+                    | ErrorKind::TimedOut
+            ) {
+                return true;
+            }
+        }
+    }
+
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("channel closed")
+        || msg.contains("senderror")
+        || msg.contains("recverror")
+        || msg.contains("broken pipe")
+        || msg.contains("connection reset")
+        || msg.contains("unexpected eof")
+}
+
+#[derive(Clone)]
+struct SftpLiveSession {
+    handle: Arc<Handle<SshClientHandler>>,
+    sftp: Arc<SftpSession>,
+}
+
+impl SftpLiveSession {
+    fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
+}
+
+pub(crate) struct ReconnectSlot<T: Clone> {
+    inner: Mutex<(u64, Option<T>)>,
+    is_closed_check: fn(&T) -> bool,
+}
+
+impl<T: Clone> ReconnectSlot<T> {
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new((0, None)),
+            is_closed_check: |_| false,
+        }
+    }
+
+    pub fn with_liveness_check(is_closed_check: fn(&T) -> bool) -> Self {
+        Self {
+            inner: Mutex::new((0, None)),
+            is_closed_check,
+        }
+    }
+
+    pub async fn get_or_connect<CF, CFut>(&self, mut connect: CF) -> anyhow::Result<(u64, T)>
+    where
+        CF: FnMut() -> CFut,
+        CFut: Future<Output = anyhow::Result<(T, bool)>>,
+    {
+        let mut guard = self.inner.lock().await;
+        if let Some(existing) = guard.1.as_ref() {
+            if !(self.is_closed_check)(existing) {
+                return Ok((guard.0, existing.clone()));
+            }
+            guard.1 = None;
+        }
+
+        let (fresh, _) = connect().await?;
+        guard.0 = guard.0.wrapping_add(1).max(1);
+        let id = guard.0;
+        guard.1 = Some(fresh.clone());
+        Ok((id, fresh))
+    }
+
+    pub async fn evict_if_id(&self, failed_id: u64) {
+        let mut guard = self.inner.lock().await;
+        if guard.1.is_some() && guard.0 == failed_id {
+            guard.1 = None;
+        }
+    }
+
+    pub async fn invalidate_all(&self) {
+        let mut guard = self.inner.lock().await;
+        guard.1 = None;
+    }
+
+    pub async fn run_with_retry<CF, CFut, OF, OFut, R>(
+        &self,
+        mut connect: CF,
+        mut op: OF,
+    ) -> anyhow::Result<R>
+    where
+        CF: FnMut() -> CFut,
+        CFut: Future<Output = anyhow::Result<(T, bool)>>,
+        OF: FnMut(&T) -> OFut,
+        OFut: Future<Output = anyhow::Result<R>>,
+    {
+        for attempt in 0..2 {
+            let (session_id, session) = self.get_or_connect(&mut connect).await?;
+            match op(&session).await {
+                Ok(val) => return Ok(val),
+                Err(err) => {
+                    if is_sftp_session_disconnect_error(&err) {
+                        self.evict_if_id(session_id).await;
+                        if attempt == 0 {
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        unreachable!("retry loop always returns on attempt 0 or 1")
+    }
+}
+
+async fn connect_sftp_live_session_with_timeout(
     config: &SftpConfig,
     secret: &str,
     timeout_dur: Duration,
-) -> anyhow::Result<Arc<SftpSession>> {
+) -> anyhow::Result<SftpLiveSession> {
     let host = config.host.trim();
     let port = config.port;
+    let resolved_proxy =
+        resolve_proxy_for_connection(config.proxy_mode, config.proxy_url.as_deref());
 
     tokio::time::timeout(timeout_dur, async {
-        let ssh_config = Arc::new(Config {
-            inactivity_timeout: Some(Duration::from_secs(30)),
-            ..Config::default()
-        });
-        let addr = (host, port);
-        let mut handle = client::connect(ssh_config, addr, SshClientHandler)
+        let ssh_config = Arc::new(build_sftp_ssh_config());
+        let tcp_stream = connect_tcp_via_proxy(host, port, &resolved_proxy, timeout_dur)
             .await
             .with_context(|| format!("Failed to connect to SSH server {host}:{port}"))?;
+
+        let mut handle = client::connect_stream(ssh_config, tcp_stream, SshClientHandler)
+            .await
+            .with_context(|| format!("Failed SSH handshake with {host}:{port}"))?;
 
         let user = config.username.trim();
         let auth_res = if let Some(key_path) = config
@@ -113,7 +267,10 @@ pub async fn connect_sftp_session_with_timeout(
         let sftp = SftpSession::new(channel.into_stream())
             .await
             .context("Failed to initialize SFTP session")?;
-        Ok(Arc::new(sftp))
+        Ok(SftpLiveSession {
+            handle: Arc::new(handle),
+            sftp: Arc::new(sftp),
+        })
     })
     .await
     .with_context(|| {
@@ -122,6 +279,21 @@ pub async fn connect_sftp_session_with_timeout(
             timeout_dur.as_secs().max(1)
         )
     })?
+}
+
+pub async fn connect_sftp_session_with_timeout(
+    config: &SftpConfig,
+    secret: &str,
+    timeout_dur: Duration,
+) -> anyhow::Result<Arc<SftpSession>> {
+    let live = connect_sftp_live_session_with_timeout(config, secret, timeout_dur).await?;
+    Ok(live.sftp)
+}
+
+pub struct SftpBackend {
+    config: SftpConfig,
+    secret: String,
+    session_slot: ReconnectSlot<SftpLiveSession>,
 }
 
 impl SftpBackend {
@@ -135,24 +307,28 @@ impl SftpBackend {
         Ok(Self {
             config,
             secret,
-            session: Mutex::new(None),
+            session_slot: ReconnectSlot::with_liveness_check(SftpLiveSession::is_closed),
         })
     }
 
-    async fn get_or_connect_session(&self) -> anyhow::Result<Arc<SftpSession>> {
-        let mut guard = self.session.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            return Ok(existing.clone());
-        }
-
-        let arc_sftp = connect_sftp_session_with_timeout(
-            &self.config,
-            &self.secret,
-            DEFAULT_SFTP_CONNECT_TIMEOUT,
-        )
-        .await?;
-        *guard = Some(arc_sftp.clone());
-        Ok(arc_sftp)
+    async fn run_sftp<OF, OFut, R>(&self, mut op: OF) -> anyhow::Result<R>
+    where
+        OF: FnMut(Arc<SftpSession>) -> OFut,
+        OFut: Future<Output = anyhow::Result<R>>,
+    {
+        let cfg = &self.config;
+        let sec = &self.secret;
+        self.session_slot
+            .run_with_retry(
+                || async move {
+                    let live =
+                        connect_sftp_live_session_with_timeout(cfg, sec, DEFAULT_SFTP_CONNECT_TIMEOUT)
+                            .await?;
+                    Ok((live, false))
+                },
+                |live| op(Arc::clone(&live.sftp)),
+            )
+            .await
     }
 }
 
@@ -163,19 +339,29 @@ impl StorageBackend for SftpBackend {
     }
 
     async fn connect_and_verify(&self) -> anyhow::Result<String> {
-        let sftp = self.get_or_connect_session().await?;
         let initial = normalize_remote_path(&self.config.initial_path);
-        let canonical = sftp.canonicalize(&initial).await.unwrap_or(initial);
-        Ok(normalize_remote_path(&canonical))
+        self.run_sftp(|sftp| {
+            let initial = initial.clone();
+            async move {
+                let canonical = sftp.canonicalize(&initial).await.unwrap_or(initial);
+                Ok(normalize_remote_path(&canonical))
+            }
+        })
+        .await
     }
 
     async fn list_dir(&self, path: &str) -> anyhow::Result<Vec<FileEntry>> {
-        let sftp = self.get_or_connect_session().await?;
         let norm_path = normalize_remote_path(path);
-        let read_dir = sftp
-            .read_dir(&norm_path)
-            .await
-            .with_context(|| format!("SFTP read_dir failed for {norm_path}"))?;
+        let read_dir = self
+            .run_sftp(|sftp| {
+                let p = norm_path.clone();
+                async move {
+                    sftp.read_dir(&p)
+                        .await
+                        .with_context(|| format!("SFTP read_dir failed for {p}"))
+                }
+            })
+            .await?;
 
         let mut entries = Vec::new();
         for item in read_dir {
@@ -202,24 +388,34 @@ impl StorageBackend for SftpBackend {
     }
 
     async fn create_dir(&self, path: &str) -> anyhow::Result<()> {
-        let sftp = self.get_or_connect_session().await?;
         let norm = normalize_remote_path(path);
-        sftp.create_dir(&norm)
-            .await
-            .with_context(|| format!("SFTP create_dir failed for {norm}"))
+        self.run_sftp(|sftp| {
+            let p = norm.clone();
+            async move {
+                sftp.create_dir(&p)
+                    .await
+                    .with_context(|| format!("SFTP create_dir failed for {p}"))
+            }
+        })
+        .await
     }
 
     async fn rename(&self, from: &str, to: &str) -> anyhow::Result<()> {
-        let sftp = self.get_or_connect_session().await?;
         let src = normalize_remote_path(from);
         let dst = normalize_remote_path(to);
-        sftp.rename(&src, &dst)
-            .await
-            .with_context(|| format!("SFTP rename failed from {src} to {dst}"))
+        self.run_sftp(|sftp| {
+            let s = src.clone();
+            let d = dst.clone();
+            async move {
+                sftp.rename(&s, &d)
+                    .await
+                    .with_context(|| format!("SFTP rename failed from {s} to {d}"))
+            }
+        })
+        .await
     }
 
     async fn remove(&self, path: &str, is_dir: bool) -> anyhow::Result<()> {
-        let sftp = self.get_or_connect_session().await?;
         let norm = normalize_remote_path(path);
         if is_dir {
             let mut stack = vec![(norm, false)];
@@ -231,22 +427,41 @@ impl StorageBackend for SftpBackend {
                         if child.kind.is_dir_like() {
                             stack.push((child.path, false));
                         } else {
-                            sftp.remove_file(&child.path)
-                                .await
-                                .with_context(|| format!("SFTP remove_file failed for {}", child.path))?;
+                            let file_path = child.path;
+                            self.run_sftp(|sftp| {
+                                let fp = file_path.clone();
+                                async move {
+                                    sftp.remove_file(&fp)
+                                        .await
+                                        .with_context(|| format!("SFTP remove_file failed for {fp}"))
+                                }
+                            })
+                            .await?;
                         }
                     }
                 } else {
-                    sftp.remove_dir(&cur_dir)
-                        .await
-                        .with_context(|| format!("SFTP remove_dir failed for {cur_dir}"))?;
+                    self.run_sftp(|sftp| {
+                        let cd = cur_dir.clone();
+                        async move {
+                            sftp.remove_dir(&cd)
+                                .await
+                                .with_context(|| format!("SFTP remove_dir failed for {cd}"))
+                        }
+                    })
+                    .await?;
                 }
             }
             Ok(())
         } else {
-            sftp.remove_file(&norm)
-                .await
-                .with_context(|| format!("SFTP remove_file failed for {norm}"))
+            self.run_sftp(|sftp| {
+                let p = norm.clone();
+                async move {
+                    sftp.remove_file(&p)
+                        .await
+                        .with_context(|| format!("SFTP remove_file failed for {p}"))
+                }
+            })
+            .await
         }
     }
 
@@ -260,12 +475,17 @@ impl StorageBackend for SftpBackend {
         if cancel.is_cancelled() {
             return Err(anyhow!("Transfer cancelled"));
         }
-        let sftp = self.get_or_connect_session().await?;
         let norm = normalize_remote_path(remote_path);
-        let mut remote_file = sftp
-            .open(&norm)
-            .await
-            .with_context(|| format!("SFTP open failed for {norm}"))?;
+        let mut remote_file = self
+            .run_sftp(|sftp| {
+                let p = norm.clone();
+                async move {
+                    sftp.open(&p)
+                        .await
+                        .with_context(|| format!("SFTP open failed for {p}"))
+                }
+            })
+            .await?;
 
         let mut buf = vec![0u8; 64 * 1024];
         let mut total = 0u64;
@@ -273,7 +493,13 @@ impl StorageBackend for SftpBackend {
             if cancel.is_cancelled() {
                 return Err(anyhow!("Transfer cancelled"));
             }
-            let n = remote_file.read(&mut buf).await?;
+            let n = match remote_file.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    self.session_slot.invalidate_all().await;
+                    return Err(e).with_context(|| format!("SFTP read failed for {norm}"));
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -296,12 +522,17 @@ impl StorageBackend for SftpBackend {
         if cancel.is_cancelled() {
             return Err(anyhow!("Transfer cancelled"));
         }
-        let sftp = self.get_or_connect_session().await?;
         let norm = normalize_remote_path(remote_path);
-        let mut remote_file = sftp
-            .create(&norm)
-            .await
-            .with_context(|| format!("SFTP create failed for {norm}"))?;
+        let mut remote_file = self
+            .run_sftp(|sftp| {
+                let p = norm.clone();
+                async move {
+                    sftp.create(&p)
+                        .await
+                        .with_context(|| format!("SFTP create failed for {p}"))
+                }
+            })
+            .await?;
 
         let mut buf = vec![0u8; 64 * 1024];
         let mut total = 0u64;
@@ -313,11 +544,17 @@ impl StorageBackend for SftpBackend {
             if n == 0 {
                 break;
             }
-            remote_file.write_all(&buf[..n]).await?;
+            if let Err(e) = remote_file.write_all(&buf[..n]).await {
+                self.session_slot.invalidate_all().await;
+                return Err(e).with_context(|| format!("SFTP write failed for {norm}"));
+            }
             total += n as u64;
             progress(total);
         }
-        remote_file.flush().await?;
+        if let Err(e) = remote_file.flush().await {
+            self.session_slot.invalidate_all().await;
+            return Err(e).with_context(|| format!("SFTP flush failed for {norm}"));
+        }
         Ok(())
     }
 }
@@ -367,5 +604,101 @@ mod tests {
             "SFTP silent server must time out promptly, took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn test_sftp_ssh_config_enables_keepalive_and_disables_idle_gc() {
+        let cfg = build_sftp_ssh_config();
+        assert_eq!(cfg.inactivity_timeout, None);
+        assert_eq!(cfg.keepalive_interval, Some(Duration::from_secs(15)));
+        assert_eq!(cfg.keepalive_max, 3);
+    }
+
+    #[test]
+    fn test_sftp_disconnect_error_classification_spares_application_status_errors() {
+        use russh_sftp::client::error::Error as SftpErr;
+        use russh_sftp::protocol::{Status, StatusCode};
+
+        let chan_closed = anyhow::Error::new(SftpErr::UnexpectedBehavior(
+            "SendError: channel closed".to_string(),
+        ))
+        .context("SFTP read_dir failed for /var");
+        assert!(is_sftp_session_disconnect_error(&chan_closed));
+
+        let io_err = anyhow::Error::new(SftpErr::IO("broken pipe".to_string()));
+        assert!(is_sftp_session_disconnect_error(&io_err));
+
+        let timeout_err = anyhow::Error::new(SftpErr::Timeout);
+        assert!(is_sftp_session_disconnect_error(&timeout_err));
+
+        let not_found_status = anyhow::Error::new(SftpErr::Status(Status {
+            id: 1,
+            status_code: StatusCode::NoSuchFile,
+            error_message: "No such file".to_string(),
+            language_tag: "en-US".to_string(),
+        }))
+        .context("SFTP read_dir failed for /missing");
+        assert!(!is_sftp_session_disconnect_error(&not_found_status));
+    }
+
+    #[tokio::test]
+    async fn test_reconnecting_session_slot_evicts_dead_session_once_and_spares_status_errors() {
+        use russh_sftp::client::error::Error as SftpErr;
+        use russh_sftp::protocol::{Status, StatusCode};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let slot: ReconnectSlot<usize> = ReconnectSlot::new();
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+
+        // 1. First session (conn #1) fails with closed channel -> auto-evicts and reconnects (conn #2) -> succeeds!
+        let cc = connect_calls.clone();
+        let val = slot
+            .run_with_retry(
+                || {
+                    let cc = cc.clone();
+                    async move {
+                        let n = cc.fetch_add(1, Ordering::SeqCst) + 1;
+                        Ok((n, false))
+                    }
+                },
+                |&conn_num| async move {
+                    if conn_num == 1 {
+                        Err(anyhow::Error::new(SftpErr::UnexpectedBehavior(
+                            "RecvError: channel closed".to_string(),
+                        )))
+                    } else {
+                        Ok(format!("listed-on-conn-{conn_num}"))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(val, "listed-on-conn-2");
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+
+        // 2. Application error (NoSuchFile) on healthy conn #2 must NOT evict or reconnect!
+        let cc2 = connect_calls.clone();
+        let err = slot
+            .run_with_retry(
+                || {
+                    let cc2 = cc2.clone();
+                    async move {
+                        let n = cc2.fetch_add(1, Ordering::SeqCst) + 1;
+                        Ok((n, false))
+                    }
+                },
+                |_conn| async move {
+                    Err::<(), _>(anyhow::Error::new(SftpErr::Status(Status {
+                        id: 2,
+                        status_code: StatusCode::NoSuchFile,
+                        error_message: "No such file".to_string(),
+                        language_tag: "en".to_string(),
+                    })))
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(!is_sftp_session_disconnect_error(&err));
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
     }
 }
