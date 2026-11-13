@@ -82,8 +82,8 @@ pub fn is_sftp_session_disconnect_error(err: &anyhow::Error) -> bool {
                     | russh::Error::ConnectionTimeout
             );
         }
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if matches!(
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
                 io_err.kind(),
                 ErrorKind::UnexpectedEof
                     | ErrorKind::BrokenPipe
@@ -91,9 +91,9 @@ pub fn is_sftp_session_disconnect_error(err: &anyhow::Error) -> bool {
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::NotConnected
                     | ErrorKind::TimedOut
-            ) {
-                return true;
-            }
+            )
+        {
+            return true;
         }
     }
 

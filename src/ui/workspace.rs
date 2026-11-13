@@ -3,6 +3,7 @@ use crate::models::{
     Bookmark, ConnectionProxyMode, FileEntry, FileKind, FtpConfig, GoogleDriveConfig,
     OneDriveConfig, ProtocolConfig, ProtocolKind, S3AddressingStyle, S3Config, S3Preset,
     SftpConfig, SmbConfig, TransferDirection, TransferStatus, TransferTask, WebDavConfig,
+    normalize_remote_path,
 };
 use crate::services::bookmark_store::{BookmarkStore, KeyringCredentialVault};
 use crate::services::preferences::{
@@ -921,12 +922,49 @@ pub fn resolve_remote_drop_sources(
     out
 }
 
+pub fn resolve_reconnect_target_path(current_remote_path: &str, verified_root: &str) -> String {
+    let trimmed = current_remote_path.trim();
+    if trimmed.is_empty() {
+        normalize_remote_path(verified_root)
+    } else {
+        normalize_remote_path(trimmed)
+    }
+}
+
+pub async fn list_dir_with_reconnect_fallback(
+    backend: &dyn StorageBackend,
+    current_remote_path: &str,
+    verified_root: &str,
+) -> anyhow::Result<(String, Vec<FileEntry>)> {
+    let preferred = resolve_reconnect_target_path(current_remote_path, verified_root);
+    let root_norm = normalize_remote_path(verified_root);
+    match backend.list_dir(&preferred).await {
+        Ok(entries) => Ok((preferred, entries)),
+        Err(primary_err) => {
+            if preferred != root_norm
+                && let Ok(root_entries) = backend.list_dir(&root_norm).await
+            {
+                return Ok((root_norm, root_entries));
+            }
+            if preferred != "/"
+                && root_norm != "/"
+                && let Ok(slash_entries) = backend.list_dir("/").await
+            {
+                return Ok(("/".to_string(), slash_entries));
+            }
+            Err(primary_err)
+        }
+    }
+}
+
 pub struct TabSession {
     pub id: Uuid,
     pub title: String,
     pub is_connected: bool,
     pub connect_tracker: TabConnectAttemptTracker,
     pub status_message: Option<String>,
+    pub remote_error_banner: Option<String>,
+    pub is_reconnecting_remote: bool,
     pub form: ConnectionFormInputs,
     pub local_backend: Arc<dyn StorageBackend>,
     pub remote_backend: Option<Arc<dyn StorageBackend>>,
@@ -1012,6 +1050,8 @@ impl TabSession {
             is_connected: false,
             connect_tracker: TabConnectAttemptTracker::default(),
             status_message: None,
+            remote_error_banner: None,
+            is_reconnecting_remote: false,
             form: ConnectionFormInputs::new(window, cx),
             local_backend: Arc::new(local_fs),
             remote_backend: None,
@@ -2087,6 +2127,8 @@ impl RustduckWorkspace {
                                 tab.remote_backend = Some(backend);
                                 tab.remote_path = initial_path;
                                 tab.remote_entries = entries;
+                                tab.remote_error_banner = None;
+                                tab.is_reconnecting_remote = false;
                                 sync_pane_selection(
                                     &mut tab.selected_remote_paths,
                                     &mut tab.selected_remote_path,
@@ -2108,11 +2150,131 @@ impl RustduckWorkspace {
         .detach();
     }
 
+    pub fn reconnect_remote_session(
+        &mut self,
+        tab_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tab_idx >= self.tabs.len() || !self.tabs[tab_idx].is_connected {
+            return;
+        }
+        let t = i18n();
+        let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
+        let (_title, config, mut secret) = self.read_form_config(tab_idx, cx);
+        if secret.trim().is_empty()
+            && let Some(bm_id) = self.tabs[tab_idx].form.bookmark_id
+            && let Ok(Some(saved_sec)) = self.bookmark_store.get_secret(bm_id)
+        {
+            secret = saved_sec;
+        }
+
+        let backend = match create_backend(&config, &secret) {
+            Ok(b) => b,
+            Err(e) => {
+                let clean = format_single_line_status(&format!("{e}"));
+                self.tabs[tab_idx].is_reconnecting_remote = false;
+                self.tabs[tab_idx].remote_error_banner = Some(clean.clone());
+                self.tabs[tab_idx].status_message = Some(t.msg_remote_conn_lost(&clean));
+                cx.notify();
+                return;
+            }
+        };
+
+        let current_remote_path = self.tabs[tab_idx].remote_path.clone();
+        let (attempt_id, cancel) = self.tabs[tab_idx]
+            .connect_tracker
+            .begin(PendingConnOp::Connect);
+        self.tabs[tab_idx].is_reconnecting_remote = true;
+        self.tabs[tab_idx].status_message = Some(t.msg_reconnecting_remote());
+        cx.notify();
+
+        let tab_id = self.tabs[tab_idx].id;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let join_handle = tokio_runtime().spawn(async move {
+            let reconnect_fut = async {
+                let verified_root = backend.connect_and_verify().await?;
+                let (resolved_path, entries) = list_dir_with_reconnect_fallback(
+                    backend.as_ref(),
+                    &current_remote_path,
+                    &verified_root,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((backend, resolved_path, entries))
+            };
+            let res = tokio::select! {
+                _ = cancel.cancelled() => Err(anyhow::anyhow!("Reconnect cancelled")),
+                r = reconnect_fut => r,
+            };
+            let _ = tx.send(res);
+        });
+        self.tabs[tab_idx]
+            .connect_tracker
+            .attach_abort_handle(attempt_id, join_handle.abort_handle());
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(result) = rx.await {
+                let _ = this.update_in(cx, |ws, window, cx| {
+                    let t = i18n();
+                    if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if !tab.is_connected || !tab.connect_tracker.finish_if_current(attempt_id) {
+                            tab.is_reconnecting_remote = false;
+                            return;
+                        }
+                        tab.is_reconnecting_remote = false;
+                        match result {
+                            Ok((backend, resolved_path, entries)) => {
+                                if let Some(new_sec) = backend.exported_secret() {
+                                    tab.form.secret_input.update(cx, |s, cx| {
+                                        s.set_value(new_sec.clone(), window, cx)
+                                    });
+                                    if let Some(bm_id) = tab.form.bookmark_id {
+                                        let _ = ws.bookmark_store.set_secret(bm_id, &new_sec);
+                                    }
+                                }
+                                tab.remote_backend = Some(backend);
+                                tab.remote_path = resolved_path.clone();
+                                tab.remote_path_input.update(cx, |s, cx| {
+                                    s.set_value(resolved_path, window, cx)
+                                });
+                                tab.remote_entries = entries;
+                                prune_selection_against_entries(
+                                    &mut tab.selected_remote_paths,
+                                    &mut tab.selected_remote_path,
+                                    &tab.remote_entries,
+                                );
+                                tab.remote_error_banner = None;
+                                tab.rebuild_visible_cache(false, cx);
+                                tab.status_message = Some(t.msg_reconnected_ok());
+                            }
+                            Err(e) => {
+                                let clean = format_single_line_status(&format!("{e}"));
+                                tab.remote_error_banner = Some(clean.clone());
+                                tab.status_message = Some(t.msg_remote_conn_lost(&clean));
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn dismiss_remote_error_banner(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(tab_idx) {
+            tab.remote_error_banner = None;
+            cx.notify();
+        }
+    }
+
     pub fn disconnect_tab(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
         let t = i18n();
         let tab = &mut self.tabs[tab_idx];
         let _ = tab.connect_tracker.cancel_current();
         tab.is_connected = false;
+        tab.is_reconnecting_remote = false;
+        tab.remote_error_banner = None;
         tab.remote_backend = None;
         tab.remote_entries.clear();
         sync_pane_selection(
@@ -2533,6 +2695,7 @@ impl RustduckWorkspace {
                         match res {
                             Ok(entries) => {
                                 tab.remote_entries = entries;
+                                tab.remote_error_banner = None;
                                 prune_selection_against_entries(
                                     &mut tab.selected_remote_paths,
                                     &mut tab.selected_remote_path,
@@ -2542,7 +2705,9 @@ impl RustduckWorkspace {
                                 tab.status_message = Some(t.msg_remote_dir_synced());
                             }
                             Err(e) => {
-                                tab.status_message = Some(format!("{e}"));
+                                let clean = format_single_line_status(&format!("{e}"));
+                                tab.remote_error_banner = Some(clean.clone());
+                                tab.status_message = Some(t.msg_remote_conn_lost(&clean));
                             }
                         }
                     }
@@ -2718,7 +2883,11 @@ impl RustduckWorkspace {
                                 }
                             }
                             Err(e) => {
-                                ws.tabs[idx].status_message = Some(format!("{e}"));
+                                let clean = format_single_line_status(&format!("{e}"));
+                                if !is_local {
+                                    ws.tabs[idx].remote_error_banner = Some(clean.clone());
+                                }
+                                ws.tabs[idx].status_message = Some(clean);
                             }
                         }
                     }
@@ -2792,7 +2961,11 @@ impl RustduckWorkspace {
                                 }
                             }
                             Err(e) => {
-                                ws.tabs[idx].status_message = Some(format!("{e}"));
+                                let clean = format_single_line_status(&format!("{e}"));
+                                if !is_local {
+                                    ws.tabs[idx].remote_error_banner = Some(clean.clone());
+                                }
+                                ws.tabs[idx].status_message = Some(clean);
                             }
                         }
                     }
@@ -2879,7 +3052,11 @@ impl RustduckWorkspace {
                 let _ = this.update(cx, |ws, cx| {
                     if let Some(idx) = ws.tabs.iter().position(|t| t.id == tab_id) {
                         if let Some(e) = first_err {
-                            ws.tabs[idx].status_message = Some(format!("{e}"));
+                            let clean = format_single_line_status(&format!("{e}"));
+                            if !is_local {
+                                ws.tabs[idx].remote_error_banner = Some(clean.clone());
+                            }
+                            ws.tabs[idx].status_message = Some(clean);
                         }
                         ws.set_selected_paths(idx, is_local, Vec::new(), cx);
                         if is_local {
@@ -3182,7 +3359,13 @@ impl RustduckWorkspace {
             .map(|(idx, tab)| {
                 let (proto_icon, proto_color) = protocol_icon_and_color(tab.form.protocol);
                 let dot_color = if tab.is_connected {
-                    accent_green()
+                    if tab.is_reconnecting_remote {
+                        accent_amber()
+                    } else if tab.remote_error_banner.is_some() {
+                        accent_red()
+                    } else {
+                        accent_green()
+                    }
                 } else if tab.is_connecting() {
                     accent_amber()
                 } else {
@@ -3368,6 +3551,7 @@ pub fn is_error_status_message(msg: &str) -> bool {
     msg.contains("失败")
         || msg.contains("无效")
         || msg.contains("错误")
+        || msg.contains("异常")
         || msg.contains("缺少")
         || msg.contains("未检测到")
         || msg.contains("不能")
@@ -3999,6 +4183,108 @@ mod tests {
                 && main_src.contains("configure_app_lifecycle(")
                 && main_src.contains("register_main_window_close_quit("),
             "main.rs must configure LastWindowClosed quit mode, app lifecycle menus/shortcuts, and main window close quit guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_reconnect_target_path_preserves_current_dir_and_falls_back_cleanly() {
+        use async_trait::async_trait;
+        use tokio::io::{AsyncRead, AsyncWrite};
+
+        assert_eq!(
+            resolve_reconnect_target_path("/var/log/nginx", "/home/deploy"),
+            "/var/log/nginx"
+        );
+        assert_eq!(
+            resolve_reconnect_target_path("   ", "/home/deploy"),
+            "/home/deploy"
+        );
+        assert_eq!(resolve_reconnect_target_path("var/log/", "/"), "/var/log");
+
+        struct MockReconnectBackend {
+            valid_dir: String,
+        }
+
+        #[async_trait]
+        impl StorageBackend for MockReconnectBackend {
+            fn protocol_name(&self) -> &'static str {
+                "MockSFTP"
+            }
+            async fn connect_and_verify(&self) -> anyhow::Result<String> {
+                Ok("/home/deploy".into())
+            }
+            async fn list_dir(&self, path: &str) -> anyhow::Result<Vec<FileEntry>> {
+                if path == self.valid_dir || path == "/home/deploy" {
+                    Ok(vec![FileEntry {
+                        name: "app.log".into(),
+                        path: format!("{path}/app.log"),
+                        kind: FileKind::File,
+                        size: 128,
+                        modified_unix: None,
+                        permissions: None,
+                    }])
+                } else {
+                    anyhow::bail!("No such file: {path}")
+                }
+            }
+            async fn create_dir(&self, _path: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn rename(&self, _from: &str, _to: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn remove(&self, _path: &str, _is_dir: bool) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn download_stream(
+                &self,
+                _remote_path: &str,
+                _dst: &mut (dyn AsyncWrite + Unpin + Send),
+                _on_progress: crate::storage::ProgressCallback,
+                _cancel: CancellationToken,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn upload_stream(
+                &self,
+                _src: &mut (dyn AsyncRead + Unpin + Send),
+                _total_size: Option<u64>,
+                _remote_path: &str,
+                _on_progress: crate::storage::ProgressCallback,
+                _cancel: CancellationToken,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let backend = MockReconnectBackend {
+            valid_dir: "/var/log/nginx".into(),
+        };
+        let (kept_path, entries) =
+            list_dir_with_reconnect_fallback(&backend, "/var/log/nginx", "/home/deploy")
+                .await
+                .unwrap();
+        assert_eq!(kept_path, "/var/log/nginx");
+        assert_eq!(entries.len(), 1);
+
+        let (fallback_path, root_entries) =
+            list_dir_with_reconnect_fallback(&backend, "/deleted/subdir", "/home/deploy")
+                .await
+                .unwrap();
+        assert_eq!(fallback_path, "/home/deploy");
+        assert_eq!(root_entries.len(), 1);
+
+        let dual_pane_src = include_str!("dual_pane_view.rs");
+        assert!(
+            !dual_pane_src.contains("render_connected_session_toolbar")
+                && !dual_pane_src.contains("back-to-bookmarks")
+                && !dual_pane_src.contains("sync-refresh-both"),
+            "redundant top session toolbar must be completely removed from dual_pane_view.rs"
+        );
+        assert!(
+            dual_pane_src.contains("disconnect-remote-session")
+                && dual_pane_src.contains("reconnect-remote-btn"),
+            "compact remote disconnect action and inline reconnect banner must be wired in dual_pane_view.rs"
         );
     }
 }

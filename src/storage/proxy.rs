@@ -186,10 +186,10 @@ fn detect_env_proxy_url() -> Option<String> {
         "HTTP_PROXY",
         "http_proxy",
     ] {
-        if let Ok(val) = std::env::var(key) {
-            if let Some(norm) = normalize_proxy_url(Some(&val)) {
-                return Some(norm);
-            }
+        if let Ok(val) = std::env::var(key)
+            && let Some(norm) = normalize_proxy_url(Some(&val))
+        {
+            return Some(norm);
         }
     }
     None

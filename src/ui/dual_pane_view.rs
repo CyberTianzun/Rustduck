@@ -8,7 +8,7 @@ use crate::ui::native_file_list::{
     NativeRowViewModel,
 };
 use crate::ui::{
-    accent_blue, bg_canvas, bg_elevated, bg_panel, border_subtle, is_dark_theme,
+    accent_blue, accent_red, bg_canvas, bg_elevated, bg_panel, border_subtle, is_dark_theme,
     protocol_icon_and_color, text_muted, text_primary, workspace::RustduckWorkspace,
 };
 use gpui::{
@@ -30,134 +30,25 @@ pub fn render_dual_pane_view(
     ws: &RustduckWorkspace,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
-    let top_toolbar = render_connected_session_toolbar(tab_idx, ws, cx);
     let left_pane = render_single_pane(tab_idx, true, ws, cx);
     let right_pane = render_single_pane(tab_idx, false, ws, cx);
 
-    v_flex()
+    div()
         .size_full()
         .bg(bg_canvas())
-        .child(top_toolbar)
+        .min_h_0()
+        .overflow_hidden()
         .child(
-            div()
-                .flex_1()
-                .w_full()
-                .h_full()
-                .min_h_0()
-                .overflow_hidden()
+            h_resizable(("transmit-dual-pane-split", tab_idx))
                 .child(
-                    h_resizable(("transmit-dual-pane-split", tab_idx))
-                        .child(
-                            resizable_panel()
-                                .size_range(px(DUAL_PANE_MIN_WIDTH_PX)..px(DUAL_PANE_MAX_WIDTH_PX))
-                                .child(left_pane),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size_range(px(DUAL_PANE_MIN_WIDTH_PX)..px(DUAL_PANE_MAX_WIDTH_PX))
-                                .child(right_pane),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn render_connected_session_toolbar(
-    tab_idx: usize,
-    ws: &RustduckWorkspace,
-    cx: &mut Context<RustduckWorkspace>,
-) -> AnyElement {
-    let t = i18n();
-    let tab = &ws.tabs[tab_idx];
-    let show_hidden = tab.show_hidden;
-    let (proto_icon, proto_color) = protocol_icon_and_color(tab.form.protocol);
-
-    h_flex()
-        .w_full()
-        .h(px(36.0))
-        .px_4()
-        .bg(bg_panel())
-        .border_b_1()
-        .border_color(border_subtle())
-        .justify_between()
-        .items_center()
-        .child(
-            h_flex()
-                .gap_2p5()
-                .items_center()
-                .child(
-                    Button::new("back-to-bookmarks")
-                        .xsmall()
-                        .secondary()
-                        .icon(IconName::Star)
-                        .label(t.favorites_back_btn())
-                        .tooltip(t.favorites_back_tooltip())
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
-                            this.disconnect_tab(tab_idx, cx);
-                        })),
+                    resizable_panel()
+                        .size_range(px(DUAL_PANE_MIN_WIDTH_PX)..px(DUAL_PANE_MAX_WIDTH_PX))
+                        .child(left_pane),
                 )
                 .child(
-                    h_flex()
-                        .gap_1p5()
-                        .px_2p5()
-                        .py_0p5()
-                        .rounded(px(6.0))
-                        .bg(bg_elevated())
-                        .border_1()
-                        .border_color(border_subtle())
-                        .items_center()
-                        .child(Icon::new(proto_icon).xsmall().text_color(proto_color))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(text_primary())
-                                .child(tab.title.clone()),
-                        ),
-                )
-                .child(
-                    Button::new("sync-refresh-both")
-                        .xsmall()
-                        .ghost()
-                        .icon(IconName::RefreshCw)
-                        .label(t.sync_refresh_both_btn())
-                        .on_click(cx.listener(move |this, _ev, window, cx| {
-                            this.refresh_local_pane(tab_idx, window, cx);
-                            this.refresh_remote_pane(tab_idx, window, cx);
-                        })),
-                ),
-        )
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    Button::new("toggle-hidden-files")
-                        .xsmall()
-                        .icon(if show_hidden {
-                            IconName::Eye
-                        } else {
-                            IconName::EyeOff
-                        })
-                        .with_variant(if show_hidden {
-                            ButtonVariant::Primary
-                        } else {
-                            ButtonVariant::Secondary
-                        })
-                        .label(t.toggle_hidden_btn(show_hidden))
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
-                            this.toggle_show_hidden(tab_idx, cx);
-                        })),
-                )
-                .child(
-                    Button::new("disconnect-session")
-                        .xsmall()
-                        .danger()
-                        .icon(IconName::Unplug)
-                        .label(t.disconnect_btn())
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
-                            this.disconnect_tab(tab_idx, cx);
-                        })),
+                    resizable_panel()
+                        .size_range(px(DUAL_PANE_MIN_WIDTH_PX)..px(DUAL_PANE_MAX_WIDTH_PX))
+                        .child(right_pane),
                 ),
         )
         .into_any_element()
@@ -218,6 +109,7 @@ fn render_single_pane(
         is_local,
         &tab.title,
         tab.form.protocol,
+        tab.show_hidden,
         filter_input,
         &selected_entries,
         cx,
@@ -230,6 +122,18 @@ fn render_single_pane(
         breadcrumbs,
         cx,
     );
+    let reconnect_banner = if !is_local
+        && (tab.remote_error_banner.is_some() || tab.is_reconnecting_remote)
+    {
+        Some(render_remote_reconnect_banner(
+            tab_idx,
+            tab.remote_error_banner.as_deref(),
+            tab.is_reconnecting_remote,
+            cx,
+        ))
+    } else {
+        None
+    };
     let file_table = render_pane_file_table(
         tab_idx,
         is_local,
@@ -255,16 +159,106 @@ fn render_single_pane(
         .bg(bg_canvas())
         .child(action_header)
         .child(breadcrumb_bar)
+        .when_some(reconnect_banner, |el, banner| el.child(banner))
         .child(file_table)
         .child(footer)
         .into_any_element()
 }
 
+fn render_remote_reconnect_banner(
+    tab_idx: usize,
+    error_text: Option<&str>,
+    is_reconnecting: bool,
+    cx: &mut Context<RustduckWorkspace>,
+) -> AnyElement {
+    let t = i18n();
+    let fg_color = if is_reconnecting {
+        accent_blue()
+    } else {
+        accent_red()
+    };
+    let message = if is_reconnecting {
+        t.msg_reconnecting_remote()
+    } else {
+        t.msg_remote_conn_lost(error_text.unwrap_or_default())
+    };
+
+    h_flex()
+        .w_full()
+        .px_3()
+        .py_1p5()
+        .gap_2()
+        .bg(bg_elevated())
+        .border_b_1()
+        .border_color(fg_color)
+        .justify_between()
+        .items_center()
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1p5()
+                .items_center()
+                .overflow_hidden()
+                .child(
+                    Icon::new(if is_reconnecting {
+                        IconName::RefreshCw
+                    } else {
+                        IconName::Unplug
+                    })
+                    .xsmall()
+                    .text_color(fg_color),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(fg_color)
+                        .child(message),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_1p5()
+                .flex_shrink_0()
+                .items_center()
+                .child(
+                    Button::new(("reconnect-remote-btn", tab_idx))
+                        .xsmall()
+                        .primary()
+                        .icon(IconName::RefreshCw)
+                        .loading(is_reconnecting)
+                        .label(t.reconnect_now_btn(is_reconnecting))
+                        .on_click(cx.listener(move |this, _ev, window, cx| {
+                            this.reconnect_remote_session(tab_idx, window, cx);
+                        })),
+                )
+                .when(!is_reconnecting, |row| {
+                    row.child(
+                        Button::new(("dismiss-remote-err-btn", tab_idx))
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .icon(IconName::X)
+                            .tooltip(t.cancel_btn())
+                            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                this.dismiss_remote_error_banner(tab_idx, cx);
+                            })),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_pane_action_header(
     tab_idx: usize,
     is_local: bool,
     tab_title: &str,
     protocol: crate::models::ProtocolKind,
+    show_hidden: bool,
     filter_input: &Entity<InputState>,
     selected_entries: &[FileEntry],
     cx: &mut Context<RustduckWorkspace>,
@@ -298,6 +292,7 @@ fn render_pane_action_header(
         .w_full()
         .h(px(38.0))
         .px_3()
+        .gap_2()
         .bg(bg_panel())
         .border_b_1()
         .border_color(border_subtle())
@@ -305,11 +300,16 @@ fn render_pane_action_header(
         .items_center()
         .child(
             h_flex()
-                .gap_1p5()
+                .min_w_0()
+                .gap_1()
                 .items_center()
+                .overflow_hidden()
                 .child(Icon::new(pane_icon).xsmall().text_color(pane_icon_color))
                 .child(
                     div()
+                        .max_w(px(210.0))
+                        .truncate()
+                        .mr_0p5()
                         .text_xs()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(text_primary())
@@ -319,6 +319,7 @@ fn render_pane_action_header(
                     Button::new((side_prefix, 1usize))
                         .xsmall()
                         .ghost()
+                        .compact()
                         .icon(IconName::ChevronUp)
                         .tooltip(t.nav_up_tooltip())
                         .on_click(cx.listener(move |this, _ev, window, cx| {
@@ -329,6 +330,7 @@ fn render_pane_action_header(
                     Button::new((side_prefix, 2usize))
                         .xsmall()
                         .ghost()
+                        .compact()
                         .icon(IconName::RefreshCw)
                         .tooltip(t.refresh_dir_tooltip())
                         .on_click(cx.listener(move |this, _ev, window, cx| {
@@ -338,10 +340,30 @@ fn render_pane_action_header(
                                 this.refresh_remote_pane(tab_idx, window, cx);
                             }
                         })),
+                )
+                .child(
+                    Button::new((side_prefix, 7usize))
+                        .xsmall()
+                        .compact()
+                        .icon(if show_hidden {
+                            IconName::Eye
+                        } else {
+                            IconName::EyeOff
+                        })
+                        .with_variant(if show_hidden {
+                            ButtonVariant::Secondary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .tooltip(t.toggle_hidden_btn(show_hidden))
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.toggle_show_hidden(tab_idx, cx);
+                        })),
                 ),
         )
         .child(
             h_flex()
+                .flex_shrink_0()
                 .gap_1p5()
                 .items_center()
                 .when(can_transfer, |bar| {
@@ -373,6 +395,7 @@ fn render_pane_action_header(
                     Button::new((side_prefix, 4usize))
                         .xsmall()
                         .secondary()
+                        .compact()
                         .icon(IconName::FolderPlus)
                         .tooltip(t.new_folder_tooltip())
                         .on_click(cx.listener(move |this, _ev, window, cx| {
@@ -384,6 +407,7 @@ fn render_pane_action_header(
                         Button::new((side_prefix, 5usize))
                             .xsmall()
                             .secondary()
+                            .compact()
                             .icon(IconName::Pencil)
                             .tooltip(t.rename_selected_tooltip())
                             .on_click(cx.listener(move |this, _ev, window, cx| {
@@ -396,6 +420,7 @@ fn render_pane_action_header(
                         Button::new((side_prefix, 6usize))
                             .xsmall()
                             .danger()
+                            .compact()
                             .icon(IconName::Trash)
                             .tooltip(t.delete_selected_tooltip())
                             .on_click(cx.listener(move |this, _ev, _win, cx| {
@@ -404,13 +429,27 @@ fn render_pane_action_header(
                     )
                 })
                 .child(
-                    div().w(px(145.0)).child(
+                    div().w(px(140.0)).child(
                         Input::new(filter_input)
                             .xsmall()
                             .prefix(Icon::new(IconName::Search).xsmall().text_color(text_muted()))
                             .cleanable(true),
                     ),
-                ),
+                )
+                .when(!is_local, |bar| {
+                    bar.child(div().w(px(1.0)).h(px(16.0)).mx_0p5().bg(border_subtle()))
+                        .child(
+                            Button::new(("disconnect-remote-session", tab_idx))
+                                .xsmall()
+                                .danger()
+                                .compact()
+                                .icon(IconName::Unplug)
+                                .tooltip(t.disconnect_btn())
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    this.disconnect_tab(tab_idx, cx);
+                                })),
+                        )
+                }),
         )
         .into_any_element()
 }
