@@ -499,7 +499,7 @@ impl S3Backend {
         let client = crate::storage::proxy::build_http_client_for_proxy(
             &resolved_proxy,
             std::time::Duration::from_secs(15),
-            Some("Rustduck/0.2.4"),
+            Some(concat!("Rustduck/", env!("CARGO_PKG_VERSION"))),
         )
         .context("Failed to initialize S3 HTTP client")?;
         Ok(Self {

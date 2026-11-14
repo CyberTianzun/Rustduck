@@ -1979,13 +1979,23 @@ mod tests {
 
     #[test]
     fn test_system_icon_cache_resolves_valid_indices_for_dir_and_files() {
-        let mut cache = ShellIconCache::new();
-        let dir_icon = cache.icon_index_for(true, false, true, "");
-        let txt_icon = cache.icon_index_for(false, false, false, "txt");
-        let exe_icon = cache.icon_index_for(false, false, false, "exe");
-        assert!(dir_icon >= 0);
-        assert!(txt_icon >= 0);
-        assert!(exe_icon >= 0);
+        std::thread::spawn(|| {
+            let ole_ok = unsafe { OleInitialize(None).is_ok() };
+            let mut cache = ShellIconCache::new();
+            let dir_icon = cache.icon_index_for(true, false, true, "");
+            let txt_icon = cache.icon_index_for(false, false, false, "txt");
+            let exe_icon = cache.icon_index_for(false, false, false, "exe");
+            if ole_ok {
+                unsafe {
+                    OleUninitialize();
+                }
+            }
+            assert!(dir_icon >= 0);
+            assert!(txt_icon >= 0);
+            assert!(exe_icon >= 0);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
