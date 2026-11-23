@@ -32,7 +32,7 @@ impl ProtocolKind {
             ProtocolKind::S3 => "S3",
             ProtocolKind::Smb => "SMB",
             ProtocolKind::WebDav => "WebDAV",
-            ProtocolKind::GoogleDrive => "GDrive",
+            ProtocolKind::GoogleDrive => "Google Drive",
             ProtocolKind::OneDrive => "OneDrive",
         }
     }

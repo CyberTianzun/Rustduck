@@ -9,7 +9,8 @@ use crate::ui::native_file_list::{
 };
 use crate::ui::{
     accent_blue, accent_red, bg_canvas, bg_elevated, bg_panel, border_subtle, is_dark_theme,
-    protocol_icon_and_color, text_muted, text_primary, workspace::RustduckWorkspace,
+    protocol_icon_element, text_muted, text_primary, workspace::RustduckWorkspace,
+    PROTOCOL_ICON_XS,
 };
 use gpui::{
     div, prelude::*, px, relative, AnyElement, App, Bounds, Context, Element, ElementId, Entity,
@@ -275,15 +276,19 @@ fn render_pane_action_header(
 ) -> AnyElement {
     let t = i18n();
     let side_prefix = if is_local { "local" } else { "remote" };
-    let (pane_icon, pane_icon_color, pane_title) = if is_local {
+    let (pane_icon, pane_title) = if is_local {
         (
-            IconName::Laptop,
-            accent_blue(),
+            Icon::new(IconName::Laptop)
+                .xsmall()
+                .text_color(accent_blue())
+                .into_any_element(),
             t.local_pane_title().to_string(),
         )
     } else {
-        let (p_icon, p_col) = protocol_icon_and_color(protocol);
-        (p_icon, p_col, t.remote_pane_title(tab_title))
+        (
+            protocol_icon_element(protocol, PROTOCOL_ICON_XS),
+            t.remote_pane_title(tab_title),
+        )
     };
 
     let can_transfer = selected_entries
@@ -314,7 +319,7 @@ fn render_pane_action_header(
                 .gap_1()
                 .items_center()
                 .overflow_hidden()
-                .child(Icon::new(pane_icon).xsmall().text_color(pane_icon_color))
+                .child(pane_icon)
                 .child(
                     div()
                         .max_w(px(210.0))

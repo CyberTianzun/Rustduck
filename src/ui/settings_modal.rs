@@ -8,7 +8,7 @@ use crate::ui::workspace::RustduckWorkspace;
 use crate::ui::{
     accent_amber, accent_blue, accent_green, accent_red, bg_canvas, bg_elevated, bg_panel,
     bg_row_hover, bg_row_selected, border_selected, border_strong, border_subtle,
-    protocol_icon_and_color, text_muted, text_primary, text_secondary,
+    protocol_icon_element, text_muted, text_primary, text_secondary, PROTOCOL_ICON_XS,
 };
 use gpui::{
     div, img, prelude::*, px, AnyElement, Context, FontWeight, IntoElement, MouseButton,
@@ -791,14 +791,6 @@ fn render_about_settings(
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
-    let (sftp_icon, sftp_col) = protocol_icon_and_color(ProtocolKind::Sftp);
-    let (ftp_icon, ftp_col) = protocol_icon_and_color(ProtocolKind::Ftp);
-    let (s3_icon, s3_col) = protocol_icon_and_color(ProtocolKind::S3);
-    let (smb_icon, smb_col) = protocol_icon_and_color(ProtocolKind::Smb);
-    let (webdav_icon, webdav_col) = protocol_icon_and_color(ProtocolKind::WebDav);
-    let (gdrive_icon, gdrive_col) = protocol_icon_and_color(ProtocolKind::GoogleDrive);
-    let (onedrive_icon, onedrive_col) = protocol_icon_and_color(ProtocolKind::OneDrive);
-
     let brand_card = h_flex()
         .w_full()
         .p_4()
@@ -867,13 +859,13 @@ fn render_about_settings(
                 .min_w_0()
                 .gap_2()
                 .flex_wrap()
-                .child(render_protocol_pill(sftp_icon, sftp_col, t.proto_sftp_label()))
-                .child(render_protocol_pill(ftp_icon, ftp_col, t.proto_ftp_label()))
-                .child(render_protocol_pill(s3_icon, s3_col, t.proto_s3_label()))
-                .child(render_protocol_pill(smb_icon, smb_col, t.proto_smb_label()))
-                .child(render_protocol_pill(webdav_icon, webdav_col, t.proto_webdav_label()))
-                .child(render_protocol_pill(gdrive_icon, gdrive_col, t.proto_gdrive_label()))
-                .child(render_protocol_pill(onedrive_icon, onedrive_col, t.proto_onedrive_label())),
+                .child(render_protocol_pill(ProtocolKind::Sftp, t.proto_sftp_label()))
+                .child(render_protocol_pill(ProtocolKind::Ftp, t.proto_ftp_label()))
+                .child(render_protocol_pill(ProtocolKind::S3, t.proto_s3_label()))
+                .child(render_protocol_pill(ProtocolKind::Smb, t.proto_smb_label()))
+                .child(render_protocol_pill(ProtocolKind::WebDav, t.proto_webdav_label()))
+                .child(render_protocol_pill(ProtocolKind::GoogleDrive, t.proto_gdrive_label()))
+                .child(render_protocol_pill(ProtocolKind::OneDrive, t.proto_onedrive_label())),
         );
 
     let is_checking = matches!(ws.update_state, UpdateCheckState::Checking);
@@ -988,11 +980,7 @@ fn render_about_settings(
         .into_any_element()
 }
 
-fn render_protocol_pill(
-    icon: IconName,
-    color: gpui::Hsla,
-    label: &'static str,
-) -> AnyElement {
+fn render_protocol_pill(protocol: ProtocolKind, label: &'static str) -> AnyElement {
     h_flex()
         .px_2p5()
         .py_1()
@@ -1002,7 +990,7 @@ fn render_protocol_pill(
         .border_1()
         .border_color(border_subtle())
         .items_center()
-        .child(Icon::new(icon).xsmall().text_color(color))
+        .child(protocol_icon_element(protocol, PROTOCOL_ICON_XS))
         .child(div().text_xs().text_color(text_primary()).child(label))
         .into_any_element()
 }

@@ -38,7 +38,7 @@ use crate::ui::settings_modal::{APP_VERSION, SettingsTab, render_settings_modal}
 use crate::ui::transfer_drawer::render_transfer_drawer;
 use crate::ui::{
     accent_amber, accent_blue, accent_green, accent_red, apply_theme_preference, bg_canvas,
-    bg_elevated, border_subtle, protocol_icon_and_color, text_muted, text_primary,
+    bg_elevated, border_subtle, protocol_icon_element, text_muted, text_primary, PROTOCOL_ICON_XS,
 };
 use futures::StreamExt as _;
 use gpui::{
@@ -48,7 +48,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::InputState;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{Icon, Sizable as _, TitleBar, h_flex, v_flex};
+use gpui_component::{Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -3559,7 +3559,7 @@ impl RustduckWorkspace {
             .iter()
             .enumerate()
             .map(|(idx, tab)| {
-                let (proto_icon, proto_color) = protocol_icon_and_color(tab.form.protocol);
+                let proto_icon = protocol_icon_element(tab.form.protocol, PROTOCOL_ICON_XS);
                 let dot_color = if tab.is_connected {
                     if tab.is_reconnecting_remote {
                         accent_amber()
@@ -3580,7 +3580,7 @@ impl RustduckWorkspace {
                             .gap_1p5()
                             .items_center()
                             .child(div().size(px(6.0)).rounded(px(99.0)).bg(dot_color))
-                            .child(Icon::new(proto_icon).xsmall().text_color(proto_color)),
+                            .child(proto_icon),
                     )
                     .label(tab.title.clone())
                     .suffix(

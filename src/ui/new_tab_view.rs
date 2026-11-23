@@ -4,8 +4,9 @@ use crate::storage::gdrive::has_default_gdrive_oauth_credentials;
 use crate::storage::onedrive::has_default_onedrive_oauth_credentials;
 use crate::ui::{
     accent_amber, accent_blue, accent_red, bg_canvas, bg_elevated, bg_panel, bg_row_hover,
-    bg_row_selected, border_selected, border_strong, border_subtle, protocol_icon_and_color,
-    text_muted, text_primary, text_secondary,
+    bg_row_selected, border_selected, border_strong, border_subtle, protocol_brand_icon_path,
+    protocol_icon_and_color, protocol_icon_element, text_muted, text_primary, text_secondary,
+    PROTOCOL_ICON_SM, PROTOCOL_ICON_XS,
     workspace::{
         format_single_line_status, is_error_status_message, ConnectionFormInputs, PendingConnOp,
         RustduckWorkspace,
@@ -295,7 +296,7 @@ fn render_bookmark_card(
     let bm_select = bm.clone();
     let bm_connect = bm.clone();
     let proto = bm.config.kind();
-    let (proto_icon, proto_color) = protocol_icon_and_color(proto);
+    let (_, proto_color) = protocol_icon_and_color(proto);
     let proto_tag = proto.short_tag();
 
     h_flex()
@@ -349,7 +350,7 @@ fn render_bookmark_card(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(Icon::new(proto_icon).small().text_color(proto_color)),
+                        .child(protocol_icon_element(proto, PROTOCOL_ICON_SM)),
                 )
                 .child(
                     v_flex()
@@ -558,22 +559,28 @@ fn render_inspector_header(
         ("proto-s3", ProtocolKind::S3, IconName::Cloud, t.proto_s3_label()),
         ("proto-smb", ProtocolKind::Smb, IconName::HardDrive, t.proto_smb_label()),
         ("proto-webdav", ProtocolKind::WebDav, IconName::Globe, t.proto_webdav_label()),
-        ("proto-gdrive", ProtocolKind::GoogleDrive, IconName::FolderClosed, t.proto_gdrive_label()),
-        ("proto-onedrive", ProtocolKind::OneDrive, IconName::Database, t.proto_onedrive_label()),
+        ("proto-gdrive", ProtocolKind::GoogleDrive, IconName::Cloud, t.proto_gdrive_label()),
+        ("proto-onedrive", ProtocolKind::OneDrive, IconName::Cloud, t.proto_onedrive_label()),
     ];
 
     let proto_buttons: Vec<AnyElement> = proto_defs
         .into_iter()
         .map(|(btn_id, proto, icon, label)| {
-            Button::new(btn_id)
-                .xsmall()
-                .icon(icon)
-                .with_variant(if active_protocol == proto {
+            let btn = Button::new(btn_id).xsmall();
+            // Brand logos are multicolor, so they are rendered as image children instead of
+            // the button's single-tint icon slot.
+            let btn = if protocol_brand_icon_path(proto).is_some() {
+                btn.accessibility_label(label)
+                    .child(protocol_icon_element(proto, PROTOCOL_ICON_XS))
+                    .child(div().whitespace_nowrap().child(label))
+            } else {
+                btn.icon(icon).label(label)
+            };
+            btn.with_variant(if active_protocol == proto {
                     ButtonVariant::Primary
                 } else {
                     ButtonVariant::Ghost
                 })
-                .label(label)
                 .on_click(cx.listener(move |this, _ev, _win, cx| {
                     if this.tabs[tab_idx].form.protocol != proto {
                         if this.tabs[tab_idx].is_connecting() {

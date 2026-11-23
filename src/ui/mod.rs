@@ -9,22 +9,35 @@ pub mod workspace;
 
 use crate::models::{FileEntry, FileKind, ProtocolKind};
 use crate::services::preferences::ThemePreference;
-use gpui::{rgb, App, AssetSource, Hsla, SharedString, Window, WindowAppearance};
+use gpui::{
+    img, px, rgb, AnyElement, App, AssetSource, Hsla, IntoElement as _, Pixels, SharedString,
+    Styled as _, Window, WindowAppearance,
+};
 use gpui_component::theme::{Theme, ThemeMode};
+use gpui_component::Icon;
 use gpui_kit_assets::IconName;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const BRAND_LOGO_PNG: &[u8] = include_bytes!("../../assets/icons/brand_logo.png");
+const GOOGLE_DRIVE_SVG: &[u8] = include_bytes!("../../assets/icons/google_drive.svg");
+const ONEDRIVE_SVG: &[u8] = include_bytes!("../../assets/icons/onedrive.svg");
+
+const GOOGLE_DRIVE_ICON_PATH: &str = "icons/google_drive.svg";
+const ONEDRIVE_ICON_PATH: &str = "icons/onedrive.svg";
 
 /// Combined asset source providing all `gpui_kit_assets::AllAssets` icons plus Rustduck's
-/// custom transparent Rusty Duck brand icon (`"icons/brand_logo.png"`).
+/// custom assets: the Rusty Duck brand icon (`"icons/brand_logo.png"`) and the official
+/// multicolor Google Drive / OneDrive logos.
 pub struct RustduckAssets;
 
 impl AssetSource for RustduckAssets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-        if path == "icons/brand_logo.png" {
-            return Ok(Some(Cow::Borrowed(BRAND_LOGO_PNG)));
+        match path {
+            "icons/brand_logo.png" => return Ok(Some(Cow::Borrowed(BRAND_LOGO_PNG))),
+            GOOGLE_DRIVE_ICON_PATH => return Ok(Some(Cow::Borrowed(GOOGLE_DRIVE_SVG))),
+            ONEDRIVE_ICON_PATH => return Ok(Some(Cow::Borrowed(ONEDRIVE_SVG))),
+            _ => {}
         }
         gpui_kit_assets::AllAssets.load(path)
     }
@@ -33,6 +46,8 @@ impl AssetSource for RustduckAssets {
         let mut items = gpui_kit_assets::AllAssets.list(path)?;
         if path.is_empty() || path == "icons" {
             items.push("icons/brand_logo.png".into());
+            items.push(GOOGLE_DRIVE_ICON_PATH.into());
+            items.push(ONEDRIVE_ICON_PATH.into());
         }
         Ok(items)
     }
@@ -270,6 +285,29 @@ pub fn protocol_icon_and_color(protocol: ProtocolKind) -> (IconName, Hsla) {
     }
 }
 
+/// Asset path of the multicolor brand logo for protocols that have one.
+pub fn protocol_brand_icon_path(protocol: ProtocolKind) -> Option<&'static str> {
+    match protocol {
+        ProtocolKind::GoogleDrive => Some(GOOGLE_DRIVE_ICON_PATH),
+        ProtocolKind::OneDrive => Some(ONEDRIVE_ICON_PATH),
+        _ => None,
+    }
+}
+
+/// Renders a protocol's icon at `size`: the full-color brand logo for Google Drive /
+/// OneDrive, otherwise the tinted generic icon from `protocol_icon_and_color`.
+pub fn protocol_icon_element(protocol: ProtocolKind, size: Pixels) -> AnyElement {
+    if let Some(path) = protocol_brand_icon_path(protocol) {
+        return img(path).size(size).flex_none().into_any_element();
+    }
+    let (icon, color) = protocol_icon_and_color(protocol);
+    Icon::new(icon).size(size).text_color(color).into_any_element()
+}
+
+/// Icon sizes matching gpui-component's `xsmall()` / `small()` icons.
+pub const PROTOCOL_ICON_XS: Pixels = px(12.0);
+pub const PROTOCOL_ICON_SM: Pixels = px(14.0);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +338,15 @@ mod tests {
         assert!(bytes.len() > 100);
         // PNG magic header
         assert_eq!(&bytes[0..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn test_rustduck_assets_loads_cloud_brand_svgs() {
+        for proto in [ProtocolKind::GoogleDrive, ProtocolKind::OneDrive] {
+            let path = protocol_brand_icon_path(proto).expect("brand icon path");
+            let bytes = RustduckAssets.load(path).unwrap().expect("svg should exist");
+            assert!(bytes.starts_with(b"<svg"));
+        }
+        assert!(protocol_brand_icon_path(ProtocolKind::Sftp).is_none());
     }
 }
