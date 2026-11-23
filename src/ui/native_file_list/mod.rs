@@ -42,6 +42,10 @@ pub enum NativePaneEvent {
     NavigateUp {
         is_local: bool,
     },
+    /// Esc pressed in the list: abort the pane's in-flight directory load.
+    CancelPending {
+        is_local: bool,
+    },
     SortChanged {
         is_local: bool,
         column: SortColumn,

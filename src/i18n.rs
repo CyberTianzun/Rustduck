@@ -1543,6 +1543,26 @@ impl I18n {
         }
     }
 
+    pub fn listing_in_progress(&self) -> &'static str {
+        if self.is_zh() { "加载中…" } else { "Loading…" }
+    }
+
+    pub fn cancel_listing_tooltip(&self) -> &'static str {
+        if self.is_zh() {
+            "停止加载，返回当前目录 (Esc)"
+        } else {
+            "Stop loading and stay in the current folder (Esc)"
+        }
+    }
+
+    pub fn msg_dir_load_cancelled(&self) -> String {
+        if self.is_zh() {
+            "已取消加载目录".to_string()
+        } else {
+            "Folder loading cancelled".to_string()
+        }
+    }
+
     pub fn msg_remote_dir_synced(&self) -> String {
         if self.is_zh() {
             "远程目录已同步".to_string()

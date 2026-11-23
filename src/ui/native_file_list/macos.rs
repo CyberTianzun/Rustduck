@@ -1490,6 +1490,17 @@ extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObj
                     });
                 return;
             }
+            // Escape (53) -> abort the pane's in-flight directory load
+            if !cmd_held && key_code == 53 {
+                state
+                    .lock()
+                    .unwrap()
+                    .events
+                    .push(NativePaneEvent::CancelPending {
+                        is_local: ctx.is_local,
+                    });
+                return;
+            }
             if cmd_held && key_code == 51 {
                 state
                     .lock()

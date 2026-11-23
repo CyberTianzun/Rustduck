@@ -17,6 +17,8 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
+use gpui_component::progress::Progress;
+use gpui_component::spinner::Spinner;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::{h_flex, v_flex, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
@@ -103,6 +105,11 @@ fn render_single_pane(
     let selected_entries = ws.selected_entries(tab_idx, is_local);
     let breadcrumbs = split_breadcrumb_segments(current_path, is_local);
     let has_parent = parent_local_or_remote(current_path, is_local).is_some();
+    // Elapsed seconds of a listing that has outlived the reveal delay.
+    let listing_secs = tab
+        .listing(is_local)
+        .filter(|l| l.revealed)
+        .map(|l| l.elapsed_secs());
 
     let action_header = render_pane_action_header(
         tab_idx,
@@ -112,6 +119,7 @@ fn render_single_pane(
         tab.show_hidden,
         filter_input,
         &selected_entries,
+        listing_secs.is_some(),
         cx,
     );
     let breadcrumb_bar = render_pane_breadcrumb_bar(
@@ -120,6 +128,7 @@ fn render_single_pane(
         is_editing_path,
         path_input,
         breadcrumbs,
+        listing_secs,
         cx,
     );
     let reconnect_banner = if !is_local
@@ -261,6 +270,7 @@ fn render_pane_action_header(
     show_hidden: bool,
     filter_input: &Entity<InputState>,
     selected_entries: &[FileEntry],
+    is_listing: bool,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
@@ -332,6 +342,7 @@ fn render_pane_action_header(
                         .ghost()
                         .compact()
                         .icon(IconName::RefreshCw)
+                        .loading(is_listing)
                         .tooltip(t.refresh_dir_tooltip())
                         .on_click(cx.listener(move |this, _ev, window, cx| {
                             if is_local {
@@ -460,6 +471,7 @@ fn render_pane_breadcrumb_bar(
     is_editing_path: bool,
     path_input: &Entity<InputState>,
     breadcrumbs: Vec<(String, String)>,
+    listing_secs: Option<u64>,
     cx: &mut Context<RustduckWorkspace>,
 ) -> AnyElement {
     let t = i18n();
@@ -552,7 +564,41 @@ fn render_pane_breadcrumb_bar(
             .into_any_element()
     };
 
+    let listing_status = listing_secs.map(|secs| {
+        let label = if secs >= 1 {
+            format!("{} {secs}s", t.listing_in_progress())
+        } else {
+            t.listing_in_progress().to_string()
+        };
+        h_flex()
+            .flex_shrink_0()
+            .gap_1p5()
+            .items_center()
+            .child(Spinner::new().xsmall().color(accent_blue()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(text_muted())
+                    .whitespace_nowrap()
+                    .child(label),
+            )
+            .child(
+                Button::new((side_prefix, 13usize))
+                    .xsmall()
+                    .ghost()
+                    .compact()
+                    .icon(IconName::X)
+                    .label(t.cancel_btn())
+                    .tooltip(t.cancel_listing_tooltip())
+                    .on_click(cx.listener(move |this, _ev, window, cx| {
+                        this.cancel_pane_listing(tab_idx, is_local, window, cx);
+                    })),
+            )
+    });
+    let is_listing = listing_status.is_some();
+
     h_flex()
+        .relative()
         .w_full()
         .h(px(32.0))
         .px_3()
@@ -563,7 +609,26 @@ fn render_pane_breadcrumb_bar(
         .justify_between()
         .items_center()
         .child(content)
-        .when(!is_editing_path, |bar| {
+        .when_some(listing_status, |bar, status| bar.child(status))
+        // Indeterminate sweep riding on the bar's bottom edge.
+        .when(is_listing, |bar| {
+            bar.child(
+                div().absolute().left_0().right_0().bottom_0().child(
+                    Progress::new((
+                        if is_local {
+                            "pane-listing-local"
+                        } else {
+                            "pane-listing-remote"
+                        },
+                        tab_idx,
+                    ))
+                    .loading(true)
+                    .with_size(px(2.0))
+                    .color(accent_blue()),
+                ),
+            )
+        })
+        .when(!is_editing_path && !is_listing, |bar| {
             bar.child(
                 Button::new((side_prefix, 12usize))
                     .xsmall()

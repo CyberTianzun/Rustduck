@@ -43,8 +43,8 @@ use windows::Win32::UI::Controls::{
     WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_F2,
-    VK_RETURN,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_BACK, VK_CONTROL, VK_DELETE,
+    VK_ESCAPE, VK_F2, VK_RETURN,
 };
 #[cfg(test)]
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
@@ -1246,6 +1246,11 @@ unsafe fn handle_listview_notify(
                         let _ = SetFocus(Some(lv_hwnd));
                         send_msg(lv_hwnd, LVM_EDITLABELW, focused as usize, 0);
                     }
+                } else if vk == VK_ESCAPE.0 {
+                    let mut guard = state.lock().unwrap();
+                    guard
+                        .events
+                        .push(NativePaneEvent::CancelPending { is_local });
                 } else if vk == VK_BACK.0 {
                     let mut guard = state.lock().unwrap();
                     guard.events.push(NativePaneEvent::NavigateUp { is_local });

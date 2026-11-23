@@ -957,6 +957,32 @@ pub async fn list_dir_with_reconnect_fallback(
     }
 }
 
+/// How long a directory listing may run before the pane shows loading
+/// feedback. Fast listings finish inside this window and never flicker.
+pub const PANE_LISTING_REVEAL_DELAY: std::time::Duration = std::time::Duration::from_millis(220);
+
+/// An in-flight directory listing for one pane.
+pub struct PaneListing {
+    pub generation: u64,
+    pub target_path: String,
+    pub started_at: std::time::Instant,
+    /// Set once the listing outlives [`PANE_LISTING_REVEAL_DELAY`].
+    pub revealed: bool,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+impl PaneListing {
+    pub fn elapsed_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+}
+
+impl Drop for PaneListing {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
+
 pub struct TabSession {
     pub id: Uuid,
     pub title: String,
@@ -1000,9 +1026,46 @@ pub struct TabSession {
     pub show_hidden: bool,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
+    /// Path whose entries the pane currently displays. `local_path` /
+    /// `remote_path` jump ahead to the navigation target immediately, so this
+    /// is what a cancelled navigation falls back to.
+    pub local_shown_path: String,
+    pub remote_shown_path: String,
+    pub local_listing: Option<PaneListing>,
+    pub remote_listing: Option<PaneListing>,
+    listing_generation: u64,
 }
 
 impl TabSession {
+    pub fn listing(&self, is_local: bool) -> Option<&PaneListing> {
+        if is_local {
+            self.local_listing.as_ref()
+        } else {
+            self.remote_listing.as_ref()
+        }
+    }
+
+    fn listing_slot(&mut self, is_local: bool) -> &mut Option<PaneListing> {
+        if is_local {
+            &mut self.local_listing
+        } else {
+            &mut self.remote_listing
+        }
+    }
+
+    /// Returns true (and clears the slot) when `generation` is still the
+    /// pane's current listing; false for stale or cancelled results.
+    fn finish_listing(&mut self, is_local: bool, generation: u64) -> bool {
+        let slot = self.listing_slot(is_local);
+        if slot.as_ref().is_some_and(|l| l.generation == generation) {
+            // Task already finished; dropping only aborts a completed handle.
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn is_connecting(&self) -> bool {
         self.connect_tracker.is_connecting()
     }
@@ -1055,6 +1118,11 @@ impl TabSession {
             form: ConnectionFormInputs::new(window, cx),
             local_backend: Arc::new(local_fs),
             remote_backend: None,
+            local_shown_path: initial_local.clone(),
+            remote_shown_path: "/".to_string(),
+            local_listing: None,
+            remote_listing: None,
+            listing_generation: 0,
             local_path: initial_local,
             remote_path: "/".to_string(),
             local_entries: Vec::new(),
@@ -2126,6 +2194,8 @@ impl RustduckWorkspace {
                                 tab.title = title;
                                 tab.is_connected = true;
                                 tab.remote_backend = Some(backend);
+                                tab.remote_listing = None;
+                                tab.remote_shown_path = initial_path.clone();
                                 tab.remote_path = initial_path;
                                 tab.remote_entries = entries;
                                 tab.remote_error_banner = None;
@@ -2244,6 +2314,8 @@ impl RustduckWorkspace {
                                     }
                                 }
                                 tab.remote_backend = Some(backend);
+                                tab.remote_listing = None;
+                                tab.remote_shown_path = resolved_path.clone();
                                 tab.remote_path = resolved_path.clone();
                                 tab.remote_path_input.update(cx, |s, cx| {
                                     s.set_value(resolved_path, window, cx)
@@ -2287,6 +2359,7 @@ impl RustduckWorkspace {
         tab.is_reconnecting_remote = false;
         tab.remote_error_banner = None;
         tab.remote_backend = None;
+        tab.remote_listing = None;
         tab.remote_entries.clear();
         sync_pane_selection(
             &mut tab.selected_remote_paths,
@@ -2625,6 +2698,104 @@ impl RustduckWorkspace {
         }
     }
 
+    /// Registers a new in-flight listing (aborting any previous one for the
+    /// pane) and schedules its delayed reveal + elapsed-time ticks.
+    fn install_pane_listing(
+        &mut self,
+        tab_idx: usize,
+        is_local: bool,
+        target_path: String,
+        abort_handle: tokio::task::AbortHandle,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let tab = &mut self.tabs[tab_idx];
+        tab.listing_generation += 1;
+        let generation = tab.listing_generation;
+        let tab_id = tab.id;
+        // Re-listing the same target (refresh click, transfer watcher) restarts
+        // the request but keeps the user-visible clock running.
+        let (started_at, revealed) = tab
+            .listing(is_local)
+            .filter(|l| l.target_path == target_path)
+            .map(|l| (l.started_at, l.revealed))
+            .unwrap_or_else(|| (std::time::Instant::now(), false));
+        // Replacing the slot drops (and aborts) any previous listing.
+        *tab.listing_slot(is_local) = Some(PaneListing {
+            generation,
+            target_path,
+            started_at,
+            revealed,
+            abort_handle,
+        });
+
+        cx.spawn(async move |this, cx| {
+            let mut delay = PANE_LISTING_REVEAL_DELAY;
+            loop {
+                cx.background_executor().timer(delay).await;
+                let still_loading = this
+                    .update(cx, |ws, cx| {
+                        let Some(listing) = ws
+                            .tabs
+                            .iter_mut()
+                            .find(|t| t.id == tab_id)
+                            .and_then(|t| t.listing_slot(is_local).as_mut())
+                            .filter(|l| l.generation == generation)
+                        else {
+                            return false;
+                        };
+                        listing.revealed = true;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !still_loading {
+                    break;
+                }
+                // Re-render once a second so the elapsed counter advances.
+                delay = std::time::Duration::from_secs(1);
+            }
+        })
+        .detach();
+        generation
+    }
+
+    /// Aborts the pane's in-flight listing and returns the breadcrumb to the
+    /// directory whose entries are still on screen.
+    pub fn cancel_pane_listing(
+        &mut self,
+        tab_idx: usize,
+        is_local: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(tab_idx) else {
+            return;
+        };
+        let Some(_listing) = tab.listing_slot(is_local).take() else {
+            return;
+        };
+        let restored = if is_local {
+            tab.local_path = tab.local_shown_path.clone();
+            tab.local_path_editing = false;
+            tab.local_path.clone()
+        } else {
+            tab.remote_path = tab.remote_shown_path.clone();
+            tab.remote_path_editing = false;
+            tab.remote_path.clone()
+        };
+        let input = if is_local {
+            tab.local_path_input.clone()
+        } else {
+            tab.remote_path_input.clone()
+        };
+        input.update(cx, |s, cx| s.set_value(restored.clone(), window, cx));
+        tab.status_message = Some(i18n().msg_dir_load_cancelled());
+        if is_local && !matches!(restored.as_str(), "" | "/" | "\\") {
+            let _ = self.preferences_store.set_last_local_dir(restored);
+        }
+        cx.notify();
+    }
+
     fn spawn_local_list(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
         if tab_idx >= self.tabs.len() {
             return;
@@ -2633,7 +2804,9 @@ impl RustduckWorkspace {
         let backend = self.tabs[tab_idx].local_backend.clone();
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
-        tokio_runtime().spawn(async move {
+        let task_path = path.clone();
+        let join_handle = tokio_runtime().spawn(async move {
+            let path = task_path;
             match backend.list_dir(&path).await {
                 Ok(entries) => {
                     let _ = tx.send(Ok((entries, None)));
@@ -2650,18 +2823,26 @@ impl RustduckWorkspace {
                 }
             }
         });
+        let generation =
+            self.install_pane_listing(tab_idx, true, path.clone(), join_handle.abort_handle(), cx);
 
         cx.spawn(async move |this, cx| {
             if let Ok(res) = rx.await {
                 let _ = this.update(cx, |ws, cx| {
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if !tab.finish_listing(true, generation) {
+                            return;
+                        }
                         match res {
                             Ok((entries, fallback_opt)) => {
                                 if let Some(fallback_dir) = fallback_opt {
                                     tab.local_path = fallback_dir.clone();
+                                    tab.local_shown_path = fallback_dir.clone();
                                     tab.status_message =
                                         Some(i18n().msg_local_dir_fallback(&fallback_dir));
                                     let _ = ws.preferences_store.set_last_local_dir(fallback_dir);
+                                } else {
+                                    tab.local_shown_path = path;
                                 }
                                 tab.local_entries = entries;
                                 prune_selection_against_entries(
@@ -2693,19 +2874,26 @@ impl RustduckWorkspace {
         let path = self.tabs[tab_idx].remote_path.clone();
         let tab_id = self.tabs[tab_idx].id;
         let (tx, rx) = futures::channel::oneshot::channel();
-        tokio_runtime().spawn(async move {
-            let res = backend.list_dir(&path).await;
+        let task_path = path.clone();
+        let join_handle = tokio_runtime().spawn(async move {
+            let res = backend.list_dir(&task_path).await;
             let _ = tx.send(res);
         });
+        let generation =
+            self.install_pane_listing(tab_idx, false, path.clone(), join_handle.abort_handle(), cx);
 
         cx.spawn(async move |this, cx| {
             if let Ok(res) = rx.await {
                 let _ = this.update(cx, |ws, cx| {
                     let t = i18n();
                     if let Some(tab) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if !tab.finish_listing(false, generation) {
+                            return;
+                        }
                         match res {
                             Ok(entries) => {
                                 tab.remote_entries = entries;
+                                tab.remote_shown_path = path;
                                 tab.remote_error_banner = None;
                                 prune_selection_against_entries(
                                     &mut tab.selected_remote_paths,
@@ -3259,6 +3447,9 @@ impl RustduckWorkspace {
                 NativePaneEvent::NavigateUp { is_local } => {
                     self.navigate_up(tab_idx, is_local, window, cx);
                 }
+                NativePaneEvent::CancelPending { is_local } => {
+                    self.cancel_pane_listing(tab_idx, is_local, window, cx);
+                }
                 NativePaneEvent::SortChanged {
                     is_local: _,
                     column,
@@ -3640,11 +3831,36 @@ impl Render for RustduckWorkspace {
             .flatten();
         let settings_modal_el = self.settings_open.then(|| render_settings_modal(self, cx));
 
+        let can_cancel_listing = is_connected && !self.settings_open && !has_action_modal;
+
         v_flex()
             .relative()
             .size_full()
             .bg(bg_canvas())
             .text_color(text_primary())
+            // Esc while focus is in the GPUI chrome (breadcrumbs, header) —
+            // the native lists report their own Esc via CancelPending.
+            .when(can_cancel_listing, |root| {
+                root.on_key_down(cx.listener(move |ws, ev: &gpui::KeyDownEvent, window, cx| {
+                    if ev.keystroke.key != "escape" || ev.keystroke.modifiers.modified() {
+                        return;
+                    }
+                    let Some(tab) = ws.tabs.get(active_idx) else {
+                        return;
+                    };
+                    let panes: Vec<bool> = [false, true]
+                        .into_iter()
+                        .filter(|&is_local| tab.listing(is_local).is_some_and(|l| l.revealed))
+                        .collect();
+                    if panes.is_empty() {
+                        return;
+                    }
+                    for is_local in panes {
+                        ws.cancel_pane_listing(active_idx, is_local, window, cx);
+                    }
+                    cx.stop_propagation();
+                }))
+            })
             .child(title_bar_el)
             .child(div().flex_1().w_full().overflow_hidden().child(body_el))
             .child(drawer_el)
@@ -3826,6 +4042,27 @@ mod tests {
         assert!(od_blank.onedrive_client_secret.is_empty());
         assert_eq!(od_blank.conn_proxy_mode, ConnectionProxyMode::Default);
         assert!(od_blank.conn_proxy_url.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pane_listing_drop_aborts_inflight_list_task() {
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = tx.send(());
+        });
+        let mut slot = Some(PaneListing {
+            generation: 1,
+            target_path: "/slow".to_string(),
+            started_at: std::time::Instant::now(),
+            revealed: false,
+            abort_handle: handle.abort_handle(),
+        });
+        // Cancelling (taking + dropping the listing) must abort the request so
+        // the result channel closes instead of delivering a stale listing.
+        drop(slot.take());
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(rx.await.is_err());
     }
 
     #[tokio::test]
