@@ -30,6 +30,7 @@ pub enum NativeContextMenuAction {
     NewFolder,
     DeleteSelected,
     CopySelectedPath,
+    CopyRemoteUrl(RemoteUrlKind),
     Refresh,
     RevealInShell,
 }

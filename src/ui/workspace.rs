@@ -22,7 +22,7 @@ use crate::storage::onedrive::{
     authorize_onedrive_in_browser, has_default_onedrive_oauth_credentials,
     validate_onedrive_oauth_config,
 };
-use crate::storage::{StorageBackend, create_backend};
+use crate::storage::{RemoteUrlKind, StorageBackend, create_backend};
 use crate::ui::action_modal::render_pane_action_modal;
 use crate::ui::dual_pane_view::render_dual_pane_view;
 use crate::ui::file_pane::{
@@ -994,6 +994,7 @@ pub struct TabSession {
     pub form: ConnectionFormInputs,
     pub local_backend: Arc<dyn StorageBackend>,
     pub remote_backend: Option<Arc<dyn StorageBackend>>,
+    pub connected_protocol: Option<ProtocolKind>,
     pub local_path: String,
     pub remote_path: String,
     pub local_entries: Vec<FileEntry>,
@@ -1118,6 +1119,7 @@ impl TabSession {
             form: ConnectionFormInputs::new(window, cx),
             local_backend: Arc::new(local_fs),
             remote_backend: None,
+            connected_protocol: None,
             local_shown_path: initial_local.clone(),
             remote_shown_path: "/".to_string(),
             local_listing: None,
@@ -1528,6 +1530,7 @@ impl RustduckWorkspace {
         for tab in &mut self.tabs {
             let _ = tab.connect_tracker.cancel_current();
             tab.remote_backend = None;
+            tab.connected_protocol = None;
             tab.is_connected = false;
         }
         self.native_file_list_host.teardown();
@@ -2140,6 +2143,7 @@ impl RustduckWorkspace {
         let t = i18n();
         let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
         let (title, config, secret) = self.read_form_config(tab_idx, cx);
+        let protocol_kind = config.kind();
         let backend = match create_backend(&config, &secret) {
             Ok(b) => b,
             Err(e) => {
@@ -2193,6 +2197,7 @@ impl RustduckWorkspace {
                                 }
                                 tab.title = title;
                                 tab.is_connected = true;
+                                tab.connected_protocol = Some(protocol_kind);
                                 tab.remote_backend = Some(backend);
                                 tab.remote_listing = None;
                                 tab.remote_shown_path = initial_path.clone();
@@ -2233,6 +2238,7 @@ impl RustduckWorkspace {
         let t = i18n();
         let _ = self.tabs[tab_idx].connect_tracker.cancel_current();
         let (_title, config, mut secret) = self.read_form_config(tab_idx, cx);
+        let protocol_kind = config.kind();
         if let Some(live_sec) = self.tabs[tab_idx]
             .remote_backend
             .as_ref()
@@ -2313,6 +2319,7 @@ impl RustduckWorkspace {
                                         let _ = ws.bookmark_store.set_secret(bm_id, &new_sec);
                                     }
                                 }
+                                tab.connected_protocol = Some(protocol_kind);
                                 tab.remote_backend = Some(backend);
                                 tab.remote_listing = None;
                                 tab.remote_shown_path = resolved_path.clone();
@@ -2359,6 +2366,7 @@ impl RustduckWorkspace {
         tab.is_reconnecting_remote = false;
         tab.remote_error_banner = None;
         tab.remote_backend = None;
+        tab.connected_protocol = None;
         tab.remote_listing = None;
         tab.remote_entries.clear();
         sync_pane_selection(
@@ -3496,6 +3504,11 @@ impl RustduckWorkspace {
                             cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
                         }
                     }
+                    NativeContextMenuAction::CopyRemoteUrl(kind) => {
+                        if !is_local {
+                            self.copy_selected_remote_urls(tab_idx, kind, cx);
+                        }
+                    }
                     NativeContextMenuAction::Refresh => {
                         if is_local {
                             self.refresh_local_pane(tab_idx, window, cx);
@@ -3543,6 +3556,41 @@ impl RustduckWorkspace {
                 }
             }
         }
+    }
+
+    /// Generates remote URLs for the current remote selection, writes them to the clipboard,
+    /// and updates the tab status message without overwriting the clipboard on empty or error results.
+    pub fn copy_selected_remote_urls(
+        &mut self,
+        tab_idx: usize,
+        kind: RemoteUrlKind,
+        cx: &mut Context<Self>,
+    ) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+        let selected = self.selected_entries(tab_idx, false);
+        let Some(backend) = self.tabs[tab_idx].remote_backend.clone() else {
+            return;
+        };
+        if selected.is_empty() {
+            return;
+        }
+        let t = i18n();
+        match collect_remote_item_urls(backend.as_ref(), &selected, kind) {
+            Ok(urls) if !urls.is_empty() => {
+                cx.write_to_clipboard(ClipboardItem::new_string(urls.join("\n")));
+                self.tabs[tab_idx].status_message = Some(t.msg_copied_remote_url(urls.len(), kind));
+            }
+            Ok(_) => {
+                self.tabs[tab_idx].status_message = Some(t.msg_copy_url_unavailable());
+            }
+            Err(e) => {
+                let clean = format_single_line_status(&e.to_string());
+                self.tabs[tab_idx].status_message = Some(t.msg_copy_url_failed(&clean));
+            }
+        }
+        cx.notify();
     }
 
     fn render_custom_title_bar(
@@ -3742,6 +3790,21 @@ impl RustduckWorkspace {
             .child(right_actions)
             .into_any_element()
     }
+}
+
+/// Collects non-empty remote URLs for `entries` in selection order using `backend.build_item_url`.
+pub fn collect_remote_item_urls(
+    backend: &dyn StorageBackend,
+    entries: &[FileEntry],
+    kind: RemoteUrlKind,
+) -> anyhow::Result<Vec<String>> {
+    let mut urls = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(url) = backend.build_item_url(entry, kind)? {
+            urls.push(url);
+        }
+    }
+    Ok(urls)
 }
 
 pub fn format_single_line_status(msg: &str) -> String {
@@ -4534,5 +4597,135 @@ mod tests {
                 && dual_pane_src.contains("reconnect-remote-btn"),
             "compact remote disconnect action and inline reconnect banner must be wired in dual_pane_view.rs"
         );
+    }
+
+    #[test]
+    fn test_collect_remote_item_urls_joins_multi_select_and_handles_empty_and_errors() {
+        use crate::storage::RemoteUrlKind;
+        use crate::storage::s3::S3Backend;
+        use crate::storage::sftp::SftpBackend;
+
+        let s3_cfg = S3Config {
+            preset: S3Preset::AwsS3,
+            endpoint: "https://s3.us-west-2.amazonaws.com".to_string(),
+            region: "us-west-2".to_string(),
+            access_key_id: "AKID_DEMO".to_string(),
+            bucket: Some("my-bucket".to_string()),
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::VirtualHosted,
+            proxy_mode: ConnectionProxyMode::Direct,
+            ..S3Config::default()
+        };
+        let s3_backend = S3Backend::new(s3_cfg, "secret-demo".to_string()).unwrap();
+        let file_entries = vec![
+            FileEntry {
+                name: "b.txt".to_string(),
+                path: "/folder/b.txt".to_string(),
+                kind: FileKind::File,
+                size: 10,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "a.txt".to_string(),
+                path: "/folder/a.txt".to_string(),
+                kind: FileKind::File,
+                size: 20,
+                modified_unix: None,
+                permissions: None,
+            },
+        ];
+        let s3_urls = collect_remote_item_urls(
+            &s3_backend,
+            &file_entries,
+            RemoteUrlKind::S3Uri,
+        )
+        .unwrap();
+        assert_eq!(
+            s3_urls,
+            vec![
+                "s3://my-bucket/folder/b.txt".to_string(),
+                "s3://my-bucket/folder/a.txt".to_string(),
+            ]
+        );
+
+        assert!(
+            collect_remote_item_urls(
+                &s3_backend,
+                &file_entries,
+                RemoteUrlKind::S3Presigned { expires_secs: 0 },
+            )
+            .is_err()
+        );
+
+        let dir_entries = vec![FileEntry {
+            name: "folder".to_string(),
+            path: "/folder".to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        }];
+        let dir_presigned = collect_remote_item_urls(
+            &s3_backend,
+            &dir_entries,
+            RemoteUrlKind::S3Presigned { expires_secs: 3600 },
+        )
+        .unwrap();
+        assert!(dir_presigned.is_empty());
+
+        let sftp_cfg = SftpConfig {
+            host: "host".to_string(),
+            port: 22,
+            username: "user".to_string(),
+            ..SftpConfig::default()
+        };
+        let sftp_backend = SftpBackend::new(sftp_cfg, String::new()).unwrap();
+        let sftp_entries = vec![
+            FileEntry {
+                name: "a".to_string(),
+                path: "/a".to_string(),
+                kind: FileKind::File,
+                size: 1,
+                modified_unix: None,
+                permissions: None,
+            },
+            FileEntry {
+                name: "b".to_string(),
+                path: "/b".to_string(),
+                kind: FileKind::File,
+                size: 2,
+                modified_unix: None,
+                permissions: None,
+            },
+        ];
+        let sftp_urls = collect_remote_item_urls(
+            &sftp_backend,
+            &sftp_entries,
+            RemoteUrlKind::SftpScp,
+        )
+        .unwrap();
+        assert_eq!(
+            sftp_urls,
+            vec!["user@host:/a".to_string(), "user@host:/b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_copy_remote_url_status_message_error_classification() {
+        use crate::storage::RemoteUrlKind;
+
+        for lang in [AppLanguage::ZhCn, AppLanguage::EnUs] {
+            let t = I18n::new(lang);
+            assert!(!is_error_status_message(
+                &t.msg_copied_remote_url(1, RemoteUrlKind::Default)
+            ));
+            assert!(!is_error_status_message(&t.msg_copied_remote_url(
+                2,
+                RemoteUrlKind::S3Presigned { expires_secs: 3600 }
+            )));
+            assert!(is_error_status_message(&t.msg_copy_url_unavailable()));
+            assert!(is_error_status_message(&t.msg_copy_url_failed(&"expired")));
+        }
     }
 }
