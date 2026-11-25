@@ -8,12 +8,13 @@ use crate::storage::oauth::{
     resolve_oauth_credential,
 };
 use crate::storage::s3::encode_s3_key_path;
-use crate::storage::{ProgressCallback, StorageBackend};
+use crate::storage::{ProgressCallback, RemoteUrlKind, StorageBackend};
 use anyhow::{anyhow, Context};
 use chrono::DateTime;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::RwLock;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -40,6 +41,8 @@ struct OneDriveItem {
     last_modified: Option<String>,
     #[serde(default)]
     folder: Option<serde_json::Value>,
+    #[serde(rename = "webUrl", default)]
+    web_url: Option<String>,
 }
 
 pub fn effective_onedrive_client_id(config: &OneDriveConfig) -> Option<String> {
@@ -90,10 +93,11 @@ pub fn build_onedrive_item_url(remote_path: &str, suffix: &str) -> String {
     }
 }
 
-pub fn parse_onedrive_children_json(
+/// Parse a OneDrive `children` Graph API JSON payload into `(webUrl, FileEntry)` tuples.
+pub fn parse_onedrive_children_with_links_json(
     json: &str,
     parent_path: &str,
-) -> anyhow::Result<Vec<FileEntry>> {
+) -> anyhow::Result<Vec<(Option<String>, FileEntry)>> {
     let parsed: OneDriveChildrenResponse = serde_json::from_str(json)
         .with_context(|| format!("Failed to parse OneDrive children JSON: {json}"))?;
 
@@ -106,21 +110,38 @@ pub fn parse_onedrive_children_json(
             .as_deref()
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
             .map(|dt| dt.timestamp());
+        let web_url = item
+            .web_url
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
-        entries.push(FileEntry {
-            path: join_remote_path(&norm_parent, &item.name),
-            name: item.name,
-            kind: if is_dir {
-                FileKind::Directory
-            } else {
-                FileKind::File
+        entries.push((
+            web_url,
+            FileEntry {
+                path: join_remote_path(&norm_parent, &item.name),
+                name: item.name,
+                kind: if is_dir {
+                    FileKind::Directory
+                } else {
+                    FileKind::File
+                },
+                size: if is_dir { 0 } else { item.size.unwrap_or(0) },
+                modified_unix,
+                permissions: None,
             },
-            size: if is_dir { 0 } else { item.size.unwrap_or(0) },
-            modified_unix,
-            permissions: None,
-        });
+        ));
     }
     Ok(entries)
+}
+
+pub fn parse_onedrive_children_json(
+    json: &str,
+    parent_path: &str,
+) -> anyhow::Result<Vec<FileEntry>> {
+    Ok(parse_onedrive_children_with_links_json(json, parent_path)?
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect())
 }
 
 pub async fn authorize_onedrive_in_browser(
@@ -157,6 +178,7 @@ pub struct OneDriveBackend {
     client: Client,
     token_state: Mutex<OneDriveTokenState>,
     latest_refresh_token: RwLock<Option<String>>,
+    path_web_url_cache: RwLock<HashMap<String, String>>,
 }
 
 impl OneDriveBackend {
@@ -174,7 +196,32 @@ impl OneDriveBackend {
                 refresh_token: initial_rt.clone(),
             }),
             latest_refresh_token: RwLock::new(Some(initial_rt)),
+            path_web_url_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    fn cache_listed_entries(&self, items: &[(Option<String>, FileEntry)]) {
+        if let Ok(mut cache) = self.path_web_url_cache.write() {
+            for (web_url, entry) in items {
+                let norm = normalize_remote_path(&entry.path);
+                if let Some(url) = web_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    cache.insert(norm, url.to_string());
+                } else {
+                    cache.remove(&norm);
+                }
+            }
+        }
+    }
+
+    fn evict_cached_path(&self, path: &str) {
+        let norm = normalize_remote_path(path);
+        if let Ok(mut cache) = self.path_web_url_cache.write() {
+            cache.remove(&norm);
+            if norm != "/" {
+                let prefix = format!("{norm}/");
+                cache.retain(|k, _| !k.starts_with(&prefix));
+            }
+        }
     }
 
     async fn ensure_access_token(&self) -> anyhow::Result<String> {
@@ -229,6 +276,25 @@ impl StorageBackend for OneDriveBackend {
             .and_then(|g| g.clone())
     }
 
+    fn build_item_url(
+        &self,
+        entry: &FileEntry,
+        kind: RemoteUrlKind,
+    ) -> anyhow::Result<Option<String>> {
+        match kind {
+            RemoteUrlKind::Default => {
+                let norm = normalize_remote_path(&entry.path);
+                if let Ok(cache) = self.path_web_url_cache.read() {
+                    if let Some(url) = cache.get(&norm) {
+                        return Ok(Some(url.clone()));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn connect_and_verify(&self) -> anyhow::Result<String> {
         let token = self.ensure_access_token().await?;
         let initial = normalize_remote_path(&self.config.initial_path);
@@ -275,7 +341,9 @@ impl StorageBackend for OneDriveBackend {
                 text
             ));
         }
-        parse_onedrive_children_json(&text, &norm)
+        let items = parse_onedrive_children_with_links_json(&text, &norm)?;
+        self.cache_listed_entries(&items);
+        Ok(items.into_iter().map(|(_, entry)| entry).collect())
     }
 
     async fn create_dir(&self, path: &str) -> anyhow::Result<()> {
@@ -346,6 +414,8 @@ impl StorageBackend for OneDriveBackend {
                 text
             ));
         }
+        self.evict_cached_path(&src);
+        self.evict_cached_path(&dst);
         Ok(())
     }
 
@@ -370,6 +440,7 @@ impl StorageBackend for OneDriveBackend {
                 text
             ));
         }
+        self.evict_cached_path(&norm);
         Ok(())
     }
 
@@ -549,5 +620,80 @@ mod tests {
         // Empty Refresh Token must fail fast on OneDriveBackend::new instead of silently launching browser on Connect
         let empty_token_res = OneDriveBackend::new(OneDriveConfig::default(), "".to_string());
         assert!(empty_token_res.is_err());
+    }
+
+    #[test]
+    fn test_onedrive_web_url_cache_and_invalidation() {
+        let sample_json = r#"{
+            "value": [
+                {
+                    "name": "Documents",
+                    "folder": { "childCount": 4 },
+                    "webUrl": "https://onedrive.live.com/?id=folder_1"
+                },
+                {
+                    "name": "budget.xlsx",
+                    "size": 65536,
+                    "webUrl": "https://1drv.ms/x/s!budget123"
+                }
+            ]
+        }"#;
+
+        let parsed = parse_onedrive_children_with_links_json(sample_json, "/Work").unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].0.as_deref(),
+            Some("https://onedrive.live.com/?id=folder_1")
+        );
+        assert_eq!(
+            parsed[1].0.as_deref(),
+            Some("https://1drv.ms/x/s!budget123")
+        );
+
+        let backend =
+            OneDriveBackend::new(OneDriveConfig::default(), "test-refresh-token".to_string())
+                .unwrap();
+        backend.cache_listed_entries(&parsed);
+
+        let folder_entry = &parsed[0].1;
+        let file_entry = &parsed[1].1;
+        assert_eq!(
+            backend
+                .build_item_url(folder_entry, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://onedrive.live.com/?id=folder_1")
+        );
+        assert_eq!(
+            backend
+                .build_item_url(file_entry, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://1drv.ms/x/s!budget123")
+        );
+
+        let uncached_entry = FileEntry {
+            name: "missing.txt".to_string(),
+            path: "/Work/missing.txt".to_string(),
+            kind: FileKind::File,
+            size: 10,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            backend
+                .build_item_url(&uncached_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+
+        // Evict stale URL on rename/delete
+        backend.evict_cached_path("/Work/budget.xlsx");
+        assert_eq!(
+            backend
+                .build_item_url(file_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
     }
 }

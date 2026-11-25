@@ -7,7 +7,7 @@ use crate::storage::oauth::{
     authorize_via_browser_loopback, build_http_client_with_mode, refresh_access_token,
     resolve_oauth_credential,
 };
-use crate::storage::{ProgressCallback, StorageBackend};
+use crate::storage::{ProgressCallback, RemoteUrlKind, StorageBackend};
 use anyhow::{anyhow, Context};
 use chrono::DateTime;
 use futures::StreamExt;
@@ -40,6 +40,8 @@ struct GDriveFileItem {
     size: Option<String>,
     #[serde(rename = "modifiedTime", default)]
     modified_time: Option<String>,
+    #[serde(rename = "webViewLink", default)]
+    web_view_link: Option<String>,
 }
 
 pub fn effective_gdrive_client_id(config: &GoogleDriveConfig) -> Option<String> {
@@ -75,10 +77,21 @@ pub fn escape_gdrive_query_value(val: &str) -> String {
     val.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-pub fn parse_gdrive_files_json(
+/// Build the fallback Google Drive web view URL from a file/folder ID when `webViewLink` is absent.
+pub fn build_gdrive_fallback_web_url(file_id: &str, is_dir: bool) -> String {
+    let id = file_id.trim();
+    if is_dir {
+        format!("https://drive.google.com/drive/folders/{id}")
+    } else {
+        format!("https://drive.google.com/file/d/{id}/view")
+    }
+}
+
+/// Parse a Google Drive `files.list` JSON payload into `(id, webViewLink, FileEntry)` tuples.
+pub fn parse_gdrive_files_with_links_json(
     json: &str,
     parent_path: &str,
-) -> anyhow::Result<Vec<(String, FileEntry)>> {
+) -> anyhow::Result<Vec<(String, Option<String>, FileEntry)>> {
     let parsed: GDriveFileListResponse = serde_json::from_str(json)
         .with_context(|| format!("Failed to parse Google Drive files list JSON: {json}"))?;
 
@@ -99,10 +112,15 @@ pub fn parse_gdrive_files_json(
             .as_deref()
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
             .map(|dt| dt.timestamp());
+        let web_view_link = item
+            .web_view_link
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let entry_path = join_remote_path(&norm_parent, &item.name);
         out.push((
             item.id,
+            web_view_link,
             FileEntry {
                 name: item.name,
                 path: entry_path,
@@ -118,6 +136,16 @@ pub fn parse_gdrive_files_json(
         ));
     }
     Ok(out)
+}
+
+pub fn parse_gdrive_files_json(
+    json: &str,
+    parent_path: &str,
+) -> anyhow::Result<Vec<(String, FileEntry)>> {
+    Ok(parse_gdrive_files_with_links_json(json, parent_path)?
+        .into_iter()
+        .map(|(id, _link, entry)| (id, entry))
+        .collect())
 }
 
 pub async fn authorize_google_drive_in_browser(
@@ -155,6 +183,7 @@ pub struct GoogleDriveBackend {
     token_state: Mutex<GDriveTokenState>,
     latest_refresh_token: RwLock<Option<String>>,
     path_id_cache: RwLock<HashMap<String, String>>,
+    path_web_url_cache: RwLock<HashMap<String, String>>,
 }
 
 impl GoogleDriveBackend {
@@ -175,7 +204,75 @@ impl GoogleDriveBackend {
             }),
             latest_refresh_token: RwLock::new(Some(initial_rt)),
             path_id_cache: RwLock::new(cache),
+            path_web_url_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    fn cache_listed_entries(&self, items: &[(String, Option<String>, FileEntry)]) {
+        if let Ok(mut id_cache) = self.path_id_cache.write() {
+            for (id, _link, entry) in items {
+                id_cache.insert(normalize_remote_path(&entry.path), id.clone());
+            }
+        }
+        if let Ok(mut url_cache) = self.path_web_url_cache.write() {
+            for (_id, link, entry) in items {
+                let norm = normalize_remote_path(&entry.path);
+                if let Some(url) = link.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    url_cache.insert(norm, url.to_string());
+                } else {
+                    url_cache.remove(&norm);
+                }
+            }
+        }
+    }
+
+    fn migrate_cache_map(cache: &mut HashMap<String, String>, src: &str, dst: &str) {
+        if let Some(val) = cache.remove(src) {
+            cache.insert(dst.to_string(), val);
+        }
+        if src != "/" {
+            let prefix = format!("{src}/");
+            let child_keys: Vec<String> = cache
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for key in child_keys {
+                if let Some(val) = cache.remove(&key) {
+                    let suffix = &key[src.len()..];
+                    cache.insert(format!("{dst}{suffix}"), val);
+                }
+            }
+        }
+    }
+
+    fn evict_cache_map(cache: &mut HashMap<String, String>, norm: &str) {
+        cache.remove(norm);
+        if norm != "/" {
+            let prefix = format!("{norm}/");
+            cache.retain(|k, _| !k.starts_with(&prefix));
+        }
+    }
+
+    fn migrate_cached_path(&self, from: &str, to: &str) {
+        let src = normalize_remote_path(from);
+        let dst = normalize_remote_path(to);
+        if let Ok(mut id_cache) = self.path_id_cache.write() {
+            Self::migrate_cache_map(&mut id_cache, &src, &dst);
+        }
+        if let Ok(mut url_cache) = self.path_web_url_cache.write() {
+            Self::migrate_cache_map(&mut url_cache, &src, &dst);
+        }
+    }
+
+    fn evict_cached_path(&self, path: &str) {
+        let norm = normalize_remote_path(path);
+        if let Ok(mut id_cache) = self.path_id_cache.write() {
+            Self::evict_cache_map(&mut id_cache, &norm);
+        }
+        if let Ok(mut url_cache) = self.path_web_url_cache.write() {
+            Self::evict_cache_map(&mut url_cache, &norm);
+        }
     }
 
     async fn ensure_access_token(&self) -> anyhow::Result<String> {
@@ -299,6 +396,33 @@ impl StorageBackend for GoogleDriveBackend {
             .and_then(|g| g.clone())
     }
 
+    fn build_item_url(
+        &self,
+        entry: &FileEntry,
+        kind: RemoteUrlKind,
+    ) -> anyhow::Result<Option<String>> {
+        match kind {
+            RemoteUrlKind::Default => {
+                let norm = normalize_remote_path(&entry.path);
+                if let Ok(cache) = self.path_web_url_cache.read() {
+                    if let Some(url) = cache.get(&norm) {
+                        return Ok(Some(url.clone()));
+                    }
+                }
+                if let Ok(id_cache) = self.path_id_cache.read() {
+                    if let Some(id) = id_cache.get(&norm) {
+                        return Ok(Some(build_gdrive_fallback_web_url(
+                            id,
+                            entry.kind.is_dir_like(),
+                        )));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn connect_and_verify(&self) -> anyhow::Result<String> {
         let token = self.ensure_access_token().await?;
         let resp = self
@@ -337,7 +461,10 @@ impl StorageBackend for GoogleDriveBackend {
             .bearer_auth(&token)
             .query(&[
                 ("q", q.as_str()),
-                ("fields", "files(id,name,mimeType,size,modifiedTime)"),
+                (
+                    "fields",
+                    "files(id,name,mimeType,size,modifiedTime,webViewLink)",
+                ),
                 ("pageSize", "1000"),
                 ("supportsAllDrives", "true"),
                 ("includeItemsFromAllDrives", "true"),
@@ -356,19 +483,9 @@ impl StorageBackend for GoogleDriveBackend {
             ));
         }
 
-        let pairs = parse_gdrive_files_json(&text, &norm_path)?;
-        let mut entries = Vec::with_capacity(pairs.len());
-        if let Ok(mut cache) = self.path_id_cache.write() {
-            for (id, entry) in pairs {
-                cache.insert(entry.path.clone(), id);
-                entries.push(entry);
-            }
-        } else {
-            for (_, entry) in pairs {
-                entries.push(entry);
-            }
-        }
-        Ok(entries)
+        let items = parse_gdrive_files_with_links_json(&text, &norm_path)?;
+        self.cache_listed_entries(&items);
+        Ok(items.into_iter().map(|(_, _, entry)| entry).collect())
     }
 
     async fn create_dir(&self, path: &str) -> anyhow::Result<()> {
@@ -445,11 +562,7 @@ impl StorageBackend for GoogleDriveBackend {
                 text
             ));
         }
-        if let Ok(mut cache) = self.path_id_cache.write() {
-            if let Some(id) = cache.remove(&src) {
-                cache.insert(dst, id);
-            }
-        }
+        self.migrate_cached_path(&src, &dst);
         Ok(())
     }
 
@@ -475,9 +588,7 @@ impl StorageBackend for GoogleDriveBackend {
                 text
             ));
         }
-        if let Ok(mut cache) = self.path_id_cache.write() {
-            cache.remove(&norm);
-        }
+        self.evict_cached_path(&norm);
         Ok(())
     }
 
@@ -715,5 +826,119 @@ mod tests {
         // Empty Refresh Token must fail fast on GoogleDriveBackend::new instead of silently launching browser on Connect
         let empty_token_res = GoogleDriveBackend::new(GoogleDriveConfig::default(), "   ".to_string());
         assert!(empty_token_res.is_err());
+    }
+
+    #[test]
+    fn test_gdrive_web_url_cache_and_id_fallback() {
+        let sample_json = r#"{
+            "files": [
+                {
+                    "id": "folder_123",
+                    "name": "Designs",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "webViewLink": "https://drive.google.com/drive/folders/folder_123?usp=sharing"
+                },
+                {
+                    "id": "file_456",
+                    "name": "old.pdf",
+                    "mimeType": "application/pdf",
+                    "size": "1048576"
+                },
+                {
+                    "id": "folder_789",
+                    "name": "Archive",
+                    "mimeType": "application/vnd.google-apps.folder"
+                }
+            ]
+        }"#;
+
+        let parsed = parse_gdrive_files_with_links_json(sample_json, "/Projects").unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(
+            parsed[0].1.as_deref(),
+            Some("https://drive.google.com/drive/folders/folder_123?usp=sharing")
+        );
+        assert_eq!(parsed[1].1, None);
+        assert_eq!(parsed[2].1, None);
+
+        let backend =
+            GoogleDriveBackend::new(GoogleDriveConfig::default(), "test-refresh-token".to_string())
+                .unwrap();
+        backend.cache_listed_entries(&parsed);
+
+        let folder_entry = &parsed[0].2;
+        assert_eq!(
+            backend
+                .build_item_url(folder_entry, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://drive.google.com/drive/folders/folder_123?usp=sharing")
+        );
+
+        let file_entry = &parsed[1].2;
+        assert_eq!(
+            backend
+                .build_item_url(file_entry, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://drive.google.com/file/d/file_456/view")
+        );
+
+        let fallback_folder_entry = &parsed[2].2;
+        assert_eq!(
+            backend
+                .build_item_url(fallback_folder_entry, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://drive.google.com/drive/folders/folder_789")
+        );
+
+        let unknown_entry = FileEntry {
+            name: "unknown.pdf".to_string(),
+            path: "/Projects/unknown.pdf".to_string(),
+            kind: FileKind::File,
+            size: 123,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            backend
+                .build_item_url(&unknown_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+
+        // Migrate renamed path and verify old path is gone and new path keeps fallback URL
+        backend.migrate_cached_path("/Projects/old.pdf", "/Projects/new.pdf");
+        assert_eq!(
+            backend
+                .build_item_url(file_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+        let renamed_entry = FileEntry {
+            name: "new.pdf".to_string(),
+            path: "/Projects/new.pdf".to_string(),
+            kind: FileKind::File,
+            size: 1048576,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            backend
+                .build_item_url(&renamed_entry, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://drive.google.com/file/d/file_456/view")
+        );
+
+        // Evict deleted path and verify URL is removed
+        backend.evict_cached_path("/Projects/new.pdf");
+        assert_eq!(
+            backend
+                .build_item_url(&renamed_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
     }
 }
