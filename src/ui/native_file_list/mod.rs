@@ -4,9 +4,14 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-use crate::models::{FileEntry, FileKind, format_bytes};
+use crate::i18n::I18n;
+use crate::models::{FileEntry, FileKind, ProtocolKind, format_bytes};
+use crate::storage::{
+    RemoteUrlKind, S3_PRESIGN_1_HOUR, S3_PRESIGN_7_DAYS, S3_PRESIGN_15_MIN, S3_PRESIGN_24_HOURS,
+};
 use crate::ui::file_pane::{SortColumn, format_modified_time, join_local_or_remote};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -94,6 +99,186 @@ pub struct NativePaneSnapshot {
     pub rows: Arc<Vec<NativeRowViewModel>>,
     pub entries: Arc<Vec<FileEntry>>,
     pub selected_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyUrlMenuEntry {
+    Action {
+        label: String,
+        kind: RemoteUrlKind,
+        enabled: bool,
+    },
+    Separator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyUrlMenuSpec {
+    Single {
+        label: String,
+        kind: RemoteUrlKind,
+        enabled: bool,
+    },
+    Submenu {
+        label: String,
+        enabled: bool,
+        items: Vec<CopyUrlMenuEntry>,
+    },
+}
+
+/// Resolves `selected_paths` against `entries` in selection order, ignoring unknown paths.
+pub fn resolve_selected_entries<'a>(
+    selected_paths: &[String],
+    entries: &'a [FileEntry],
+) -> Vec<&'a FileEntry> {
+    if selected_paths.is_empty() || entries.is_empty() {
+        return Vec::new();
+    }
+    let mut by_path = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        by_path.entry(entry.path.as_str()).or_insert(entry);
+    }
+    selected_paths
+        .iter()
+        .filter_map(|path| by_path.get(path.as_str()).copied())
+        .collect()
+}
+
+/// Builds a declarative "Copy URL" context menu model for the given remote protocol and selection.
+pub fn build_copy_url_menu_spec(
+    protocol: ProtocolKind,
+    selected_entries: &[&FileEntry],
+    t: I18n,
+) -> CopyUrlMenuSpec {
+    let has_selection = !selected_entries.is_empty();
+    let all_files =
+        has_selection && selected_entries.iter().all(|e| matches!(e.kind, FileKind::File));
+
+    match protocol {
+        ProtocolKind::S3 => {
+            let mut items = vec![
+                CopyUrlMenuEntry::Action {
+                    label: t.ctx_copy_s3_http_url().to_string(),
+                    kind: RemoteUrlKind::S3Http,
+                    enabled: has_selection,
+                },
+                CopyUrlMenuEntry::Action {
+                    label: t.ctx_copy_s3_uri().to_string(),
+                    kind: RemoteUrlKind::S3Uri,
+                    enabled: has_selection,
+                },
+                CopyUrlMenuEntry::Separator,
+            ];
+            for expires_secs in [
+                S3_PRESIGN_15_MIN,
+                S3_PRESIGN_1_HOUR,
+                S3_PRESIGN_24_HOURS,
+                S3_PRESIGN_7_DAYS,
+            ] {
+                items.push(CopyUrlMenuEntry::Action {
+                    label: t.ctx_copy_s3_presigned(expires_secs),
+                    kind: RemoteUrlKind::S3Presigned { expires_secs },
+                    enabled: all_files,
+                });
+            }
+            CopyUrlMenuSpec::Submenu {
+                label: t.ctx_copy_url().to_string(),
+                enabled: has_selection,
+                items,
+            }
+        }
+        ProtocolKind::Sftp => CopyUrlMenuSpec::Submenu {
+            label: t.ctx_copy_url().to_string(),
+            enabled: has_selection,
+            items: vec![
+                CopyUrlMenuEntry::Action {
+                    label: t.ctx_copy_sftp_scp_path().to_string(),
+                    kind: RemoteUrlKind::SftpScp,
+                    enabled: has_selection,
+                },
+                CopyUrlMenuEntry::Action {
+                    label: t.ctx_copy_sftp_url().to_string(),
+                    kind: RemoteUrlKind::SftpUrl,
+                    enabled: has_selection,
+                },
+            ],
+        },
+        ProtocolKind::Smb => CopyUrlMenuSpec::Submenu {
+            label: t.ctx_copy_url().to_string(),
+            enabled: has_selection,
+            items: vec![
+                CopyUrlMenuEntry::Action {
+                    label: t.ctx_copy_smb_url().to_string(),
+                    kind: RemoteUrlKind::SmbUrl,
+                    enabled: has_selection,
+                },
+                CopyUrlMenuEntry::Action {
+                    label: t.ctx_copy_smb_unc_path().to_string(),
+                    kind: RemoteUrlKind::SmbUnc,
+                    enabled: has_selection,
+                },
+            ],
+        },
+        ProtocolKind::Ftp
+        | ProtocolKind::WebDav
+        | ProtocolKind::GoogleDrive
+        | ProtocolKind::OneDrive => CopyUrlMenuSpec::Single {
+            label: t.ctx_copy_url().to_string(),
+            kind: RemoteUrlKind::Default,
+            enabled: has_selection,
+        },
+    }
+}
+
+/// Encodes a supported menu [`RemoteUrlKind`] preset into a native menu tag (`100..=110`), or `-1` if unsupported.
+pub fn remote_url_kind_to_menu_tag(kind: RemoteUrlKind) -> isize {
+    match kind {
+        RemoteUrlKind::Default => 100,
+        RemoteUrlKind::S3Http => 101,
+        RemoteUrlKind::S3Uri => 102,
+        RemoteUrlKind::S3Presigned {
+            expires_secs: S3_PRESIGN_15_MIN,
+        } => 103,
+        RemoteUrlKind::S3Presigned {
+            expires_secs: S3_PRESIGN_1_HOUR,
+        } => 104,
+        RemoteUrlKind::S3Presigned {
+            expires_secs: S3_PRESIGN_24_HOURS,
+        } => 105,
+        RemoteUrlKind::S3Presigned {
+            expires_secs: S3_PRESIGN_7_DAYS,
+        } => 106,
+        RemoteUrlKind::S3Presigned { .. } => -1,
+        RemoteUrlKind::SftpScp => 107,
+        RemoteUrlKind::SftpUrl => 108,
+        RemoteUrlKind::SmbUrl => 109,
+        RemoteUrlKind::SmbUnc => 110,
+    }
+}
+
+/// Decodes a native menu tag (`100..=110`) back into its [`RemoteUrlKind`].
+pub fn menu_tag_to_remote_url_kind(tag: isize) -> Option<RemoteUrlKind> {
+    match tag {
+        100 => Some(RemoteUrlKind::Default),
+        101 => Some(RemoteUrlKind::S3Http),
+        102 => Some(RemoteUrlKind::S3Uri),
+        103 => Some(RemoteUrlKind::S3Presigned {
+            expires_secs: S3_PRESIGN_15_MIN,
+        }),
+        104 => Some(RemoteUrlKind::S3Presigned {
+            expires_secs: S3_PRESIGN_1_HOUR,
+        }),
+        105 => Some(RemoteUrlKind::S3Presigned {
+            expires_secs: S3_PRESIGN_24_HOURS,
+        }),
+        106 => Some(RemoteUrlKind::S3Presigned {
+            expires_secs: S3_PRESIGN_7_DAYS,
+        }),
+        107 => Some(RemoteUrlKind::SftpScp),
+        108 => Some(RemoteUrlKind::SftpUrl),
+        109 => Some(RemoteUrlKind::SmbUrl),
+        110 => Some(RemoteUrlKind::SmbUnc),
+        _ => None,
+    }
 }
 
 pub fn build_native_row_models(
@@ -700,5 +885,315 @@ mod tests {
             ),
             "teardown must close wakeup channels so background watcher exits immediately"
         );
+    }
+
+    #[test]
+    fn test_build_copy_url_menu_spec_covers_all_protocols_and_s3_presign_guards() {
+        use crate::i18n::I18n;
+        use crate::models::ProtocolKind;
+        use crate::services::preferences::AppLanguage;
+        use crate::storage::{
+            RemoteUrlKind, S3_PRESIGN_1_HOUR, S3_PRESIGN_7_DAYS, S3_PRESIGN_15_MIN,
+            S3_PRESIGN_24_HOURS,
+        };
+
+        let t = I18n::new(AppLanguage::EnUs);
+        let dir_entry = FileEntry {
+            name: "docs".into(),
+            path: "/bucket/docs".into(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        };
+        let file_entry = FileEntry {
+            name: "report.pdf".into(),
+            path: "/bucket/report.pdf".into(),
+            kind: FileKind::File,
+            size: 2048,
+            modified_unix: None,
+            permissions: None,
+        };
+        let bucket_entry = FileEntry {
+            name: "my-bucket".into(),
+            path: "/my-bucket".into(),
+            kind: FileKind::Bucket,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        };
+        let all_entries = vec![
+            dir_entry.clone(),
+            file_entry.clone(),
+            bucket_entry.clone(),
+        ];
+
+        // resolve_selected_entries preserves selection order and ignores unknown paths
+        let selected_paths = vec![
+            "/bucket/report.pdf".to_string(),
+            "/unknown/missing.txt".to_string(),
+            "/bucket/docs".to_string(),
+        ];
+        let resolved = resolve_selected_entries(&selected_paths, &all_entries);
+        assert_eq!(
+            resolved.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["/bucket/report.pdf", "/bucket/docs"]
+        );
+
+        // Empty selection on S3: Submenu disabled and all actions disabled
+        match build_copy_url_menu_spec(ProtocolKind::S3, &[], t) {
+            CopyUrlMenuSpec::Submenu {
+                label,
+                enabled,
+                items,
+            } => {
+                assert_eq!(label, t.ctx_copy_url());
+                assert!(!enabled);
+                assert_eq!(items.len(), 7);
+                for item in &items {
+                    if let CopyUrlMenuEntry::Action { enabled, .. } = item {
+                        assert!(!enabled);
+                    }
+                }
+            }
+            other => panic!("expected Submenu for S3 empty selection, got {other:?}"),
+        }
+
+        // Single File on S3: 7 entries, all actions enabled
+        match build_copy_url_menu_spec(ProtocolKind::S3, &[&file_entry], t) {
+            CopyUrlMenuSpec::Submenu {
+                label,
+                enabled,
+                items,
+            } => {
+                assert_eq!(label, t.ctx_copy_url());
+                assert!(enabled);
+                assert_eq!(
+                    items,
+                    vec![
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_s3_http_url().to_string(),
+                            kind: RemoteUrlKind::S3Http,
+                            enabled: true,
+                        },
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_s3_uri().to_string(),
+                            kind: RemoteUrlKind::S3Uri,
+                            enabled: true,
+                        },
+                        CopyUrlMenuEntry::Separator,
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_s3_presigned(S3_PRESIGN_15_MIN),
+                            kind: RemoteUrlKind::S3Presigned {
+                                expires_secs: S3_PRESIGN_15_MIN,
+                            },
+                            enabled: true,
+                        },
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_s3_presigned(S3_PRESIGN_1_HOUR),
+                            kind: RemoteUrlKind::S3Presigned {
+                                expires_secs: S3_PRESIGN_1_HOUR,
+                            },
+                            enabled: true,
+                        },
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_s3_presigned(S3_PRESIGN_24_HOURS),
+                            kind: RemoteUrlKind::S3Presigned {
+                                expires_secs: S3_PRESIGN_24_HOURS,
+                            },
+                            enabled: true,
+                        },
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_s3_presigned(S3_PRESIGN_7_DAYS),
+                            kind: RemoteUrlKind::S3Presigned {
+                                expires_secs: S3_PRESIGN_7_DAYS,
+                            },
+                            enabled: true,
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected Submenu for S3 file selection, got {other:?}"),
+        }
+
+        // Directory, Bucket, and mixed [File, Directory] on S3:
+        // Submenu enabled, S3Http & S3Uri enabled, all 4 presigned items disabled
+        for selection in [
+            vec![&dir_entry],
+            vec![&bucket_entry],
+            vec![&file_entry, &dir_entry],
+        ] {
+            match build_copy_url_menu_spec(ProtocolKind::S3, &selection, t) {
+                CopyUrlMenuSpec::Submenu { enabled, items, .. } => {
+                    assert!(enabled);
+                    assert_eq!(items.len(), 7);
+                    match &items[0] {
+                        CopyUrlMenuEntry::Action { kind, enabled, .. } => {
+                            assert_eq!(*kind, RemoteUrlKind::S3Http);
+                            assert!(*enabled);
+                        }
+                        other => panic!("expected S3Http action, got {other:?}"),
+                    }
+                    match &items[1] {
+                        CopyUrlMenuEntry::Action { kind, enabled, .. } => {
+                            assert_eq!(*kind, RemoteUrlKind::S3Uri);
+                            assert!(*enabled);
+                        }
+                        other => panic!("expected S3Uri action, got {other:?}"),
+                    }
+                    assert_eq!(items[2], CopyUrlMenuEntry::Separator);
+                    for item in &items[3..] {
+                        match item {
+                            CopyUrlMenuEntry::Action {
+                                kind: RemoteUrlKind::S3Presigned { .. },
+                                enabled,
+                                ..
+                            } => assert!(!enabled),
+                            other => panic!("expected disabled S3Presigned action, got {other:?}"),
+                        }
+                    }
+                }
+                other => panic!("expected Submenu for S3, got {other:?}"),
+            }
+        }
+
+        // SFTP: Submenu with SftpScp and SftpUrl
+        match build_copy_url_menu_spec(ProtocolKind::Sftp, &[&file_entry], t) {
+            CopyUrlMenuSpec::Submenu {
+                label,
+                enabled,
+                items,
+            } => {
+                assert_eq!(label, t.ctx_copy_url());
+                assert!(enabled);
+                assert_eq!(
+                    items,
+                    vec![
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_sftp_scp_path().to_string(),
+                            kind: RemoteUrlKind::SftpScp,
+                            enabled: true,
+                        },
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_sftp_url().to_string(),
+                            kind: RemoteUrlKind::SftpUrl,
+                            enabled: true,
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected Submenu for SFTP, got {other:?}"),
+        }
+        match build_copy_url_menu_spec(ProtocolKind::Sftp, &[], t) {
+            CopyUrlMenuSpec::Submenu { enabled, items, .. } => {
+                assert!(!enabled);
+                assert!(items.iter().all(|i| matches!(
+                    i,
+                    CopyUrlMenuEntry::Action { enabled: false, .. }
+                )));
+            }
+            other => panic!("expected Submenu for empty SFTP, got {other:?}"),
+        }
+
+        // SMB: Submenu with SmbUrl and SmbUnc
+        match build_copy_url_menu_spec(ProtocolKind::Smb, &[&file_entry], t) {
+            CopyUrlMenuSpec::Submenu {
+                label,
+                enabled,
+                items,
+            } => {
+                assert_eq!(label, t.ctx_copy_url());
+                assert!(enabled);
+                assert_eq!(
+                    items,
+                    vec![
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_smb_url().to_string(),
+                            kind: RemoteUrlKind::SmbUrl,
+                            enabled: true,
+                        },
+                        CopyUrlMenuEntry::Action {
+                            label: t.ctx_copy_smb_unc_path().to_string(),
+                            kind: RemoteUrlKind::SmbUnc,
+                            enabled: true,
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected Submenu for SMB, got {other:?}"),
+        }
+        match build_copy_url_menu_spec(ProtocolKind::Smb, &[], t) {
+            CopyUrlMenuSpec::Submenu { enabled, items, .. } => {
+                assert!(!enabled);
+                assert!(items.iter().all(|i| matches!(
+                    i,
+                    CopyUrlMenuEntry::Action { enabled: false, .. }
+                )));
+            }
+            other => panic!("expected Submenu for empty SMB, got {other:?}"),
+        }
+
+        // Single-item protocols: FTP, WebDAV, GoogleDrive, OneDrive
+        for proto in [
+            ProtocolKind::Ftp,
+            ProtocolKind::WebDav,
+            ProtocolKind::GoogleDrive,
+            ProtocolKind::OneDrive,
+        ] {
+            assert_eq!(
+                build_copy_url_menu_spec(proto, &[&file_entry], t),
+                CopyUrlMenuSpec::Single {
+                    label: t.ctx_copy_url().to_string(),
+                    kind: RemoteUrlKind::Default,
+                    enabled: true,
+                }
+            );
+            assert_eq!(
+                build_copy_url_menu_spec(proto, &[], t),
+                CopyUrlMenuSpec::Single {
+                    label: t.ctx_copy_url().to_string(),
+                    kind: RemoteUrlKind::Default,
+                    enabled: false,
+                }
+            );
+        }
+
+        // Tag codecs roundtrip all 11 supported menu RemoteUrlKind values (100..=110)
+        let supported_kinds = [
+            RemoteUrlKind::Default,
+            RemoteUrlKind::S3Http,
+            RemoteUrlKind::S3Uri,
+            RemoteUrlKind::S3Presigned {
+                expires_secs: S3_PRESIGN_15_MIN,
+            },
+            RemoteUrlKind::S3Presigned {
+                expires_secs: S3_PRESIGN_1_HOUR,
+            },
+            RemoteUrlKind::S3Presigned {
+                expires_secs: S3_PRESIGN_24_HOURS,
+            },
+            RemoteUrlKind::S3Presigned {
+                expires_secs: S3_PRESIGN_7_DAYS,
+            },
+            RemoteUrlKind::SftpScp,
+            RemoteUrlKind::SftpUrl,
+            RemoteUrlKind::SmbUrl,
+            RemoteUrlKind::SmbUnc,
+        ];
+        let mut tags = Vec::new();
+        for kind in supported_kinds {
+            let tag = remote_url_kind_to_menu_tag(kind);
+            assert!((100..=110).contains(&tag), "unexpected tag {tag} for {kind:?}");
+            assert_eq!(menu_tag_to_remote_url_kind(tag), Some(kind));
+            tags.push(tag);
+        }
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags, (100..=110).collect::<Vec<isize>>());
+
+        // Out-of-range tags return None
+        for bad_tag in [-1, 0, 1, 99, 111, isize::MAX] {
+            assert_eq!(menu_tag_to_remote_url_kind(bad_tag), None);
+        }
     }
 }
