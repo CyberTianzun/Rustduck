@@ -1,7 +1,7 @@
 use crate::models::{
     join_remote_path, normalize_remote_path, FileEntry, FileKind, S3AddressingStyle, S3Config,
 };
-use crate::storage::{ProgressCallback, StorageBackend};
+use crate::storage::{ProgressCallback, RemoteUrlKind, StorageBackend, S3_PRESIGN_MAX_SECS};
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -170,6 +170,17 @@ pub fn resolve_bucket_and_object_key(
             return Err(anyhow!("Invalid S3 bucket or object key in {remote_path}"));
         }
         Ok((bkt.to_string(), key.to_string()))
+    }
+}
+
+/// Build an `s3://bucket[/key]` URI for an S3 bucket, prefix, or object key.
+pub fn build_s3_uri(bucket: &str, key: &str) -> String {
+    let clean_bucket = bucket.trim().trim_matches('/');
+    let clean_key = key.trim_start_matches('/');
+    if clean_key.is_empty() {
+        format!("s3://{clean_bucket}")
+    } else {
+        format!("s3://{clean_bucket}/{clean_key}")
     }
 }
 
@@ -409,6 +420,139 @@ pub fn resolve_effective_s3_region(config: &S3Config) -> String {
     }
 }
 
+fn s3_host_header(url: &Url) -> String {
+    match url.port() {
+        Some(port) => format!("{}:{}", url.host_str().unwrap_or_default(), port),
+        None => url.host_str().unwrap_or_default().to_string(),
+    }
+}
+
+fn s3_canonical_uri(url: &Url) -> &str {
+    if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    }
+}
+
+fn build_sigv4_canonical_query<K: AsRef<str>, V: AsRef<str>>(
+    pairs: impl IntoIterator<Item = (K, V)>,
+) -> String {
+    let mut encoded: Vec<(String, String)> = pairs
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                utf8_percent_encode(k.as_ref(), S3_SEGMENT_ENCODE_SET).to_string(),
+                utf8_percent_encode(v.as_ref(), S3_SEGMENT_ENCODE_SET).to_string(),
+            )
+        })
+        .collect();
+    encoded.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    encoded
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn sign_sigv4_request(
+    secret_access_key: &str,
+    amz_date: &str,
+    date_stamp: &str,
+    region: &str,
+    canonical_request: &str,
+) -> (String, String) {
+    let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
+    let req_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{req_hash}");
+
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_access_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+    (credential_scope, signature)
+}
+
+/// Generate an AWS SigV4 query-presigned GET URL for an S3 object.
+pub fn build_s3_presigned_get_url(
+    config: &S3Config,
+    secret_access_key: &str,
+    bucket: &str,
+    key: &str,
+    expires_secs: u64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<String> {
+    if expires_secs == 0 || expires_secs > S3_PRESIGN_MAX_SECS {
+        return Err(anyhow!(
+            "S3 presigned URL expiry must be between 1 and {S3_PRESIGN_MAX_SECS} seconds"
+        ));
+    }
+    let clean_bucket = bucket.trim().trim_matches('/');
+    if clean_bucket.is_empty() {
+        return Err(anyhow!("S3 bucket cannot be empty for presigned URL"));
+    }
+    let clean_key = key.trim_start_matches('/');
+    if clean_key.is_empty() {
+        return Err(anyhow!("S3 object key cannot be empty for presigned URL"));
+    }
+    let access_key = config.access_key_id.trim();
+    if access_key.is_empty() {
+        return Err(anyhow!("S3 access key ID cannot be empty for presigned URL"));
+    }
+    let clean_secret = secret_access_key.trim();
+    if clean_secret.is_empty() {
+        return Err(anyhow!(
+            "S3 secret access key cannot be empty for presigned URL"
+        ));
+    }
+
+    let mut url = build_s3_url(
+        &config.endpoint,
+        config.addressing_style,
+        Some(clean_bucket),
+        clean_key,
+    )?;
+    url.set_fragment(None);
+
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date_stamp = now.format("%Y%m%d").to_string();
+    let region = resolve_effective_s3_region(config);
+    let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
+    let credential = format!("{access_key}/{credential_scope}");
+    let expires_str = expires_secs.to_string();
+    let host_header = s3_host_header(&url);
+
+    let canonical_query = build_sigv4_canonical_query([
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", credential.as_str()),
+        ("X-Amz-Date", amz_date.as_str()),
+        ("X-Amz-Expires", expires_str.as_str()),
+        ("X-Amz-SignedHeaders", "host"),
+    ]);
+
+    let canonical_request = format!(
+        "GET\n{}\n{}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD",
+        s3_canonical_uri(&url),
+        canonical_query,
+        host_header
+    );
+
+    let (_, signature) = sign_sigv4_request(
+        clean_secret,
+        &amz_date,
+        &date_stamp,
+        &region,
+        &canonical_request,
+    );
+
+    url.set_query(Some(&format!("{canonical_query}&X-Amz-Signature={signature}")));
+    Ok(url.to_string())
+}
+
 pub fn build_put_object_acl_headers(
     acl: crate::services::preferences::S3UploadAcl,
 ) -> Vec<(String, String)> {
@@ -522,10 +666,7 @@ impl S3Backend {
         let effective_region = resolve_effective_s3_region(&self.config);
         let region = effective_region.as_str();
 
-        let host_header = match url.port() {
-            Some(port) => format!("{}:{}", url.host_str().unwrap_or_default(), port),
-            None => url.host_str().unwrap_or_default().to_string(),
-        };
+        let host_header = s3_host_header(url);
 
         let mut canonical_headers_vec: Vec<(String, String)> = vec![
             ("host".to_string(), host_header.clone()),
@@ -547,27 +688,8 @@ impl S3Backend {
             .collect::<Vec<_>>()
             .join(";");
 
-        let mut query_pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(k, v)| {
-                (
-                    utf8_percent_encode(&k, S3_SEGMENT_ENCODE_SET).to_string(),
-                    utf8_percent_encode(&v, S3_SEGMENT_ENCODE_SET).to_string(),
-                )
-            })
-            .collect();
-        query_pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        let canonical_query = query_pairs
-            .into_iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        let canonical_uri = if url.path().is_empty() {
-            "/"
-        } else {
-            url.path()
-        };
+        let canonical_query = build_sigv4_canonical_query(url.query_pairs());
+        let canonical_uri = s3_canonical_uri(url);
 
         let canonical_request = format!(
             "{}\n{}\n{}\n{}\n{}\n{}",
@@ -579,19 +701,13 @@ impl S3Backend {
             payload_hash
         );
 
-        let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
-        let req_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-        let string_to_sign =
-            format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{req_hash}");
-
-        let k_date = hmac_sha256(
-            format!("AWS4{}", self.secret_access_key).as_bytes(),
-            date_stamp.as_bytes(),
+        let (credential_scope, signature) = sign_sigv4_request(
+            &self.secret_access_key,
+            &amz_date,
+            &date_stamp,
+            region,
+            &canonical_request,
         );
-        let k_region = hmac_sha256(&k_date, region.as_bytes());
-        let k_service = hmac_sha256(&k_region, b"s3");
-        let k_signing = hmac_sha256(&k_service, b"aws4_request");
-        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
 
         let auth_header = format!(
             "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
@@ -649,6 +765,78 @@ impl S3Backend {
 impl StorageBackend for S3Backend {
     fn protocol_name(&self) -> &'static str {
         "S3"
+    }
+
+    fn build_item_url(
+        &self,
+        entry: &FileEntry,
+        kind: RemoteUrlKind,
+    ) -> anyhow::Result<Option<String>> {
+        if !matches!(
+            kind,
+            RemoteUrlKind::Default
+                | RemoteUrlKind::S3Http
+                | RemoteUrlKind::S3Uri
+                | RemoteUrlKind::S3Presigned { .. }
+        ) {
+            return Ok(None);
+        }
+        if matches!(kind, RemoteUrlKind::S3Presigned { .. }) && !matches!(entry.kind, FileKind::File)
+        {
+            return Ok(None);
+        }
+
+        let (bucket, key) = match entry.kind {
+            FileKind::Bucket => {
+                let path_bucket = entry.path.trim_matches('/');
+                let bucket = if path_bucket.is_empty() {
+                    entry.name.trim_matches('/')
+                } else {
+                    path_bucket
+                };
+                if bucket.is_empty() {
+                    return Err(anyhow!("S3 bucket name cannot be empty"));
+                }
+                (bucket.to_string(), String::new())
+            }
+            FileKind::Directory => {
+                let (bucket_opt, prefix) =
+                    resolve_bucket_and_prefix(self.config.bucket.as_deref(), &entry.path);
+                let bucket = bucket_opt.ok_or_else(|| {
+                    anyhow!("Cannot build S3 URL without a bucket for {}", entry.path)
+                })?;
+                (bucket, prefix)
+            }
+            FileKind::File => {
+                resolve_bucket_and_object_key(self.config.bucket.as_deref(), &entry.path)?
+            }
+        };
+
+        match kind {
+            RemoteUrlKind::S3Http | RemoteUrlKind::Default => {
+                let url = build_s3_url(
+                    &self.config.endpoint,
+                    self.config.addressing_style,
+                    Some(&bucket),
+                    &key,
+                )?;
+                Ok(Some(url.to_string()))
+            }
+            RemoteUrlKind::S3Uri => Ok(Some(build_s3_uri(&bucket, &key))),
+            RemoteUrlKind::S3Presigned { expires_secs } => build_s3_presigned_get_url(
+                &self.config,
+                &self.secret_access_key,
+                &bucket,
+                &key,
+                expires_secs,
+                Utc::now(),
+            )
+            .map(Some),
+            RemoteUrlKind::SftpScp
+            | RemoteUrlKind::SftpUrl
+            | RemoteUrlKind::SmbUrl
+            | RemoteUrlKind::SmbUnc => Ok(None),
+        }
     }
 
     async fn connect_and_verify(&self) -> anyhow::Result<String> {
@@ -1500,6 +1688,346 @@ mod tests {
                 .lines()
                 .any(|line| line.trim().eq_ignore_ascii_case("content-length: 0")),
             "expected explicit Content-Length: 0 header on CopyObject PUT, got:\n{received}"
+        );
+    }
+
+    #[test]
+    fn test_s3_presigned_get_url_matches_official_aws_sigv4_vector() {
+        use crate::models::{S3AddressingStyle, S3Config, S3Preset};
+
+        let config = S3Config {
+            preset: S3Preset::AwsS3,
+            endpoint: "https://s3.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            bucket: None,
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::VirtualHosted,
+            ..S3Config::default()
+        };
+        let now = DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let url = build_s3_presigned_get_url(
+            &config,
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "examplebucket",
+            "test.txt",
+            86_400,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            url,
+            "https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+        );
+    }
+
+    #[test]
+    fn test_s3_presigned_url_handles_bucket_qualified_oss_cjk_plus_and_minio_port() {
+        use crate::models::{S3AddressingStyle, S3Config, S3Preset};
+
+        let now = DateTime::parse_from_rfc3339("2026-11-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let oss_config = S3Config {
+            preset: S3Preset::AlibabaOss,
+            endpoint: "https://my-bucket.oss-cn-hangzhou.aliyuncs.com".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "LTAI5T_DEMO".to_string(),
+            bucket: Some("my-bucket".to_string()),
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::VirtualHosted,
+            ..S3Config::default()
+        };
+
+        let oss_url = build_s3_presigned_get_url(
+            &oss_config,
+            "oss-secret-demo",
+            "my-bucket",
+            "设计稿 2026/a+b.zip",
+            3_600,
+            now,
+        )
+        .unwrap();
+        assert!(
+            oss_url.starts_with("https://my-bucket.oss-cn-hangzhou.aliyuncs.com/"),
+            "expected non-doubled bucket host, got: {oss_url}"
+        );
+        assert!(
+            !oss_url.contains("my-bucket.my-bucket."),
+            "bucket host was unexpectedly doubled: {oss_url}"
+        );
+        let parsed_oss = Url::parse(&oss_url).unwrap();
+        assert!(
+            parsed_oss
+                .path()
+                .contains("%E8%AE%BE%E8%AE%A1%E7%A8%BF%202026/a%2Bb.zip"),
+            "expected CJK and '+' encoded in path, got: {}",
+            parsed_oss.path()
+        );
+        assert!(
+            !parsed_oss.path().contains('+'),
+            "raw '+' must not remain in path: {}",
+            parsed_oss.path()
+        );
+        let oss_query = parsed_oss.query().unwrap_or_default();
+        assert!(
+            oss_query.contains("cn-hangzhou%2Fs3%2Faws4_request"),
+            "expected inferred cn-hangzhou region in credential scope, got: {oss_query}"
+        );
+        assert!(
+            oss_query.contains("X-Amz-Expires=3600"),
+            "expected X-Amz-Expires=3600, got: {oss_query}"
+        );
+
+        let minio_config = S3Config {
+            preset: S3Preset::Minio,
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "minioadmin".to_string(),
+            bucket: Some("dev".to_string()),
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::PathStyle,
+            ..S3Config::default()
+        };
+
+        let minio_url = build_s3_presigned_get_url(
+            &minio_config,
+            "miniosecret",
+            "dev",
+            "logs/app.log",
+            3_600,
+            now,
+        )
+        .unwrap();
+        assert!(
+            minio_url.starts_with("http://127.0.0.1:9000/dev/logs/app.log?"),
+            "unexpected MinIO path-style presigned URL: {minio_url}"
+        );
+        let parsed_minio = Url::parse(&minio_url).unwrap();
+        assert_eq!(parsed_minio.port(), Some(9000));
+
+        assert!(build_s3_presigned_get_url(
+            &minio_config,
+            "miniosecret",
+            "dev",
+            "logs/app.log",
+            0,
+            now,
+        )
+        .is_err());
+        assert!(build_s3_presigned_get_url(
+            &minio_config,
+            "miniosecret",
+            "dev",
+            "logs/app.log",
+            604_801,
+            now,
+        )
+        .is_err());
+        assert!(build_s3_presigned_get_url(
+            &minio_config,
+            "miniosecret",
+            "dev",
+            "logs/app.log",
+            604_800,
+            now,
+        )
+        .is_ok());
+        assert!(build_s3_presigned_get_url(
+            &minio_config,
+            "miniosecret",
+            "",
+            "logs/app.log",
+            60,
+            now,
+        )
+        .is_err());
+        assert!(
+            build_s3_presigned_get_url(&minio_config, "miniosecret", "dev", "/", 60, now).is_err()
+        );
+    }
+
+    #[test]
+    fn test_s3_backend_build_item_url_for_bucket_directory_and_file_in_single_and_all_bucket_modes() {
+        use crate::models::{ConnectionProxyMode, S3AddressingStyle, S3Config, S3Preset};
+        use crate::storage::RemoteUrlKind;
+
+        let all_buckets_cfg = S3Config {
+            preset: S3Preset::AwsS3,
+            endpoint: "https://s3.us-west-2.amazonaws.com".to_string(),
+            region: "us-west-2".to_string(),
+            access_key_id: "AKID_DEMO".to_string(),
+            bucket: None,
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::VirtualHosted,
+            proxy_mode: ConnectionProxyMode::Direct,
+            ..S3Config::default()
+        };
+        let all_backend = S3Backend::new(all_buckets_cfg.clone(), "secret-demo".to_string()).unwrap();
+
+        let bucket_entry = FileEntry {
+            name: "prod-bkt".to_string(),
+            path: "/prod-bkt".to_string(),
+            kind: FileKind::Bucket,
+            size: 0,
+            modified_unix: None,
+            permissions: Some("Bucket".to_string()),
+        };
+        assert_eq!(
+            all_backend
+                .build_item_url(&bucket_entry, RemoteUrlKind::S3Http)
+                .unwrap(),
+            Some("https://prod-bkt.s3.us-west-2.amazonaws.com/".to_string())
+        );
+        assert_eq!(
+            all_backend
+                .build_item_url(&bucket_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("https://prod-bkt.s3.us-west-2.amazonaws.com/".to_string())
+        );
+        assert_eq!(
+            all_backend
+                .build_item_url(&bucket_entry, RemoteUrlKind::S3Uri)
+                .unwrap(),
+            Some("s3://prod-bkt".to_string())
+        );
+        assert_eq!(
+            all_backend
+                .build_item_url(
+                    &bucket_entry,
+                    RemoteUrlKind::S3Presigned { expires_secs: 900 }
+                )
+                .unwrap(),
+            None
+        );
+
+        let all_dir_entry = FileEntry {
+            name: "docs".to_string(),
+            path: "/prod-bkt/docs".to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: Some("Prefix".to_string()),
+        };
+        assert_eq!(
+            all_backend
+                .build_item_url(&all_dir_entry, RemoteUrlKind::S3Http)
+                .unwrap(),
+            Some("https://prod-bkt.s3.us-west-2.amazonaws.com/docs/".to_string())
+        );
+        assert_eq!(
+            all_backend
+                .build_item_url(&all_dir_entry, RemoteUrlKind::S3Uri)
+                .unwrap(),
+            Some("s3://prod-bkt/docs/".to_string())
+        );
+        assert_eq!(
+            all_backend
+                .build_item_url(
+                    &all_dir_entry,
+                    RemoteUrlKind::S3Presigned { expires_secs: 900 }
+                )
+                .unwrap(),
+            None
+        );
+
+        let all_file_entry = FileEntry {
+            name: "a.txt".to_string(),
+            path: "/prod-bkt/docs/a.txt".to_string(),
+            kind: FileKind::File,
+            size: 12,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            all_backend
+                .build_item_url(&all_file_entry, RemoteUrlKind::S3Http)
+                .unwrap(),
+            Some("https://prod-bkt.s3.us-west-2.amazonaws.com/docs/a.txt".to_string())
+        );
+        assert_eq!(
+            all_backend
+                .build_item_url(&all_file_entry, RemoteUrlKind::S3Uri)
+                .unwrap(),
+            Some("s3://prod-bkt/docs/a.txt".to_string())
+        );
+        let presigned = all_backend
+            .build_item_url(
+                &all_file_entry,
+                RemoteUrlKind::S3Presigned { expires_secs: 900 },
+            )
+            .unwrap()
+            .expect("expected presigned URL for file");
+        assert!(
+            presigned.starts_with("https://prod-bkt.s3.us-west-2.amazonaws.com/docs/a.txt?"),
+            "unexpected presigned prefix: {presigned}"
+        );
+        assert!(
+            presigned.contains("X-Amz-Signature="),
+            "missing X-Amz-Signature: {presigned}"
+        );
+        assert_eq!(
+            all_backend
+                .build_item_url(&all_file_entry, RemoteUrlKind::SftpScp)
+                .unwrap(),
+            None
+        );
+
+        let single_bucket_cfg = S3Config {
+            bucket: Some("prod-bkt".to_string()),
+            ..all_buckets_cfg
+        };
+        let single_backend =
+            S3Backend::new(single_bucket_cfg, "secret-demo".to_string()).unwrap();
+
+        let single_dir_entry = FileEntry {
+            name: "docs".to_string(),
+            path: "/docs".to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: Some("Prefix".to_string()),
+        };
+        assert_eq!(
+            single_backend
+                .build_item_url(&single_dir_entry, RemoteUrlKind::S3Http)
+                .unwrap(),
+            Some("https://prod-bkt.s3.us-west-2.amazonaws.com/docs/".to_string())
+        );
+        assert_eq!(
+            single_backend
+                .build_item_url(&single_dir_entry, RemoteUrlKind::S3Uri)
+                .unwrap(),
+            Some("s3://prod-bkt/docs/".to_string())
+        );
+        assert_eq!(
+            single_backend
+                .build_item_url(
+                    &single_dir_entry,
+                    RemoteUrlKind::S3Presigned { expires_secs: 900 }
+                )
+                .unwrap(),
+            None
+        );
+
+        let single_file_entry = FileEntry {
+            name: "a.txt".to_string(),
+            path: "/docs/a.txt".to_string(),
+            kind: FileKind::File,
+            size: 12,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            single_backend
+                .build_item_url(&single_file_entry, RemoteUrlKind::S3Uri)
+                .unwrap(),
+            Some("s3://prod-bkt/docs/a.txt".to_string())
         );
     }
 }
