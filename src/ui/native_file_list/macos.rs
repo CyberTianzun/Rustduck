@@ -627,6 +627,10 @@ fn ensure_objc_classes() {
             sel!(acceptsFirstMouse:),
             table_accepts_first_mouse as extern "C" fn(_, Sel, *mut AnyObject) -> Bool,
         );
+        tv_decl.add_method(
+            sel!(menuForEvent:),
+            table_menu_for_event as extern "C" fn(_, Sel, *mut AnyObject) -> *mut AnyObject,
+        );
         TABLE_VIEW_CLASS.store(
             tv_decl.register() as *const AnyClass as usize,
             Ordering::Release,
@@ -1421,7 +1425,7 @@ unsafe fn append_copy_url_nsmenu(
             } => {
                 let tag = remote_url_kind_to_menu_tag(*kind);
                 if tag >= 0 {
-                    add_nsmenu_item(menu, target, label, tag as NSInteger, *enabled);
+                    add_nsmenu_item(menu, target, label, tag, *enabled);
                 }
             }
             CopyUrlMenuSpec::Submenu {
@@ -1455,7 +1459,7 @@ unsafe fn append_copy_url_nsmenu(
                                     submenu,
                                     target,
                                     label,
-                                    tag as NSInteger,
+                                    tag,
                                     *enabled && *item_enabled,
                                 );
                             }
@@ -1541,7 +1545,7 @@ extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut
             5 => Some(NativeContextMenuAction::DeleteSelected),
             6 => Some(NativeContextMenuAction::CopySelectedPath),
             7 => Some(NativeContextMenuAction::Refresh),
-            _ => menu_tag_to_remote_url_kind(tag as isize)
+            _ => menu_tag_to_remote_url_kind(tag)
                 .map(NativeContextMenuAction::CopyRemoteUrl),
         };
         if let Some(act) = action {
@@ -1668,6 +1672,52 @@ extern "C" fn table_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObj
         }
         let _: () = msg_send![super(this, class!(NSTableView)), keyDown: event];
     });
+}
+
+extern "C" fn table_menu_for_event(
+    this: *mut AnyObject,
+    _cmd: Sel,
+    event: *mut AnyObject,
+) -> *mut AnyObject {
+    autoreleasepool(|_| unsafe {
+        if !event.is_null() {
+            let win_pt: NSPoint = msg_send![event, locationInWindow];
+            let local_pt: NSPoint =
+                msg_send![this, convertPoint: win_pt, fromView: null::<AnyObject>()];
+            let row: NSInteger = msg_send![this, rowAtPoint: local_pt];
+            if row >= 0 {
+                let already_selected: Bool = msg_send![this, isRowSelected: row];
+                if !already_selected.as_bool() {
+                    let del: *mut AnyObject = msg_send![this, delegate];
+                    let selectable = get_delegate_ctx(del)
+                        .and_then(|ctx| {
+                            ctx.state.upgrade().map(|state| (ctx.is_local, state))
+                        })
+                        .is_some_and(|(is_local, state)| {
+                            let guard = state.lock().unwrap();
+                            let pane = if is_local {
+                                &guard.left
+                            } else {
+                                &guard.right
+                            };
+                            pane.rows.get(row as usize).is_some_and(|r| !r.is_parent_row)
+                        });
+                    if selectable {
+                        let idx_set: *mut AnyObject =
+                            msg_send![class!(NSIndexSet), indexSetWithIndex: row as NSUInteger];
+                        if !idx_set.is_null() {
+                            let _: () = msg_send![
+                                this,
+                                selectRowIndexes: idx_set,
+                                byExtendingSelection: Bool::NO
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+    });
+    unsafe { msg_send![super(this, class!(NSTableView)), menuForEvent: event] }
 }
 
 extern "C" fn write_rows_to_pasteboard(

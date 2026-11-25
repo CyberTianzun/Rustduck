@@ -814,12 +814,14 @@ impl StorageBackend for S3Backend {
 
         match kind {
             RemoteUrlKind::S3Http | RemoteUrlKind::Default => {
-                let url = build_s3_url(
+                let mut url = build_s3_url(
                     &self.config.endpoint,
                     self.config.addressing_style,
                     Some(&bucket),
                     &key,
                 )?;
+                url.set_query(None);
+                url.set_fragment(None);
                 Ok(Some(url.to_string()))
             }
             RemoteUrlKind::S3Uri => Ok(Some(build_s3_uri(&bucket, &key))),
@@ -1983,7 +1985,7 @@ mod tests {
             ..all_buckets_cfg
         };
         let single_backend =
-            S3Backend::new(single_bucket_cfg, "secret-demo".to_string()).unwrap();
+            S3Backend::new(single_bucket_cfg.clone(), "secret-demo".to_string()).unwrap();
 
         let single_dir_entry = FileEntry {
             name: "docs".to_string(),
@@ -2028,6 +2030,25 @@ mod tests {
                 .build_item_url(&single_file_entry, RemoteUrlKind::S3Uri)
                 .unwrap(),
             Some("s3://prod-bkt/docs/a.txt".to_string())
+        );
+
+        let dirty_endpoint_cfg = S3Config {
+            endpoint: "https://s3.us-west-2.amazonaws.com/?versionId=leak#frag".to_string(),
+            ..single_bucket_cfg
+        };
+        let dirty_backend =
+            S3Backend::new(dirty_endpoint_cfg, "secret-demo".to_string()).unwrap();
+        assert_eq!(
+            dirty_backend
+                .build_item_url(&single_file_entry, RemoteUrlKind::S3Http)
+                .unwrap(),
+            Some("https://prod-bkt.s3.us-west-2.amazonaws.com/docs/a.txt".to_string())
+        );
+        assert_eq!(
+            dirty_backend
+                .build_item_url(&single_file_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("https://prod-bkt.s3.us-west-2.amazonaws.com/docs/a.txt".to_string())
         );
     }
 }

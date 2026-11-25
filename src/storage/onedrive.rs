@@ -284,10 +284,10 @@ impl StorageBackend for OneDriveBackend {
         match kind {
             RemoteUrlKind::Default => {
                 let norm = normalize_remote_path(&entry.path);
-                if let Ok(cache) = self.path_web_url_cache.read() {
-                    if let Some(url) = cache.get(&norm) {
-                        return Ok(Some(url.clone()));
-                    }
+                if let Ok(cache) = self.path_web_url_cache.read()
+                    && let Some(url) = cache.get(&norm)
+                {
+                    return Ok(Some(url.clone()));
                 }
                 Ok(None)
             }
@@ -381,6 +381,7 @@ impl StorageBackend for OneDriveBackend {
                 text
             ));
         }
+        self.evict_cached_path(&norm);
         Ok(())
     }
 
@@ -694,6 +695,49 @@ mod tests {
                 .build_item_url(file_entry, RemoteUrlKind::Default)
                 .unwrap(),
             None
+        );
+
+        // Evicting a folder on create_dir (replace) / rename / delete clears folder + descendants,
+        // while preserving sibling folders with a shared name prefix.
+        let extra_children = parse_onedrive_children_with_links_json(
+            r#"{
+                "value": [
+                    { "name": "nested.docx", "size": 12, "webUrl": "https://1drv.ms/w/s!nested" }
+                ]
+            }"#,
+            "/Work/Documents",
+        )
+        .unwrap();
+        let sibling_folder = parse_onedrive_children_with_links_json(
+            r#"{
+                "value": [
+                    { "name": "Documents2", "folder": { "childCount": 1 }, "webUrl": "https://onedrive.live.com/?id=folder_2" }
+                ]
+            }"#,
+            "/Work",
+        )
+        .unwrap();
+        backend.cache_listed_entries(&extra_children);
+        backend.cache_listed_entries(&sibling_folder);
+        backend.evict_cached_path("/Work/Documents");
+        assert_eq!(
+            backend
+                .build_item_url(folder_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            backend
+                .build_item_url(&extra_children[0].1, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            backend
+                .build_item_url(&sibling_folder[0].1, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://onedrive.live.com/?id=folder_2")
         );
     }
 }

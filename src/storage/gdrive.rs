@@ -227,8 +227,12 @@ impl GoogleDriveBackend {
     }
 
     fn migrate_cache_map(cache: &mut HashMap<String, String>, src: &str, dst: &str) {
+        if src == dst {
+            return;
+        }
+        let mut migrated = Vec::new();
         if let Some(val) = cache.remove(src) {
-            cache.insert(dst.to_string(), val);
+            migrated.push((dst.to_string(), val));
         }
         if src != "/" {
             let prefix = format!("{src}/");
@@ -240,9 +244,13 @@ impl GoogleDriveBackend {
             for key in child_keys {
                 if let Some(val) = cache.remove(&key) {
                     let suffix = &key[src.len()..];
-                    cache.insert(format!("{dst}{suffix}"), val);
+                    migrated.push((format!("{dst}{suffix}"), val));
                 }
             }
+        }
+        Self::evict_cache_map(cache, dst);
+        for (key, val) in migrated {
+            cache.insert(key, val);
         }
     }
 
@@ -272,6 +280,16 @@ impl GoogleDriveBackend {
         }
         if let Ok(mut url_cache) = self.path_web_url_cache.write() {
             Self::evict_cache_map(&mut url_cache, &norm);
+        }
+    }
+
+    fn cache_created_dir(&self, path: &str, response_text: &str) {
+        let norm = normalize_remote_path(path);
+        self.evict_cached_path(&norm);
+        if let Ok(item) = serde_json::from_str::<GDriveFileItem>(response_text)
+            && let Ok(mut cache) = self.path_id_cache.write()
+        {
+            cache.insert(norm, item.id);
         }
     }
 
@@ -404,18 +422,18 @@ impl StorageBackend for GoogleDriveBackend {
         match kind {
             RemoteUrlKind::Default => {
                 let norm = normalize_remote_path(&entry.path);
-                if let Ok(cache) = self.path_web_url_cache.read() {
-                    if let Some(url) = cache.get(&norm) {
-                        return Ok(Some(url.clone()));
-                    }
+                if let Ok(cache) = self.path_web_url_cache.read()
+                    && let Some(url) = cache.get(&norm)
+                {
+                    return Ok(Some(url.clone()));
                 }
-                if let Ok(id_cache) = self.path_id_cache.read() {
-                    if let Some(id) = id_cache.get(&norm) {
-                        return Ok(Some(build_gdrive_fallback_web_url(
-                            id,
-                            entry.kind.is_dir_like(),
-                        )));
-                    }
+                if let Ok(id_cache) = self.path_id_cache.read()
+                    && let Some(id) = id_cache.get(&norm)
+                {
+                    return Ok(Some(build_gdrive_fallback_web_url(
+                        id,
+                        entry.kind.is_dir_like(),
+                    )));
                 }
                 Ok(None)
             }
@@ -523,11 +541,7 @@ impl StorageBackend for GoogleDriveBackend {
                 text
             ));
         }
-        if let Ok(item) = serde_json::from_str::<GDriveFileItem>(&text) {
-            if let Ok(mut cache) = self.path_id_cache.write() {
-                cache.insert(norm, item.id);
-            }
-        }
+        self.cache_created_dir(&norm, &text);
         Ok(())
     }
 
@@ -937,6 +951,182 @@ mod tests {
         assert_eq!(
             backend
                 .build_item_url(&renamed_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_gdrive_cache_hygiene_on_migrate_overwrite_and_create_dir() {
+        let sample_json = r#"{
+            "files": [
+                {
+                    "id": "dst_old_folder",
+                    "name": "Target",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "webViewLink": "https://drive.google.com/drive/folders/dst_old_folder?usp=sharing"
+                },
+                {
+                    "id": "src_no_link_id",
+                    "name": "Source",
+                    "mimeType": "application/vnd.google-apps.folder"
+                }
+            ]
+        }"#;
+        let parsed = parse_gdrive_files_with_links_json(sample_json, "/Projects").unwrap();
+        let backend =
+            GoogleDriveBackend::new(GoogleDriveConfig::default(), "test-refresh-token".to_string())
+                .unwrap();
+        backend.cache_listed_entries(&parsed);
+
+        // Also cache a stale descendant under /Projects/Target
+        let stale_child_json = r#"{
+            "files": [
+                {
+                    "id": "stale_child_id",
+                    "name": "stale.txt",
+                    "mimeType": "text/plain",
+                    "webViewLink": "https://drive.google.com/file/d/stale_child_id/view"
+                }
+            ]
+        }"#;
+        let stale_children =
+            parse_gdrive_files_with_links_json(stale_child_json, "/Projects/Target").unwrap();
+        backend.cache_listed_entries(&stale_children);
+
+        // Renaming /Projects/Source (which had NO webViewLink in path_web_url_cache) onto /Projects/Target
+        // must evict the stale dst entry and stale dst descendants instead of letting them survive.
+        backend.migrate_cached_path("/Projects/Source", "/Projects/Target");
+        let target_entry = FileEntry {
+            name: "Target".to_string(),
+            path: "/Projects/Target".to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            backend
+                .build_item_url(&target_entry, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://drive.google.com/drive/folders/src_no_link_id")
+        );
+        let stale_child_entry = &stale_children[0].2;
+        assert_eq!(
+            backend
+                .build_item_url(stale_child_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+
+        // If neither cache had src, migrating src -> dst must still clear dst
+        let dst_only_json = r#"{
+            "files": [
+                {
+                    "id": "ghost_id",
+                    "name": "Ghost",
+                    "mimeType": "application/pdf",
+                    "webViewLink": "https://drive.google.com/file/d/ghost_id/view"
+                }
+            ]
+        }"#;
+        let ghost_parsed = parse_gdrive_files_with_links_json(dst_only_json, "/Projects").unwrap();
+        backend.cache_listed_entries(&ghost_parsed);
+        backend.migrate_cached_path("/Projects/UncachedSrc", "/Projects/Ghost");
+        assert_eq!(
+            backend
+                .build_item_url(&ghost_parsed[0].2, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+
+        // Same-path migration must be a no-op and keep existing cache entries intact
+        let same_json = r#"{
+            "files": [
+                {
+                    "id": "keep_id",
+                    "name": "Keep",
+                    "mimeType": "application/pdf",
+                    "webViewLink": "https://drive.google.com/file/d/keep_id/view"
+                }
+            ]
+        }"#;
+        let same_parsed = parse_gdrive_files_with_links_json(same_json, "/Projects").unwrap();
+        backend.cache_listed_entries(&same_parsed);
+        backend.migrate_cached_path("/Projects/Keep", "/Projects/Keep");
+        assert_eq!(
+            backend
+                .build_item_url(&same_parsed[0].2, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://drive.google.com/file/d/keep_id/view")
+        );
+
+        // Creating a folder at a path with pre-existing webViewLink and descendant caches must evict stale entries
+        let pre_dir_json = r#"{
+            "files": [
+                {
+                    "id": "old_dir_id",
+                    "name": "Recreated",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "webViewLink": "https://drive.google.com/drive/folders/old_dir_id?usp=sharing"
+                },
+                {
+                    "id": "sibling_id",
+                    "name": "RecreatedSibling",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "webViewLink": "https://drive.google.com/drive/folders/sibling_id?usp=sharing"
+                }
+            ]
+        }"#;
+        let pre_dirs = parse_gdrive_files_with_links_json(pre_dir_json, "/Projects").unwrap();
+        backend.cache_listed_entries(&pre_dirs);
+        let pre_desc_json = r#"{
+            "files": [
+                {
+                    "id": "old_nested_id",
+                    "name": "nested.pdf",
+                    "mimeType": "application/pdf",
+                    "webViewLink": "https://drive.google.com/file/d/old_nested_id/view"
+                }
+            ]
+        }"#;
+        let pre_desc =
+            parse_gdrive_files_with_links_json(pre_desc_json, "/Projects/Recreated").unwrap();
+        backend.cache_listed_entries(&pre_desc);
+
+        backend.cache_created_dir(
+            "/Projects/Recreated",
+            r#"{"id":"new_dir_id","name":"Recreated","mimeType":"application/vnd.google-apps.folder"}"#,
+        );
+        assert_eq!(
+            backend
+                .build_item_url(&pre_dirs[0].2, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://drive.google.com/drive/folders/new_dir_id")
+        );
+        assert_eq!(
+            backend
+                .build_item_url(&pre_desc[0].2, RemoteUrlKind::Default)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            backend
+                .build_item_url(&pre_dirs[1].2, RemoteUrlKind::Default)
+                .unwrap()
+                .as_deref(),
+            Some("https://drive.google.com/drive/folders/sibling_id?usp=sharing")
+        );
+
+        // Even if create_dir response lacks valid JSON, pre-existing stale cache entries must be evicted
+        backend.cache_listed_entries(&pre_dirs[..1]);
+        backend.cache_created_dir("/Projects/Recreated", "");
+        assert_eq!(
+            backend
+                .build_item_url(&pre_dirs[0].2, RemoteUrlKind::Default)
                 .unwrap(),
             None
         );

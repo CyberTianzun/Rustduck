@@ -775,6 +775,18 @@ mod tests {
             !macos_src.contains("msg_send![submenu, setDelegate:"),
             "macOS child submenu must not setDelegate: (would recursively trigger menuNeedsUpdate:)"
         );
+        assert!(
+            macos_src.contains("sel!(menuForEvent:)"),
+            "RustduckFinderTableView must override menuForEvent: so right-clicking an unselected row selects it before menuNeedsUpdate:"
+        );
+        assert!(
+            macos_src.contains("rowAtPoint:"),
+            "table_menu_for_event must hit-test the right-clicked row via rowAtPoint:"
+        );
+        assert!(
+            macos_src.contains("isRowSelected:"),
+            "table_menu_for_event must check isRowSelected: so existing multi-selection is preserved"
+        );
     }
 
     #[test]
