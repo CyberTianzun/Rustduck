@@ -745,6 +745,7 @@ impl StorageBackend for S3Backend {
             .client
             .put(url)
             .headers(headers)
+            .header(reqwest::header::CONTENT_LENGTH, 0)
             .body(Vec::new())
             .send()
             .await?;
@@ -778,7 +779,13 @@ impl StorageBackend for S3Backend {
             &empty_hash,
             &[("x-amz-copy-source".to_string(), copy_source)],
         )?;
-        let resp = self.client.put(url).headers(headers).send().await?;
+        let resp = self
+            .client
+            .put(url)
+            .headers(headers)
+            .header(reqwest::header::CONTENT_LENGTH, 0)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -1348,6 +1355,151 @@ mod tests {
         assert!(
             received_headers.contains("signedheaders=host;x-amz-acl;x-amz-content-sha256;x-amz-date"),
             "expected x-amz-acl in SignedHeaders, got: {received_headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s3_create_dir_sends_explicit_content_length_zero() {
+        use crate::models::{S3AddressingStyle, S3Config, S3Preset};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (req_tx, req_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut req_buf = vec![0u8; 4096];
+                let n = socket.read(&mut req_buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]).to_string();
+                let has_cl_zero = req_str
+                    .lines()
+                    .any(|line| line.trim().eq_ignore_ascii_case("content-length: 0"));
+                let _ = req_tx.send(req_str);
+                if has_cl_zero {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                } else {
+                    let err_xml = "<Error><Code>MissingContentLength</Code></Error>";
+                    let resp = format!(
+                        "HTTP/1.1 411 Length Required\r\nContent-Length: {}\r\n\r\n{}",
+                        err_xml.len(),
+                        err_xml
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let cfg = S3Config {
+            preset: S3Preset::Minio,
+            endpoint: format!("http://{addr}"),
+            region: "us-east-1".to_string(),
+            access_key_id: "minioadmin".to_string(),
+            bucket: Some("test-bkt".to_string()),
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::PathStyle,
+            proxy_mode: crate::models::ConnectionProxyMode::Direct,
+            ..S3Config::default()
+        };
+        let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
+
+        let res = backend.create_dir("/new-folder").await;
+        let received = req_rx.await.unwrap();
+        assert!(
+            res.is_ok(),
+            "create_dir failed: {res:?}\nrequest was:\n{received}"
+        );
+        assert!(
+            received
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .starts_with("PUT /test-bkt/new-folder/ "),
+            "unexpected request line: {received}"
+        );
+        assert!(
+            received
+                .lines()
+                .any(|line| line.trim().eq_ignore_ascii_case("content-length: 0")),
+            "expected explicit Content-Length: 0 header, got:\n{received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s3_rename_copy_object_sends_explicit_content_length_zero() {
+        use crate::models::{S3AddressingStyle, S3Config, S3Preset};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (put_tx, put_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let mut put_tx = Some(put_tx);
+            for _ in 0..2 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut req_buf = vec![0u8; 4096];
+                    let n = socket.read(&mut req_buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&req_buf[..n]).to_string();
+                    let first_line = req_str.lines().next().unwrap_or_default();
+                    if first_line.starts_with("PUT ") {
+                        let has_cl_zero = req_str
+                            .lines()
+                            .any(|line| line.trim().eq_ignore_ascii_case("content-length: 0"));
+                        if let Some(tx) = put_tx.take() {
+                            let _ = tx.send(req_str);
+                        }
+                        if has_cl_zero {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .await;
+                        } else {
+                            let err_xml = "<Error><Code>MissingContentLength</Code></Error>";
+                            let resp = format!(
+                                "HTTP/1.1 411 Length Required\r\nContent-Length: {}\r\n\r\n{}",
+                                err_xml.len(),
+                                err_xml
+                            );
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                            break;
+                        }
+                    } else {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                }
+            }
+        });
+
+        let cfg = S3Config {
+            preset: S3Preset::Minio,
+            endpoint: format!("http://{addr}"),
+            region: "us-east-1".to_string(),
+            access_key_id: "minioadmin".to_string(),
+            bucket: Some("test-bkt".to_string()),
+            initial_prefix: "/".to_string(),
+            addressing_style: S3AddressingStyle::PathStyle,
+            proxy_mode: crate::models::ConnectionProxyMode::Direct,
+            ..S3Config::default()
+        };
+        let backend = S3Backend::new(cfg, "miniosecret".to_string()).unwrap();
+
+        let res = backend.rename("/old.txt", "/new.txt").await;
+        let received = put_rx.await.unwrap();
+        assert!(
+            res.is_ok(),
+            "rename failed: {res:?}\nPUT request was:\n{received}"
+        );
+        assert!(
+            received
+                .lines()
+                .any(|line| line.trim().eq_ignore_ascii_case("content-length: 0")),
+            "expected explicit Content-Length: 0 header on CopyObject PUT, got:\n{received}"
         );
     }
 }
