@@ -23,12 +23,59 @@ use tokio_util::sync::CancellationToken;
 
 pub type ProgressCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
+pub const S3_PRESIGN_15_MIN: u64 = 900;
+pub const S3_PRESIGN_1_HOUR: u64 = 3_600;
+pub const S3_PRESIGN_24_HOURS: u64 = 86_400;
+pub const S3_PRESIGN_7_DAYS: u64 = 604_800;
+pub const S3_PRESIGN_MAX_SECS: u64 = 604_800;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteUrlKind {
+    Default,
+    S3Http,
+    S3Uri,
+    S3Presigned { expires_secs: u64 },
+    SftpScp,
+    SftpUrl,
+    SmbUrl,
+    SmbUnc,
+}
+
+const USERINFO_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Format a host or IP literal for URL authority placement, bracketing bare IPv6 literals.
+pub fn format_host_for_url(host: &str) -> String {
+    let trimmed = host.trim();
+    if trimmed.contains(':') && !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        format!("[{trimmed}]")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Percent-encode a URL userinfo component using the RFC 3986 unreserved character set.
+pub fn encode_userinfo_component(raw: &str) -> String {
+    percent_encoding::utf8_percent_encode(raw, USERINFO_ENCODE_SET).to_string()
+}
+
 #[async_trait::async_trait]
 pub trait StorageBackend: Send + Sync {
     fn protocol_name(&self) -> &'static str;
 
     fn exported_secret(&self) -> Option<String> {
         None
+    }
+
+    fn build_item_url(
+        &self,
+        _entry: &FileEntry,
+        _kind: RemoteUrlKind,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
     async fn connect_and_verify(&self) -> anyhow::Result<String>;
@@ -79,5 +126,28 @@ pub fn create_backend(
             c.clone(),
             secret.to_string(),
         )?)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_host_and_userinfo_formatting_handles_ipv6_and_special_chars() {
+        assert_eq!(format_host_for_url("example.com"), "example.com");
+        assert_eq!(format_host_for_url("  example.com  "), "example.com");
+        assert_eq!(format_host_for_url("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(format_host_for_url("[2001:db8::1]"), "[2001:db8::1]");
+
+        assert_eq!(encode_userinfo_component("alice@corp"), "alice%40corp");
+        assert_eq!(encode_userinfo_component("john doe"), "john%20doe");
+        assert_eq!(encode_userinfo_component("a-b.c_d~1"), "a-b.c_d~1");
+
+        assert_eq!(S3_PRESIGN_15_MIN, 900);
+        assert_eq!(S3_PRESIGN_1_HOUR, 3_600);
+        assert_eq!(S3_PRESIGN_24_HOURS, 86_400);
+        assert_eq!(S3_PRESIGN_7_DAYS, 604_800);
+        assert_eq!(S3_PRESIGN_MAX_SECS, 604_800);
     }
 }

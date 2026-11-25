@@ -2,6 +2,9 @@ use crate::models::{ConnectionProxyMode, S3AddressingStyle, S3Preset};
 use crate::services::preferences::{
     AppLanguage, GlobalProxyMode, LocalStartupDirMode, S3UploadAcl, ThemePreference,
 };
+use crate::storage::{
+    RemoteUrlKind, S3_PRESIGN_15_MIN, S3_PRESIGN_1_HOUR, S3_PRESIGN_24_HOURS, S3_PRESIGN_7_DAYS,
+};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static ACTIVE_LANG: AtomicU8 = AtomicU8::new(0);
@@ -1276,6 +1279,61 @@ impl I18n {
         }
     }
 
+    pub fn ctx_copy_url(&self) -> &'static str {
+        if self.is_zh() {
+            "复制 URL"
+        } else {
+            "Copy URL"
+        }
+    }
+
+    pub fn ctx_copy_s3_http_url(&self) -> &'static str {
+        "HTTP URL"
+    }
+
+    pub fn ctx_copy_s3_uri(&self) -> &'static str {
+        "S3 URI"
+    }
+
+    pub fn ctx_copy_s3_presigned(&self, expires_secs: u64) -> String {
+        match (self.is_zh(), expires_secs) {
+            (true, S3_PRESIGN_15_MIN) => "签名 URL (15 分钟)".to_string(),
+            (true, S3_PRESIGN_1_HOUR) => "签名 URL (1 小时)".to_string(),
+            (true, S3_PRESIGN_24_HOURS) => "签名 URL (24 小时)".to_string(),
+            (true, S3_PRESIGN_7_DAYS) => "签名 URL (7 天)".to_string(),
+            (true, _) => format!("签名 URL ({expires_secs} 秒)"),
+            (false, S3_PRESIGN_15_MIN) => "Signed URL (15 Minutes)".to_string(),
+            (false, S3_PRESIGN_1_HOUR) => "Signed URL (1 Hour)".to_string(),
+            (false, S3_PRESIGN_24_HOURS) => "Signed URL (24 Hours)".to_string(),
+            (false, S3_PRESIGN_7_DAYS) => "Signed URL (7 Days)".to_string(),
+            (false, _) => format!("Signed URL ({expires_secs}s)"),
+        }
+    }
+
+    pub fn ctx_copy_sftp_scp_path(&self) -> &'static str {
+        if self.is_zh() {
+            "SCP / rsync 路径"
+        } else {
+            "SCP / rsync Path"
+        }
+    }
+
+    pub fn ctx_copy_sftp_url(&self) -> &'static str {
+        "SFTP URL"
+    }
+
+    pub fn ctx_copy_smb_url(&self) -> &'static str {
+        "SMB URL"
+    }
+
+    pub fn ctx_copy_smb_unc_path(&self) -> &'static str {
+        if self.is_zh() {
+            "UNC 路径"
+        } else {
+            "UNC Path"
+        }
+    }
+
     pub fn ctx_refresh(&self) -> &'static str {
         if self.is_zh() {
             "刷新"
@@ -1956,6 +2014,50 @@ impl I18n {
             format!("{provider} authorization failed: {err}")
         }
     }
+
+    pub fn msg_copied_remote_url(&self, count: usize, kind: RemoteUrlKind) -> String {
+        let label = match kind {
+            RemoteUrlKind::Default => "URL".to_string(),
+            RemoteUrlKind::S3Http => self.ctx_copy_s3_http_url().to_string(),
+            RemoteUrlKind::S3Uri => self.ctx_copy_s3_uri().to_string(),
+            RemoteUrlKind::S3Presigned { expires_secs } => {
+                self.ctx_copy_s3_presigned(expires_secs)
+            }
+            RemoteUrlKind::SftpScp => self.ctx_copy_sftp_scp_path().to_string(),
+            RemoteUrlKind::SftpUrl => self.ctx_copy_sftp_url().to_string(),
+            RemoteUrlKind::SmbUrl => self.ctx_copy_smb_url().to_string(),
+            RemoteUrlKind::SmbUnc => self.ctx_copy_smb_unc_path().to_string(),
+        };
+        if self.is_zh() {
+            if count <= 1 {
+                format!("已复制 {label} 到剪贴板")
+            } else {
+                format!("已复制 {count} 条 {label} 到剪贴板")
+            }
+        } else if count <= 1 {
+            format!("Copied {label} to clipboard")
+        } else if matches!(kind, RemoteUrlKind::Default) {
+            format!("Copied {count} URLs to clipboard")
+        } else {
+            format!("Copied {count} × {label} to clipboard")
+        }
+    }
+
+    pub fn msg_copy_url_unavailable(&self) -> String {
+        if self.is_zh() {
+            "当前选中项不能生成 URL".to_string()
+        } else {
+            "Cannot generate URL for selected item".to_string()
+        }
+    }
+
+    pub fn msg_copy_url_failed(&self, err: &dyn std::fmt::Display) -> String {
+        if self.is_zh() {
+            format!("复制 URL 失败: {err}")
+        } else {
+            format!("Failed to copy URL: {err}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2089,5 +2191,136 @@ mod tests {
         assert_eq!(en.reconnect_now_btn(true), "Reconnecting...");
         assert!(zh.msg_remote_conn_lost("EOF").contains("EOF"));
         assert!(en.msg_remote_conn_lost("EOF").contains("EOF"));
+    }
+
+    #[test]
+    fn test_copy_remote_url_i18n_bilingual_labels_and_messages() {
+        use crate::storage::{
+            RemoteUrlKind, S3_PRESIGN_15_MIN, S3_PRESIGN_1_HOUR, S3_PRESIGN_24_HOURS,
+            S3_PRESIGN_7_DAYS,
+        };
+
+        let zh = I18n::new(AppLanguage::ZhCn);
+        let en = I18n::new(AppLanguage::EnUs);
+
+        assert_eq!(zh.ctx_copy_url(), "复制 URL");
+        assert_eq!(en.ctx_copy_url(), "Copy URL");
+
+        assert_eq!(zh.ctx_copy_s3_http_url(), "HTTP URL");
+        assert_eq!(en.ctx_copy_s3_http_url(), "HTTP URL");
+        assert_eq!(zh.ctx_copy_s3_uri(), "S3 URI");
+        assert_eq!(en.ctx_copy_s3_uri(), "S3 URI");
+
+        assert_eq!(
+            zh.ctx_copy_s3_presigned(S3_PRESIGN_15_MIN),
+            "签名 URL (15 分钟)"
+        );
+        assert_eq!(
+            en.ctx_copy_s3_presigned(S3_PRESIGN_15_MIN),
+            "Signed URL (15 Minutes)"
+        );
+        assert_eq!(
+            zh.ctx_copy_s3_presigned(S3_PRESIGN_1_HOUR),
+            "签名 URL (1 小时)"
+        );
+        assert_eq!(
+            en.ctx_copy_s3_presigned(S3_PRESIGN_1_HOUR),
+            "Signed URL (1 Hour)"
+        );
+        assert_eq!(
+            zh.ctx_copy_s3_presigned(S3_PRESIGN_24_HOURS),
+            "签名 URL (24 小时)"
+        );
+        assert_eq!(
+            en.ctx_copy_s3_presigned(S3_PRESIGN_24_HOURS),
+            "Signed URL (24 Hours)"
+        );
+        assert_eq!(
+            zh.ctx_copy_s3_presigned(S3_PRESIGN_7_DAYS),
+            "签名 URL (7 天)"
+        );
+        assert_eq!(
+            en.ctx_copy_s3_presigned(S3_PRESIGN_7_DAYS),
+            "Signed URL (7 Days)"
+        );
+
+        assert_eq!(zh.ctx_copy_sftp_scp_path(), "SCP / rsync 路径");
+        assert_eq!(en.ctx_copy_sftp_scp_path(), "SCP / rsync Path");
+        assert_eq!(zh.ctx_copy_sftp_url(), "SFTP URL");
+        assert_eq!(en.ctx_copy_sftp_url(), "SFTP URL");
+
+        assert_eq!(zh.ctx_copy_smb_url(), "SMB URL");
+        assert_eq!(en.ctx_copy_smb_url(), "SMB URL");
+        assert_eq!(zh.ctx_copy_smb_unc_path(), "UNC 路径");
+        assert_eq!(en.ctx_copy_smb_unc_path(), "UNC Path");
+
+        let err_keywords = [
+            "失败",
+            "无效",
+            "错误",
+            "异常",
+            "缺少",
+            "未检测到",
+            "不能",
+            "failed",
+            "invalid",
+            "error",
+            "missing",
+            "cannot",
+            "secret not found",
+        ];
+        for msg in [
+            zh.msg_copied_remote_url(1, RemoteUrlKind::Default),
+            en.msg_copied_remote_url(1, RemoteUrlKind::Default),
+            zh.msg_copied_remote_url(
+                3,
+                RemoteUrlKind::S3Presigned {
+                    expires_secs: S3_PRESIGN_1_HOUR,
+                },
+            ),
+            en.msg_copied_remote_url(
+                3,
+                RemoteUrlKind::S3Presigned {
+                    expires_secs: S3_PRESIGN_1_HOUR,
+                },
+            ),
+        ] {
+            let lower = msg.to_ascii_lowercase();
+            for kw in err_keywords {
+                assert!(
+                    !msg.contains(kw) && !lower.contains(kw),
+                    "msg_copied_remote_url `{msg}` must not contain error keyword `{kw}`"
+                );
+            }
+        }
+        assert!(zh
+            .msg_copied_remote_url(
+                3,
+                RemoteUrlKind::S3Presigned {
+                    expires_secs: S3_PRESIGN_1_HOUR
+                }
+            )
+            .contains('3'));
+        assert!(en
+            .msg_copied_remote_url(
+                3,
+                RemoteUrlKind::S3Presigned {
+                    expires_secs: S3_PRESIGN_1_HOUR
+                }
+            )
+            .contains('3'));
+
+        assert_eq!(zh.msg_copy_url_unavailable(), "当前选中项不能生成 URL");
+        assert_eq!(
+            en.msg_copy_url_unavailable(),
+            "Cannot generate URL for selected item"
+        );
+        assert!(zh.msg_copy_url_unavailable().contains("不能"));
+        assert!(en.msg_copy_url_unavailable().contains("Cannot"));
+
+        let zh_fail = zh.msg_copy_url_failed(&"bad key");
+        let en_fail = en.msg_copy_url_failed(&"bad key");
+        assert!(zh_fail.contains("失败") && zh_fail.contains("bad key"));
+        assert!(en_fail.contains("Failed") && en_fail.contains("bad key"));
     }
 }
