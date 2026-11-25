@@ -1,6 +1,9 @@
 use crate::models::{join_remote_path, normalize_remote_path, FileEntry, FileKind, SftpConfig};
 use crate::storage::proxy::{connect_tcp_via_proxy, resolve_proxy_for_connection};
-use crate::storage::{ProgressCallback, StorageBackend};
+use crate::storage::s3::encode_s3_key_path;
+use crate::storage::{
+    encode_userinfo_component, format_host_for_url, ProgressCallback, RemoteUrlKind, StorageBackend,
+};
 use anyhow::{anyhow, Context};
 use russh::client::{self, AuthResult, Config, Handle, Handler};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
@@ -352,10 +355,53 @@ impl SftpBackend {
     }
 }
 
+pub fn format_sftp_scp_path(config: &SftpConfig, remote_path: &str) -> String {
+    let user = config.username.trim();
+    let host = format_host_for_url(&config.host);
+    let norm_path = normalize_remote_path(remote_path);
+    if user.is_empty() {
+        format!("{host}:{norm_path}")
+    } else {
+        format!("{user}@{host}:{norm_path}")
+    }
+}
+
+pub fn build_sftp_url(config: &SftpConfig, remote_path: &str) -> String {
+    let user = config.username.trim();
+    let userinfo = if user.is_empty() {
+        String::new()
+    } else {
+        format!("{}@", encode_userinfo_component(user))
+    };
+    let host = format_host_for_url(&config.host);
+    let port_part = if config.port == 22 || config.port == 0 {
+        String::new()
+    } else {
+        format!(":{}", config.port)
+    };
+    let norm_path = normalize_remote_path(remote_path);
+    let encoded_path = encode_s3_key_path(&norm_path);
+    format!("sftp://{userinfo}{host}{port_part}/{encoded_path}")
+}
+
 #[async_trait::async_trait]
 impl StorageBackend for SftpBackend {
     fn protocol_name(&self) -> &'static str {
         "SFTP"
+    }
+
+    fn build_item_url(
+        &self,
+        entry: &FileEntry,
+        kind: RemoteUrlKind,
+    ) -> anyhow::Result<Option<String>> {
+        match kind {
+            RemoteUrlKind::SftpScp | RemoteUrlKind::Default => {
+                Ok(Some(format_sftp_scp_path(&self.config, &entry.path)))
+            }
+            RemoteUrlKind::SftpUrl => Ok(Some(build_sftp_url(&self.config, &entry.path))),
+            _ => Ok(None),
+        }
     }
 
     async fn connect_and_verify(&self) -> anyhow::Result<String> {
@@ -750,5 +796,100 @@ mod tests {
         assert_eq!(active_id, 2);
         assert_eq!(active_conn, 2);
         assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_sftp_build_item_url_scp_and_sftp_url_variants() {
+        let cfg_default = SftpConfig {
+            host: "10.0.0.5".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            ..SftpConfig::default()
+        };
+        let file_entry = FileEntry {
+            name: "my file#1.txt".to_string(),
+            path: "/var/www/my file#1.txt".to_string(),
+            kind: FileKind::File,
+            size: 128,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            format_sftp_scp_path(&cfg_default, &file_entry.path),
+            "deploy@10.0.0.5:/var/www/my file#1.txt"
+        );
+        assert_eq!(
+            build_sftp_url(&cfg_default, &file_entry.path),
+            "sftp://deploy@10.0.0.5/var/www/my%20file%231.txt"
+        );
+
+        let backend_default = SftpBackend::new(cfg_default, String::new()).unwrap();
+        assert_eq!(
+            backend_default
+                .build_item_url(&file_entry, RemoteUrlKind::SftpScp)
+                .unwrap(),
+            Some("deploy@10.0.0.5:/var/www/my file#1.txt".to_string())
+        );
+        assert_eq!(
+            backend_default
+                .build_item_url(&file_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("deploy@10.0.0.5:/var/www/my file#1.txt".to_string())
+        );
+        assert_eq!(
+            backend_default
+                .build_item_url(&file_entry, RemoteUrlKind::SftpUrl)
+                .unwrap(),
+            Some("sftp://deploy@10.0.0.5/var/www/my%20file%231.txt".to_string())
+        );
+        assert_eq!(
+            backend_default
+                .build_item_url(&file_entry, RemoteUrlKind::S3Http)
+                .unwrap(),
+            None
+        );
+
+        let root_entry = FileEntry {
+            name: "/".to_string(),
+            path: "/".to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            backend_default
+                .build_item_url(&root_entry, RemoteUrlKind::SftpUrl)
+                .unwrap(),
+            Some("sftp://deploy@10.0.0.5/".to_string())
+        );
+
+        let cfg_ipv6 = SftpConfig {
+            host: "2001:db8::1".to_string(),
+            port: 2222,
+            username: "ops@team".to_string(),
+            ..SftpConfig::default()
+        };
+        let nginx_entry = FileEntry {
+            name: "nginx".to_string(),
+            path: "/etc/nginx".to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        };
+        let backend_ipv6 = SftpBackend::new(cfg_ipv6, String::new()).unwrap();
+        assert_eq!(
+            backend_ipv6
+                .build_item_url(&nginx_entry, RemoteUrlKind::SftpScp)
+                .unwrap(),
+            Some("ops@team@[2001:db8::1]:/etc/nginx".to_string())
+        );
+        assert_eq!(
+            backend_ipv6
+                .build_item_url(&nginx_entry, RemoteUrlKind::SftpUrl)
+                .unwrap(),
+            Some("sftp://ops%40team@[2001:db8::1]:2222/etc/nginx".to_string())
+        );
     }
 }

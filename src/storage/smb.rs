@@ -1,5 +1,6 @@
 use crate::models::{join_remote_path, normalize_remote_path, FileEntry, FileKind, SmbConfig};
-use crate::storage::{ProgressCallback, StorageBackend};
+use crate::storage::s3::encode_s3_key_path;
+use crate::storage::{format_host_for_url, ProgressCallback, RemoteUrlKind, StorageBackend};
 use anyhow::{anyhow, Context};
 use futures::StreamExt;
 use smb::{
@@ -127,10 +128,56 @@ impl SmbBackend {
     }
 }
 
+pub fn build_smb_url(config: &SmbConfig, remote_path: &str) -> anyhow::Result<String> {
+    let clean_server = config.server.trim().trim_matches(|c| c == '/' || c == '\\');
+    if clean_server.is_empty() {
+        return Err(anyhow!("SMB server hostname/IP cannot be empty"));
+    }
+    let clean_share = config.share.trim().trim_matches(|c| c == '/' || c == '\\');
+    if clean_share.is_empty() {
+        return Err(anyhow!("SMB share name cannot be empty"));
+    }
+
+    let host = format_host_for_url(clean_server);
+    let port_part = if config.port == 445 || config.port == 0 {
+        String::new()
+    } else {
+        format!(":{}", config.port)
+    };
+    let encoded_share = encode_s3_key_path(clean_share);
+    let norm_sub = normalize_remote_path(remote_path);
+    let encoded_sub = encode_s3_key_path(&norm_sub);
+    if encoded_sub.is_empty() {
+        Ok(format!("smb://{host}{port_part}/{encoded_share}"))
+    } else {
+        Ok(format!(
+            "smb://{host}{port_part}/{encoded_share}/{encoded_sub}"
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl StorageBackend for SmbBackend {
     fn protocol_name(&self) -> &'static str {
         "SMB"
+    }
+
+    fn build_item_url(
+        &self,
+        entry: &FileEntry,
+        kind: RemoteUrlKind,
+    ) -> anyhow::Result<Option<String>> {
+        match kind {
+            RemoteUrlKind::SmbUrl | RemoteUrlKind::Default => {
+                Ok(Some(build_smb_url(&self.config, &entry.path)?))
+            }
+            RemoteUrlKind::SmbUnc => Ok(Some(build_smb_unc_path(
+                &self.config.server,
+                &self.config.share,
+                &entry.path,
+            )?)),
+            _ => Ok(None),
+        }
     }
 
     async fn connect_and_verify(&self) -> anyhow::Result<String> {
@@ -398,6 +445,75 @@ mod tests {
         assert_eq!(
             format_smb_auth_username(Some("CORP"), r"OTHER\bob"),
             r"OTHER\bob"
+        );
+    }
+
+    #[test]
+    fn test_smb_build_item_url_smb_uri_and_unc_variants() {
+        let cfg_default = SmbConfig {
+            server: "192.168.1.50".to_string(),
+            port: 445,
+            share: "team share".to_string(),
+            ..SmbConfig::default()
+        };
+        let report = FileEntry {
+            name: "q1 report.pdf".to_string(),
+            path: "/docs/q1 report.pdf".to_string(),
+            kind: FileKind::File,
+            size: 512,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            build_smb_url(&cfg_default, &report.path).unwrap(),
+            "smb://192.168.1.50/team%20share/docs/q1%20report.pdf"
+        );
+        let backend_default = SmbBackend::new(cfg_default, String::new()).unwrap();
+        assert_eq!(
+            backend_default
+                .build_item_url(&report, RemoteUrlKind::SmbUrl)
+                .unwrap(),
+            Some("smb://192.168.1.50/team%20share/docs/q1%20report.pdf".to_string())
+        );
+        assert_eq!(
+            backend_default
+                .build_item_url(&report, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("smb://192.168.1.50/team%20share/docs/q1%20report.pdf".to_string())
+        );
+        assert_eq!(
+            backend_default
+                .build_item_url(&report, RemoteUrlKind::SmbUnc)
+                .unwrap(),
+            Some(r"\\192.168.1.50\team share\docs\q1 report.pdf".to_string())
+        );
+        assert_eq!(
+            backend_default
+                .build_item_url(&report, RemoteUrlKind::S3Http)
+                .unwrap(),
+            None
+        );
+
+        let cfg_ipv6 = SmbConfig {
+            server: "fd00::5".to_string(),
+            port: 1445,
+            share: "public".to_string(),
+            ..SmbConfig::default()
+        };
+        let root_entry = FileEntry {
+            name: "/".to_string(),
+            path: "/".to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        };
+        let backend_ipv6 = SmbBackend::new(cfg_ipv6, String::new()).unwrap();
+        assert_eq!(
+            backend_ipv6
+                .build_item_url(&root_entry, RemoteUrlKind::SmbUrl)
+                .unwrap(),
+            Some("smb://[fd00::5]:1445/public".to_string())
         );
     }
 }

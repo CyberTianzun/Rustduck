@@ -1,6 +1,9 @@
 use crate::models::{join_remote_path, normalize_remote_path, FileEntry, FileKind, FtpConfig};
 use crate::storage::proxy::{connect_tcp_via_proxy, resolve_proxy_for_connection, ProxyStream};
-use crate::storage::{ProgressCallback, StorageBackend};
+use crate::storage::s3::encode_s3_key_path;
+use crate::storage::{
+    encode_userinfo_component, format_host_for_url, ProgressCallback, RemoteUrlKind, StorageBackend,
+};
 use anyhow::{anyhow, Context};
 use chrono::NaiveDateTime;
 use rustls::pki_types::ServerName;
@@ -443,6 +446,25 @@ impl FtpBackend {
     }
 }
 
+pub fn build_ftp_url(config: &FtpConfig, remote_path: &str) -> String {
+    let scheme = if config.use_tls { "ftps" } else { "ftp" };
+    let user = config.username.trim();
+    let userinfo = if user.is_empty() || user.eq_ignore_ascii_case("anonymous") {
+        String::new()
+    } else {
+        format!("{}@", encode_userinfo_component(user))
+    };
+    let host = format_host_for_url(&config.host);
+    let port_part = if config.port == 21 || config.port == 0 {
+        String::new()
+    } else {
+        format!(":{}", config.port)
+    };
+    let norm_path = normalize_remote_path(remote_path);
+    let encoded_path = encode_s3_key_path(&norm_path);
+    format!("{scheme}://{userinfo}{host}{port_part}/{encoded_path}")
+}
+
 #[async_trait::async_trait]
 impl StorageBackend for FtpBackend {
     fn protocol_name(&self) -> &'static str {
@@ -450,6 +472,17 @@ impl StorageBackend for FtpBackend {
             "FTPS"
         } else {
             "FTP"
+        }
+    }
+
+    fn build_item_url(
+        &self,
+        entry: &FileEntry,
+        kind: RemoteUrlKind,
+    ) -> anyhow::Result<Option<String>> {
+        match kind {
+            RemoteUrlKind::Default => Ok(Some(build_ftp_url(&self.config, &entry.path))),
+            _ => Ok(None),
         }
     }
 
@@ -852,5 +885,87 @@ mod tests {
         assert_eq!(entries[0].size, 42);
         assert_eq!(data_tunnel_hits.load(Ordering::SeqCst), 1);
         mock_proxy.await.unwrap();
+    }
+
+    #[test]
+    fn test_ftp_and_ftps_build_item_url_ports_auth_and_encoding() {
+        let ftp_cfg = FtpConfig {
+            host: "ftp.example.com".to_string(),
+            port: 21,
+            username: "anonymous".to_string(),
+            use_tls: false,
+            ..FtpConfig::default()
+        };
+        let readme = FileEntry {
+            name: "readme 1.txt".to_string(),
+            path: "/pub/readme 1.txt".to_string(),
+            kind: FileKind::File,
+            size: 100,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            build_ftp_url(&ftp_cfg, &readme.path),
+            "ftp://ftp.example.com/pub/readme%201.txt"
+        );
+        let ftp_backend = FtpBackend::new(ftp_cfg, String::new()).unwrap();
+        assert_eq!(
+            ftp_backend
+                .build_item_url(&readme, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("ftp://ftp.example.com/pub/readme%201.txt".to_string())
+        );
+        assert_eq!(
+            ftp_backend
+                .build_item_url(&readme, RemoteUrlKind::SftpUrl)
+                .unwrap(),
+            None
+        );
+
+        let ftps_cfg = FtpConfig {
+            host: "ftp.example.com".to_string(),
+            port: 2121,
+            username: "deploy".to_string(),
+            use_tls: true,
+            ..FtpConfig::default()
+        };
+        let release = FileEntry {
+            name: "v1.tar.gz".to_string(),
+            path: "/releases/v1.tar.gz".to_string(),
+            kind: FileKind::File,
+            size: 2048,
+            modified_unix: None,
+            permissions: None,
+        };
+        let ftps_backend = FtpBackend::new(ftps_cfg, String::new()).unwrap();
+        assert_eq!(
+            ftps_backend
+                .build_item_url(&release, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("ftps://deploy@ftp.example.com:2121/releases/v1.tar.gz".to_string())
+        );
+
+        let ipv6_cfg = FtpConfig {
+            host: "fe80::1".to_string(),
+            port: 21,
+            username: "".to_string(),
+            use_tls: false,
+            ..FtpConfig::default()
+        };
+        let index = FileEntry {
+            name: "index.html".to_string(),
+            path: "/index.html".to_string(),
+            kind: FileKind::File,
+            size: 64,
+            modified_unix: None,
+            permissions: None,
+        };
+        let ipv6_backend = FtpBackend::new(ipv6_cfg, String::new()).unwrap();
+        assert_eq!(
+            ipv6_backend
+                .build_item_url(&index, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("ftp://[fe80::1]/index.html".to_string())
+        );
     }
 }

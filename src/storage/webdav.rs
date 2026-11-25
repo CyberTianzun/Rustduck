@@ -1,6 +1,6 @@
 use crate::models::{join_remote_path, normalize_remote_path, FileEntry, FileKind, WebDavConfig};
 use crate::storage::s3::encode_s3_key_path;
-use crate::storage::{ProgressCallback, StorageBackend};
+use crate::storage::{ProgressCallback, RemoteUrlKind, StorageBackend};
 use anyhow::{anyhow, Context};
 use chrono::DateTime;
 use futures::StreamExt;
@@ -252,6 +252,20 @@ impl WebDavBackend {
 impl StorageBackend for WebDavBackend {
     fn protocol_name(&self) -> &'static str {
         "WebDAV"
+    }
+
+    fn build_item_url(
+        &self,
+        entry: &FileEntry,
+        kind: RemoteUrlKind,
+    ) -> anyhow::Result<Option<String>> {
+        match kind {
+            RemoteUrlKind::Default => {
+                build_webdav_url(&self.config.endpoint, &entry.path, entry.kind.is_dir_like())
+                    .map(|u| Some(u.to_string()))
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn connect_and_verify(&self) -> anyhow::Result<String> {
@@ -523,5 +537,50 @@ mod tests {
         assert_eq!(items[1].kind, FileKind::File);
         assert_eq!(items[1].size, 2048);
         assert!(items[1].modified_unix.is_some());
+    }
+
+    #[test]
+    fn test_webdav_build_item_url_file_and_directory() {
+        let cfg = WebDavConfig {
+            endpoint: "https://dav.example.com/remote.php/webdav".to_string(),
+            ..WebDavConfig::default()
+        };
+        let backend = WebDavBackend::new(cfg, String::new()).unwrap();
+
+        let file_entry = FileEntry {
+            name: "report 2026.pdf".to_string(),
+            path: "/docs/report 2026.pdf".to_string(),
+            kind: FileKind::File,
+            size: 1024,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            backend
+                .build_item_url(&file_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("https://dav.example.com/remote.php/webdav/docs/report%202026.pdf".to_string())
+        );
+
+        let dir_entry = FileEntry {
+            name: "归档".to_string(),
+            path: "/docs/归档".to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        };
+        assert_eq!(
+            backend
+                .build_item_url(&dir_entry, RemoteUrlKind::Default)
+                .unwrap(),
+            Some("https://dav.example.com/remote.php/webdav/docs/%E5%BD%92%E6%A1%A3/".to_string())
+        );
+        assert_eq!(
+            backend
+                .build_item_url(&dir_entry, RemoteUrlKind::S3Http)
+                .unwrap(),
+            None
+        );
     }
 }
