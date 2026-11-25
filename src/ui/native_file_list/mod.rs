@@ -88,6 +88,7 @@ pub struct NativeRowViewModel {
 pub struct NativePaneSnapshot {
     pub tab_idx: usize,
     pub is_local: bool,
+    pub remote_protocol: Option<crate::models::ProtocolKind>,
     pub current_path: String,
     pub bounds_px: (i32, i32, i32, i32),
     pub scale_factor: f32,
@@ -757,6 +758,22 @@ mod tests {
         assert!(
             macos_src.contains("rowForView:"),
             "macOS inline rename must resolve live row via [tableView rowForView:] instead of stale [tf tag]"
+        );
+        assert!(
+            macos_src.contains("setSubmenu:"),
+            "macOS Copy URL submenu must attach child NSMenu via setSubmenu:"
+        );
+        assert!(
+            macos_src.contains("setAutoenablesItems:"),
+            "macOS NSMenu must disable autoenablesItems so item setEnabled: is respected"
+        );
+        assert!(
+            macos_src.contains("msg_send![submenu, autorelease]"),
+            "macOS child submenu NSMenu must be autoreleased after setSubmenu:"
+        );
+        assert!(
+            !macos_src.contains("msg_send![submenu, setDelegate:"),
+            "macOS child submenu must not setDelegate: (would recursively trigger menuNeedsUpdate:)"
         );
     }
 

@@ -1,10 +1,12 @@
 use super::{
-    NativeContextMenuAction, NativeEventSink, NativePaneEvent, NativePaneSnapshot,
-    NativeRowViewModel, map_row_index_to_entry, resolve_drop_destination_dir,
-    resolve_inline_rename_entry, should_commit_inline_rename,
+    CopyUrlMenuEntry, CopyUrlMenuSpec, NativeContextMenuAction, NativeEventSink, NativePaneEvent,
+    NativePaneSnapshot, NativeRowViewModel, build_copy_url_menu_spec, map_row_index_to_entry,
+    resolve_drop_destination_dir, resolve_inline_rename_entry, resolve_selected_entries,
+    should_commit_inline_rename,
 };
 use crate::i18n::i18n;
-use crate::models::FileEntry;
+use crate::models::{FileEntry, ProtocolKind};
+use crate::storage::RemoteUrlKind;
 use crate::ui::file_pane::SortColumn;
 use futures::channel::mpsc::UnboundedReceiver;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -58,17 +60,19 @@ use windows::Win32::UI::Shell::{
     ILFindLastID, ILFree, IShellFolder, SHBindToObject, SHBindToParent, SHParseDisplayName,
 };
 #[cfg(test)]
-use windows::Win32::UI::WindowsAndMessaging::WS_POPUP;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetMenuItemCount, GetMenuState, GetSubMenu, MF_BYPOSITION, WS_POPUP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GWL_STYLE,
     GetClientRect, GetCursorPos, GetWindowLongW, HMENU, IDC_ARROW, IDC_HAND, LoadCursorW,
-    MF_GRAYED, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW, PostMessageW, SPI_GETNONCLIENTMETRICS,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor,
-    SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NOTIFY, WM_NULL, WM_RBUTTONDOWN, WM_SETFONT, WS_CHILD,
-    WS_CLIPCHILDREN, WS_TABSTOP,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW, PostMessageW,
+    SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER,
+    SendMessageW, SetCursor, SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DROPFILES,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NOTIFY, WM_NULL,
+    WM_RBUTTONDOWN, WM_SETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -86,6 +90,7 @@ const CMD_DELETE: u32 = 30_005;
 const CMD_COPY_PATH: u32 = 30_006;
 const CMD_REFRESH: u32 = 30_007;
 const CMD_REVEAL_IN_SHELL: u32 = 30_008;
+const CMD_COPY_URL_BASE: u32 = 30_100;
 
 #[inline]
 unsafe fn send_msg(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
@@ -228,6 +233,7 @@ struct PaneControlState {
     is_dark: Option<bool>,
     tab_idx: usize,
     entries_revision: u64,
+    remote_protocol: Option<ProtocolKind>,
     current_path: String,
     has_parent: bool,
     sort_col: SortColumn,
@@ -248,6 +254,7 @@ impl PaneControlState {
             is_dark: None,
             tab_idx: usize::MAX,
             entries_revision: u64::MAX,
+            remote_protocol: None,
             current_path: String::new(),
             has_parent: false,
             sort_col: SortColumn::Name,
@@ -439,6 +446,11 @@ impl PlatformHost {
             || pane.rows.len() != snapshot.rows.len();
         pane.tab_idx = snapshot.tab_idx;
         pane.entries_revision = snapshot.entries_revision;
+        pane.remote_protocol = if snapshot.is_local {
+            None
+        } else {
+            snapshot.remote_protocol
+        };
         pane.current_path = snapshot.current_path.clone();
         pane.has_parent = snapshot.has_parent;
         pane.rows = Arc::clone(&snapshot.rows);
@@ -1769,7 +1781,7 @@ unsafe fn show_pane_context_menu(
         let Some(state) = ctx.state.upgrade() else {
             return;
         };
-        let (parent_hwnd_val, current_path, rows, entries) = {
+        let (parent_hwnd_val, current_path, rows, entries, remote_protocol) = {
             let guard = state.lock().unwrap();
             let pane = if is_local { &guard.left } else { &guard.right };
             (
@@ -1777,9 +1789,18 @@ unsafe fn show_pane_context_menu(
                 pane.current_path.clone(),
                 Arc::clone(&pane.rows),
                 Arc::clone(&pane.entries),
+                pane.remote_protocol,
             )
         };
         let selected_paths = collect_selected_paths_from_hwnd(lv_hwnd, &rows);
+        let copy_url_spec = if !is_local {
+            remote_protocol.map(|protocol| {
+                let selected_entries = resolve_selected_entries(&selected_paths, &entries);
+                build_copy_url_menu_spec(protocol, &selected_entries, i18n())
+            })
+        } else {
+            None
+        };
         let single_is_bucket = selected_paths.len() == 1
             && entries.iter().any(|e| {
                 e.path == selected_paths[0] && matches!(e.kind, crate::models::FileKind::Bucket)
@@ -1800,6 +1821,7 @@ unsafe fn show_pane_context_menu(
             selected_paths.len() == 1 && !single_is_bucket,
             !single_is_bucket,
             can_reveal,
+            copy_url_spec.as_ref(),
             screen_pt,
         );
     }
@@ -1856,6 +1878,7 @@ unsafe fn resolve_shell_menu_pidls(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn show_standard_native_hmenu(
     ctx: &SubclassContext,
     lv_hwnd: HWND,
@@ -1865,6 +1888,7 @@ unsafe fn show_standard_native_hmenu(
     can_rename: bool,
     can_transfer: bool,
     can_reveal: bool,
+    copy_url_spec: Option<&CopyUrlMenuSpec>,
     screen_pt: POINT,
 ) {
     unsafe {
@@ -1891,6 +1915,10 @@ unsafe fn show_standard_native_hmenu(
         append_menu_str(hmenu, CMD_DELETE, t.ctx_delete(), has_selection);
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR(null()));
         append_menu_str(hmenu, CMD_COPY_PATH, t.ctx_copy_path(), has_selection);
+        let mut url_cmds: Vec<(u32, RemoteUrlKind)> = Vec::new();
+        if let Some(spec) = copy_url_spec {
+            append_copy_url_menu_items(hmenu, spec, &mut url_cmds);
+        }
         if is_local {
             append_menu_str(
                 hmenu,
@@ -1915,7 +1943,66 @@ unsafe fn show_standard_native_hmenu(
 
         let _ = DestroyMenu(hmenu);
         if cmd != 0 {
-            dispatch_custom_menu_cmd(ctx, lv_hwnd, is_local, cmd);
+            dispatch_custom_menu_cmd(ctx, lv_hwnd, is_local, cmd, &url_cmds);
+        }
+    }
+}
+
+unsafe fn append_copy_url_menu_items(
+    hmenu: HMENU,
+    spec: &CopyUrlMenuSpec,
+    url_cmds: &mut Vec<(u32, RemoteUrlKind)>,
+) {
+    let next_id = |cmds: &[(u32, RemoteUrlKind)]| CMD_COPY_URL_BASE + cmds.len() as u32;
+    match spec {
+        CopyUrlMenuSpec::Single {
+            label,
+            kind,
+            enabled,
+        } => {
+            let id = next_id(url_cmds);
+            url_cmds.push((id, *kind));
+            unsafe {
+                append_menu_str(hmenu, id, label, *enabled);
+            }
+        }
+        CopyUrlMenuSpec::Submenu {
+            label,
+            enabled,
+            items,
+        } => {
+            let Ok(submenu) = (unsafe { CreatePopupMenu() }) else {
+                return;
+            };
+            for entry in items {
+                match entry {
+                    CopyUrlMenuEntry::Action {
+                        label,
+                        kind,
+                        enabled: item_enabled,
+                    } => {
+                        let id = next_id(url_cmds);
+                        url_cmds.push((id, *kind));
+                        unsafe {
+                            append_menu_str(submenu, id, label, *enabled && *item_enabled);
+                        }
+                    }
+                    CopyUrlMenuEntry::Separator => unsafe {
+                        let _ = AppendMenuW(submenu, MF_SEPARATOR, 0, PCWSTR(null()));
+                    },
+                }
+            }
+            let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+            let flags = if *enabled {
+                MF_POPUP
+            } else {
+                MF_POPUP | MF_GRAYED
+            };
+            unsafe {
+                if AppendMenuW(hmenu, flags, submenu.0 as usize, PCWSTR(wide.as_ptr())).is_err() {
+                    let _ = DestroyMenu(submenu);
+                }
+            }
         }
     }
 }
@@ -1932,8 +2019,28 @@ unsafe fn append_menu_str(hmenu: HMENU, id: u32, label: &str, enabled: bool) {
     }
 }
 
-unsafe fn dispatch_custom_menu_cmd(ctx: &SubclassContext, lv_hwnd: HWND, is_local: bool, cmd: u32) {
+unsafe fn dispatch_custom_menu_cmd(
+    ctx: &SubclassContext,
+    lv_hwnd: HWND,
+    is_local: bool,
+    cmd: u32,
+    url_cmds: &[(u32, RemoteUrlKind)],
+) {
     unsafe {
+        if let Some((_, kind)) = url_cmds.iter().find(|(id, _)| *id == cmd) {
+            if let Some(state) = ctx.state.upgrade() {
+                state
+                    .lock()
+                    .unwrap()
+                    .events
+                    .push(NativePaneEvent::ContextMenuCommand {
+                        is_local,
+                        action: NativeContextMenuAction::CopyRemoteUrl(*kind),
+                    });
+            }
+            return;
+        }
+
         if cmd == CMD_RENAME {
             let sel = send_msg(lv_hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize).0;
             if sel >= 0 {
@@ -2040,6 +2147,7 @@ mod tests {
                 let snap = NativePaneSnapshot {
                     tab_idx: 0,
                     is_local: true,
+                    remote_protocol: None,
                     current_path: r"C:\".to_string(),
                     bounds_px: (0, 0, 360, 240),
                     scale_factor: 1.0,
@@ -2113,6 +2221,7 @@ mod tests {
             let mut snap = NativePaneSnapshot {
                 tab_idx: 0,
                 is_local: true,
+                remote_protocol: None,
                 current_path: r"C:\".to_string(),
                 bounds_px: (0, 0, 480, 260),
                 scale_factor: 1.0,
@@ -2239,6 +2348,7 @@ mod tests {
             let snap = NativePaneSnapshot {
                 tab_idx: 0,
                 is_local: true,
+                remote_protocol: None,
                 current_path: r"C:\".to_string(),
                 bounds_px: (0, 0, 360, 240),
                 scale_factor: 1.0,
@@ -2382,6 +2492,7 @@ mod tests {
             let left_snap = NativePaneSnapshot {
                 tab_idx: 0,
                 is_local: true,
+                remote_protocol: None,
                 current_path: r"C:\Users\Admin".to_string(),
                 bounds_px: (0, 0, 380, 360),
                 scale_factor: 1.0,
@@ -2408,6 +2519,7 @@ mod tests {
             let right_snap = NativePaneSnapshot {
                 tab_idx: 0,
                 is_local: false,
+                remote_protocol: None,
                 current_path: "/prod-bucket".to_string(),
                 bounds_px: (400, 0, 380, 360),
                 scale_factor: 1.0,
@@ -2473,5 +2585,94 @@ mod tests {
             MODIFIED_COLUMN_WIDTH_PX >= 170,
             "Modified column default width ({MODIFIED_COLUMN_WIDTH_PX}px) must be wide enough for YYYY-MM-DD HH:mm timestamps"
         );
+    }
+
+    #[test]
+    fn test_windows_copy_url_hmenu_builds_s3_submenu_and_disables_presign_on_mixed_selection() {
+        use super::super::build_copy_url_menu_spec;
+        use crate::i18n::I18n;
+        use crate::models::{FileKind, ProtocolKind};
+        use crate::services::preferences::AppLanguage;
+        use crate::storage::RemoteUrlKind;
+
+        let t = I18n::new(AppLanguage::EnUs);
+        let file = FileEntry {
+            name: "report.pdf".into(),
+            path: "/bucket/report.pdf".into(),
+            kind: FileKind::File,
+            size: 1024,
+            modified_unix: None,
+            permissions: None,
+        };
+        let dir = FileEntry {
+            name: "docs".into(),
+            path: "/bucket/docs".into(),
+            kind: FileKind::Directory,
+            size: 0,
+            modified_unix: None,
+            permissions: None,
+        };
+
+        unsafe {
+            // S3 single file: cascading submenu with 7 items (HTTP, S3Uri, separator, 4 presign durations), all enabled
+            let s3_file_spec = build_copy_url_menu_spec(ProtocolKind::S3, &[&file], t);
+            let hmenu = CreatePopupMenu().expect("CreatePopupMenu for S3 file");
+            let mut url_cmds: Vec<(u32, RemoteUrlKind)> = Vec::new();
+            append_copy_url_menu_items(hmenu, &s3_file_spec, &mut url_cmds);
+            assert_eq!(url_cmds.len(), 6);
+
+            let sub = GetSubMenu(hmenu, 0);
+            assert!(!sub.0.is_null(), "S3 Copy URL must attach a child submenu");
+            assert_eq!(GetMenuItemCount(Some(sub)), 7);
+
+            let presign_state = GetMenuState(sub, 3, MF_BYPOSITION);
+            assert_ne!(presign_state, u32::MAX);
+            assert_eq!(
+                presign_state & MF_GRAYED.0,
+                0,
+                "presigned item must be enabled when only files are selected"
+            );
+            let _ = DestroyMenu(hmenu);
+
+            // S3 mixed [File, Directory]: HTTP/S3Uri enabled, presigned items grayed
+            let s3_mixed_spec = build_copy_url_menu_spec(ProtocolKind::S3, &[&file, &dir], t);
+            let hmenu = CreatePopupMenu().expect("CreatePopupMenu for S3 mixed");
+            let mut url_cmds = Vec::new();
+            append_copy_url_menu_items(hmenu, &s3_mixed_spec, &mut url_cmds);
+            assert_eq!(url_cmds.len(), 6);
+
+            let sub = GetSubMenu(hmenu, 0);
+            assert!(!sub.0.is_null());
+            assert_eq!(GetMenuItemCount(Some(sub)), 7);
+            let http_state = GetMenuState(sub, 0, MF_BYPOSITION);
+            let presign_state = GetMenuState(sub, 3, MF_BYPOSITION);
+            assert_ne!(http_state, u32::MAX);
+            assert_ne!(presign_state, u32::MAX);
+            assert_eq!(
+                http_state & MF_GRAYED.0,
+                0,
+                "S3Http must stay enabled for mixed selection"
+            );
+            assert_ne!(
+                presign_state & MF_GRAYED.0,
+                0,
+                "S3Presigned must be MF_GRAYED when selection includes a directory"
+            );
+            let _ = DestroyMenu(hmenu);
+
+            // WebDAV single file: flat menu item (no submenu) with RemoteUrlKind::Default
+            let webdav_spec = build_copy_url_menu_spec(ProtocolKind::WebDav, &[&file], t);
+            let hmenu = CreatePopupMenu().expect("CreatePopupMenu for WebDAV");
+            let mut url_cmds = Vec::new();
+            append_copy_url_menu_items(hmenu, &webdav_spec, &mut url_cmds);
+            assert_eq!(url_cmds.len(), 1);
+            assert_eq!(url_cmds[0].1, RemoteUrlKind::Default);
+            assert!(
+                GetSubMenu(hmenu, 0).0.is_null(),
+                "WebDAV Copy URL must render as a flat item, not a submenu"
+            );
+            assert_eq!(GetMenuItemCount(Some(hmenu)), 1);
+            let _ = DestroyMenu(hmenu);
+        }
     }
 }

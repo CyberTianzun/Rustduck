@@ -1,11 +1,13 @@
 use super::{
-    MAX_SAFE_PANE_POINTS, NativeContextMenuAction, NativeEventSink, NativePaneEvent,
-    NativePaneSnapshot, NativeRowViewModel, collect_paths_from_index_set, compute_appkit_frame,
-    map_row_index_to_entry, resolve_drop_destination_dir, resolve_inline_rename_entry,
+    CopyUrlMenuEntry, CopyUrlMenuSpec, MAX_SAFE_PANE_POINTS, NativeContextMenuAction,
+    NativeEventSink, NativePaneEvent, NativePaneSnapshot, NativeRowViewModel,
+    build_copy_url_menu_spec, collect_paths_from_index_set, compute_appkit_frame,
+    map_row_index_to_entry, menu_tag_to_remote_url_kind, remote_url_kind_to_menu_tag,
+    resolve_drop_destination_dir, resolve_inline_rename_entry, resolve_selected_entries,
     should_commit_inline_rename,
 };
 use crate::i18n::i18n;
-use crate::models::FileEntry;
+use crate::models::{FileEntry, ProtocolKind};
 use crate::ui::file_pane::SortColumn;
 use futures::channel::mpsc::UnboundedReceiver;
 use objc2::rc::autoreleasepool;
@@ -60,6 +62,7 @@ struct MacPaneState {
     is_dark: Option<bool>,
     tab_idx: usize,
     entries_revision: u64,
+    remote_protocol: Option<ProtocolKind>,
     current_path: String,
     has_parent: bool,
     sort_col: SortColumn,
@@ -84,6 +87,7 @@ impl MacPaneState {
             is_dark: None,
             tab_idx: usize::MAX,
             entries_revision: u64::MAX,
+            remote_protocol: None,
             current_path: String::new(),
             has_parent: false,
             sort_col: SortColumn::Name,
@@ -230,6 +234,11 @@ impl PlatformHost {
                 || pane.rows.len() != snapshot.rows.len();
             pane.tab_idx = snapshot.tab_idx;
             pane.entries_revision = snapshot.entries_revision;
+            pane.remote_protocol = if snapshot.is_local {
+                None
+            } else {
+                snapshot.remote_protocol
+            };
             pane.current_path = snapshot.current_path.clone();
             pane.has_parent = snapshot.has_parent;
             pane.rows = Arc::clone(&snapshot.rows);
@@ -683,6 +692,7 @@ unsafe fn create_single_mac_table(
 
         // Context menu
         let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
+        let _: () = msg_send![menu, setAutoenablesItems: Bool::NO];
         let _: () = msg_send![menu, setDelegate: del];
         let _: () = msg_send![tv, setMenu: menu];
         let _: *mut AnyObject = msg_send![menu, autorelease];
@@ -1349,14 +1359,25 @@ extern "C" fn menu_needs_update(this: *mut AnyObject, _cmd: Sel, menu: *mut AnyO
             return;
         }
         let _: () = msg_send![menu, removeAllItems];
-        let has_sel = {
+        let _: () = msg_send![menu, setAutoenablesItems: Bool::NO];
+        let (has_sel, copy_url_spec) = {
             let guard = state.lock().unwrap();
             let pane = if ctx.is_local {
                 &guard.left
             } else {
                 &guard.right
             };
-            !pane.selected_paths.is_empty()
+            let has_sel = !pane.selected_paths.is_empty();
+            let spec = if !ctx.is_local {
+                pane.remote_protocol.map(|protocol| {
+                    let selected_entries =
+                        resolve_selected_entries(&pane.selected_paths, &pane.entries);
+                    build_copy_url_menu_spec(protocol, &selected_entries, i18n())
+                })
+            } else {
+                None
+            };
+            (has_sel, spec)
         };
 
         let t = i18n();
@@ -1379,8 +1400,80 @@ extern "C" fn menu_needs_update(this: *mut AnyObject, _cmd: Sel, menu: *mut AnyO
         let sep2: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![menu, addItem: sep2];
         add_nsmenu_item(menu, this, t.ctx_copy_path(), 6, has_sel);
+        if let Some(ref spec) = copy_url_spec {
+            append_copy_url_nsmenu(menu, this, spec);
+        }
         add_nsmenu_item(menu, this, t.ctx_refresh(), 7, true);
     });
+}
+
+unsafe fn append_copy_url_nsmenu(
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
+    spec: &CopyUrlMenuSpec,
+) {
+    unsafe {
+        match spec {
+            CopyUrlMenuSpec::Single {
+                label,
+                kind,
+                enabled,
+            } => {
+                let tag = remote_url_kind_to_menu_tag(*kind);
+                if tag >= 0 {
+                    add_nsmenu_item(menu, target, label, tag as NSInteger, *enabled);
+                }
+            }
+            CopyUrlMenuSpec::Submenu {
+                label,
+                enabled,
+                items,
+            } => {
+                let ns_title = NSString::from_str(label);
+                let empty_key = NSString::from_str("");
+                let parent_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+                let parent_item: *mut AnyObject = msg_send![
+                    parent_item,
+                    initWithTitle: &*ns_title,
+                    action: None::<Sel>,
+                    keyEquivalent: &*empty_key
+                ];
+                let _: () = msg_send![parent_item, setEnabled: Bool::new(*enabled)];
+
+                let submenu: *mut AnyObject = msg_send![class!(NSMenu), new];
+                let _: () = msg_send![submenu, setAutoenablesItems: Bool::NO];
+                for entry in items {
+                    match entry {
+                        CopyUrlMenuEntry::Action {
+                            label,
+                            kind,
+                            enabled: item_enabled,
+                        } => {
+                            let tag = remote_url_kind_to_menu_tag(*kind);
+                            if tag >= 0 {
+                                add_nsmenu_item(
+                                    submenu,
+                                    target,
+                                    label,
+                                    tag as NSInteger,
+                                    *enabled && *item_enabled,
+                                );
+                            }
+                        }
+                        CopyUrlMenuEntry::Separator => {
+                            let sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+                            let _: () = msg_send![submenu, addItem: sep];
+                        }
+                    }
+                }
+
+                let _: () = msg_send![parent_item, setSubmenu: submenu];
+                let _: *mut AnyObject = msg_send![submenu, autorelease];
+                let _: () = msg_send![menu, addItem: parent_item];
+                let _: *mut AnyObject = msg_send![parent_item, autorelease];
+            }
+        }
+    }
 }
 
 unsafe fn add_nsmenu_item(
@@ -1448,7 +1541,8 @@ extern "C" fn on_context_menu_item(this: *mut AnyObject, _cmd: Sel, sender: *mut
             5 => Some(NativeContextMenuAction::DeleteSelected),
             6 => Some(NativeContextMenuAction::CopySelectedPath),
             7 => Some(NativeContextMenuAction::Refresh),
-            _ => None,
+            _ => menu_tag_to_remote_url_kind(tag as isize)
+                .map(NativeContextMenuAction::CopyRemoteUrl),
         };
         if let Some(act) = action {
             state

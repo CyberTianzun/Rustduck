@@ -670,6 +670,7 @@ pub struct NativeFileListElement {
     ws_entity: Entity<RustduckWorkspace>,
     tab_idx: usize,
     is_local: bool,
+    remote_protocol: Option<crate::models::ProtocolKind>,
     is_connected: bool,
     settings_open: bool,
     current_path: String,
@@ -763,6 +764,7 @@ impl Element for NativeFileListElement {
         let snapshot = NativePaneSnapshot {
             tab_idx: self.tab_idx,
             is_local: self.is_local,
+            remote_protocol: self.remote_protocol,
             current_path: self.current_path.clone(),
             bounds_px: (x, y, w, h),
             scale_factor: scale,
@@ -810,6 +812,11 @@ fn render_pane_file_table(
         ws_entity: cx.entity(),
         tab_idx,
         is_local,
+        remote_protocol: if is_local {
+            None
+        } else {
+            tab.connected_protocol.or(Some(tab.form.protocol))
+        },
         is_connected: tab.is_connected,
         settings_open: ws.settings_open || tab.has_action_modal(),
         current_path,
